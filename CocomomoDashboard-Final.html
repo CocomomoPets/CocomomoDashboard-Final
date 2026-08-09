@@ -1,4 +1,4 @@
-!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -419,15 +419,15 @@
   .field.span2{ grid-column:span 2; }
   .field.span3{ grid-column:span 3; }
   .date-weekday-hint{ display:block; font-size:11px; font-weight:600; color:var(--ink-soft); margin-top:3px; }
-  .date-overlay-wrap{ position:relative; }
-  .date-overlay-wrap input[type="date"]{ color:transparent; min-width:148px; padding-right:26px; box-sizing:border-box; }
+  .date-overlay-wrap{ position:relative; min-width:176px; flex-shrink:0; }
+  .date-overlay-wrap input[type="date"]{ color:transparent; width:100%; min-width:176px; padding-right:34px; box-sizing:border-box; }
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit,
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-fields-wrapper,
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-text,
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-month-field,
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-day-field,
   .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-year-field{ color:transparent; }
-  .date-overlay-label{ position:absolute; left:11px; right:24px; top:50%; transform:translateY(-50%); pointer-events:none; font-size:14px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .date-overlay-label{ position:absolute; left:11px; right:32px; top:50%; transform:translateY(-50%); pointer-events:none; font-size:13px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .checks{ display:flex; flex-wrap:wrap; gap:8px; }
   .check-pill{ display:flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:99px; padding:6px 11px; font-size:12.5px; }
   .check-pill input{ width:auto; }
@@ -1730,11 +1730,11 @@ function petInfoHtml(p){
       <div class="info-field"><label>Spayed / neutered</label><div>${esc(p.spayed)}</div></div>
       <div class="info-field">
         <label>Last vaccination date</label>
-        <div style="max-width:170px;">${dateOverlayHtml('pet_lastVax', p.lastVax||'')}</div>
+        <div style="max-width:190px;">${dateOverlayHtml('pet_lastVax', p.lastVax||'')}</div>
       </div>
       <div class="info-field">
         <label>Last tick treatment date</label>
-        <div style="max-width:170px;">${dateOverlayHtml('pet_lastTick', p.lastTick||'')}</div>
+        <div style="max-width:190px;">${dateOverlayHtml('pet_lastTick', p.lastTick||'')}</div>
       </div>
       <div class="info-field span2"><label>Medical condition</label><div>${esc(p.medical)||'None reported'}</div></div>
       <div class="info-field"><label>Personality</label><div>${esc(p.personality)||'—'}</div></div>
