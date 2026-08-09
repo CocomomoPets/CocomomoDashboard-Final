@@ -539,11 +539,6 @@
    2. Run the SQL from the setup guide to create the `paw_salon_data` table
    3. Paste your Project URL and anon public key below
    4. Reload this file in your browser — it will pull/push automatically
-   5. For LIVE SYNC across devices (updates appear on other screens within
-      a second or two, instead of only on next reload): in the Supabase
-      dashboard go to Database → Replication, and toggle the paw_salon_data
-      table ON. If this step is skipped, nothing breaks — the app just
-      falls back to its normal load-on-open / save-on-change behavior.
    ========================================================= */
 const SUPABASE_URL = 'https://avfwqwtshfcozudmrcja.supabase.co';       // e.g. 'https://xxxxxxxx.supabase.co'
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF2Zndxd3RzaGZjb3p1ZG1yY2phIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MDYxMTIsImV4cCI6MjEwMTQ4MjExMn0.6JmWhLBy9EQd26lutBp0YhbRj9CHU1hV79hEo-ibzqw';  // e.g. 'eyJhbGciOi...'
@@ -766,7 +761,6 @@ async function loadFromCloud(){
   _cloudLoaded = true;
   render();
   checkSignedAgreements();
-  subscribeRealtime();
   if(!_agreementPollStarted && cloudEnabled && sbSession){
     _agreementPollStarted = true;
     setInterval(checkSignedAgreements, 60000);
@@ -790,18 +784,6 @@ async function saveToCloudNow(){
   if(json === _lastSyncedJSON) { setSyncStatus('ok','Synced'); return; }
   setSyncStatus('saving','Saving…');
   try{
-    // Overwrite-protection: before pushing, check whether the cloud copy has
-    // moved on from the baseline this device last knew about (i.e. another
-    // device saved in between). If so, don't silently clobber that other
-    // save — surface a conflict popup and let staff choose how to resolve it.
-    const { data: remoteRow, error: fetchErr } = await sb.from(SUPABASE_TABLE).select('data').eq('id', WORKSPACE_ID).maybeSingle();
-    if(fetchErr) throw fetchErr;
-    const remoteJSON = (remoteRow && remoteRow.data) ? JSON.stringify(remoteRow.data) : null;
-    if(remoteJSON !== null && _lastSyncedJSON !== null && remoteJSON !== _lastSyncedJSON){
-      setSyncStatus('error','Conflict — tap to resolve');
-      openSyncConflictModal();
-      return;
-    }
     const { error } = await sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() });
     if(error) throw error;
     _lastSyncedJSON = json;
@@ -815,119 +797,15 @@ async function saveToCloudNow(){
     toast('Save failed: ' + msg);
   }
 }
-/* Shown when this device is about to save but another device has already
-   saved newer changes to the cloud since this device last loaded/saved —
-   staff pick whether to grab the other device's version (discarding this
-   device's unsaved edits) or push this device's version anyway (overwriting
-   the other device's save). Replaces the old silent "last save wins". */
-function openSyncConflictModal(){
-  openModal(`
-    <div class="modal-head"><h3>⚠️ Another device made changes</h3><button class="modal-close">✕</button></div>
-    <div class="modal-body">
-      <div style="font-size:13px;color:var(--ink-soft);line-height:1.6;">
-        Someone saved changes on another device or tab since this one last loaded the dashboard. Saving now would overwrite that work.
-      </div>
-    </div>
-    <div class="modal-foot" style="flex-wrap:wrap;">
-      <button class="btn" id="conflictReloadBtn">Reload their version (discard my unsaved changes)</button>
-      <button class="btn btn-danger" id="conflictOverwriteBtn">Keep my version (overwrite theirs)</button>
-    </div>
-  `);
-  document.getElementById('conflictReloadBtn').addEventListener('click', async ()=>{
-    closeModal();
-    toast('Reloading latest data…');
-    await loadFromCloud();
-  });
-  document.getElementById('conflictOverwriteBtn').addEventListener('click', async ()=>{
-    closeModal();
-    setSyncStatus('saving','Saving…');
-    try{
-      const snap = snapshotForCloud();
-      const json = JSON.stringify(snap);
-      const { error } = await sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() });
-      if(error) throw error;
-      _lastSyncedJSON = json;
-      _lastSyncError = null;
-      setSyncStatus('ok','Synced');
-      toast('Saved — your changes overwrote the other device\'s update');
-    } catch(err){
-      const msg = describeSupabaseError(err);
-      console.error('Supabase save failed:', msg, err);
-      _lastSyncError = msg;
-      setSyncStatus('error','Save failed — tap for details');
-      toast('Save failed: ' + msg);
-    }
-  });
-}
 
-/* =========================================================
-   LIVE SYNC — Supabase Realtime. Requires Realtime to be turned on for the
-   paw_salon_data table (Supabase dashboard → Database → Replication →
-   toggle the table on) — without that this silently just never fires and
-   the app still works exactly as before (load-on-open, save-on-change).
-   ========================================================= */
-let _realtimeChannel = null;
-function subscribeRealtime(){
-  if(!cloudEnabled || !sb || _realtimeChannel) return;
-  try{
-    _realtimeChannel = sb.channel('paw_salon_live')
-      .on('postgres_changes', { event:'UPDATE', schema:'public', table:SUPABASE_TABLE, filter:`id=eq.${WORKSPACE_ID}` }, payload=>{
-        handleRemoteRowChange(payload.new);
-      })
-      .on('broadcast', { event:'editing' }, payload=>{
-        handleEditingBroadcast(payload.payload);
-      })
-      .subscribe();
-  } catch(err){
-    console.error('Realtime subscribe failed (live updates disabled for this session):', err);
-  }
-}
-/* A row changed in the cloud — either our own save echoing back (ignored)
-   or another device's save. If this device has no unsaved local edits, pull
-   the new data straight in so everyone sees the same board within a second
-   or two, without needing to leave & reopen the page. If this device DOES
-   have unsaved edits, don't clobber them — just flag the status pill; the
-   existing save-time conflict check will catch it properly when they save. */
-function handleRemoteRowChange(row){
-  if(!row || !row.data) return;
-  const remoteJSON = JSON.stringify(row.data);
-  if(remoteJSON === _lastSyncedJSON) return; // our own write echoing back
-  const localJSON = JSON.stringify(snapshotForCloud());
-  if(localJSON === _lastSyncedJSON){
-    hydrateStateFromRemote(row.data, {resetSelection:false});
-    render();
-    setSyncStatus('ok','Synced');
-  } else {
-    setSyncStatus('error','Newer version available — tap to resolve');
-  }
-}
-/* Ephemeral "who's editing what" map, built from broadcast pings — not
-   persisted, not part of the saved data, just a live in-memory overlay so
-   staff on different devices can see "✂️ someone's already editing this"
-   before they both start typing into the same appointment. Entries expire
-   on their own after 3 minutes in case a tab closes without sending 'stop'. */
+/* Live co-editing (Realtime auto-refresh + "someone's editing this" badges)
+   was tried and removed on request — it wasn't working reliably in practice.
+   These two are kept as harmless no-ops rather than ripped out everywhere
+   they're called, so nothing else needs to change: broadcastEditing() does
+   nothing, editingBadgeHtml() always renders blank. */
+function broadcastEditing(){}
+function editingBadgeHtml(){ return ''; }
 const _activeEditors = {};
-function handleEditingBroadcast(msg){
-  if(!msg || !msg.recordId) return;
-  if(msg.action === 'stop'){ delete _activeEditors[msg.recordId]; }
-  else { _activeEditors[msg.recordId] = { user: msg.user || 'Someone', ts: Date.now() }; }
-  render();
-}
-function broadcastEditing(recordId, action){
-  if(!_realtimeChannel) return;
-  const user = (sbSession && sbSession.user && sbSession.user.email) ? sbSession.user.email.split('@')[0] : 'Someone';
-  _realtimeChannel.send({ type:'broadcast', event:'editing', payload:{ recordId, action, user } });
-}
-/* Small inline badge shown next to a stay/grooming card's title (or a grid
-   slot) when another device is currently editing that exact record — auto-
-   expires stale entries older than 3 minutes rather than trusting every
-   device to always send a clean 'stop'. */
-function editingBadgeHtml(recordId){
-  const e = _activeEditors[recordId];
-  if(!e) return '';
-  if(Date.now() - e.ts > 3*60*1000){ delete _activeEditors[recordId]; return ''; }
-  return ` <span class="badge badge-active" title="Currently being edited on another device">✏️ ${esc(e.user)} editing</span>`;
-}
 
 function scheduleSync(){
   if(!cloudEnabled || !_cloudLoaded) return;
@@ -3022,12 +2900,7 @@ function openPhotoLightbox(dataUrl){
 /* =========================================================
    MODALS — generic helpers
    ========================================================= */
-let _currentEditingRecordId = null;
-function stopEditingTracking(){
-  if(_currentEditingRecordId){ broadcastEditing(_currentEditingRecordId, 'stop'); _currentEditingRecordId = null; }
-}
 function openModal(html, {wide=false}={}){
-  stopEditingTracking(); // opening any new modal implicitly ends whatever was showing before
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-backdrop" id="mBackdrop"><div class="modal ${wide?'wide':''}">${html}</div></div>`;
   document.getElementById('mBackdrop').addEventListener('click', (e)=>{ if(e.target.id==='mBackdrop') closeModal(); });
@@ -3045,7 +2918,7 @@ function openModal(html, {wide=false}={}){
     if(primaryBtn) primaryBtn.click();
   });
 }
-function closeModal(){ stopEditingTracking(); document.getElementById('modalRoot').innerHTML=''; }
+function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
 
 /* ---- Customer modal ---- */
 function openCustomerModal(existing){
@@ -3510,7 +3383,6 @@ function openStayModal(cust, primaryPet, existing){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Create stay'}</button>
     </div>
   `, {wide:true});
-  if(existing){ _currentEditingRecordId = existing.id; broadcastEditing(existing.id, 'start'); }
 
   let workingDropoff = s.dropoff ? {...s.dropoff} : {time:'09:00', contactName:'', contactPhone:''};
   let workingPickup = s.pickup ? {...s.pickup} : {time:'17:00', contactName:'', contactPhone:''};
@@ -3918,7 +3790,6 @@ function openGroomModal(cust, pet, existing, opts){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Book appointment'}</button>
     </div>
   `, {wide:true});
-  if(existing){ _currentEditingRecordId = existing.id; broadcastEditing(existing.id, 'start'); }
   document.querySelectorAll('#g_colour_row [data-g-colour]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       selectedColor = btn.dataset.gColour;
@@ -4921,7 +4792,6 @@ function gridRowHtml(time, date, apptsForDay){
       const apptStatus = appt.status || 'Not arrived';
       const dimmed = state.groomStatusFilter && state.groomStatusFilter !== apptStatus;
       return `<td class="slot-cell slot-booked slot-status-${apptStatus.replace(/[^a-z]/gi,'')} ${dimmed?'slot-dimmed':''}" style="background:${color};color:${textColor};--cal-text-shadow:${textShadow};" data-groomid="${appt.id}">        ${hasNotes ? `<span class="slot-note-badge" title="Has notes — click to view">📝</span>` : ''}
-        ${_activeEditors[appt.id] ? `<span class="slot-note-badge" style="right:auto;left:5px;" title="Currently being edited by ${esc(_activeEditors[appt.id].user)} on another device">✏️</span>` : ''}
         <div class="slot-pet-name">${esc(pet?.name||'—')} <span class="slot-breed-inline">${esc(pet?.breed||'')}</span></div>
         <div class="slot-apt-type">${esc((appt.apptTypes||[]).join(', ')||'—')}</div>
         <div class="slot-status-label">${GROOM_STATUS_ICON[apptStatus]||''} ${esc(apptStatus)}</div>
