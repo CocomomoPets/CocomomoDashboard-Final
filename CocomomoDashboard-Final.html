@@ -505,6 +505,7 @@
     </div>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
+    <button class="btn" id="cancellationsBtn" title="View the log of cancelled grooming appointments and boarding stays">Cancellations</button>
     <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
   </div>
 
@@ -538,6 +539,11 @@
    2. Run the SQL from the setup guide to create the `paw_salon_data` table
    3. Paste your Project URL and anon public key below
    4. Reload this file in your browser — it will pull/push automatically
+   5. For LIVE SYNC across devices (updates appear on other screens within
+      a second or two, instead of only on next reload): in the Supabase
+      dashboard go to Database → Replication, and toggle the paw_salon_data
+      table ON. If this step is skipped, nothing breaks — the app just
+      falls back to its normal load-on-open / save-on-change behavior.
    ========================================================= */
 const SUPABASE_URL = 'https://avfwqwtshfcozudmrcja.supabase.co';       // e.g. 'https://xxxxxxxx.supabase.co'
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF2Zndxd3RzaGZjb3p1ZG1yY2phIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5MDYxMTIsImV4cCI6MjEwMTQ4MjExMn0.6JmWhLBy9EQd26lutBp0YhbRj9CHU1hV79hEo-ibzqw';  // e.g. 'eyJhbGciOi...'
@@ -641,6 +647,95 @@ async function ensureLogin(){
   });
 }
 
+/* Applies a remote data blob (from either the initial load or a live
+   realtime update) onto local state. Shared so both paths run the exact
+   same migration/backfill logic instead of drifting apart.
+   resetSelection=true (initial load) always jumps to the first customer/pet;
+   resetSelection=false (a live update arriving while someone's already
+   browsing) instead tries to keep whatever they currently have open, only
+   falling back if that record no longer exists in the new data. */
+function hydrateStateFromRemote(remote, opts){
+  opts = opts || {};
+  const resetSelection = opts.resetSelection !== false;
+  state.shopName = remote.shopName ?? state.shopName;
+  state.customers = (remote.customers ?? state.customers).map(normalizeCustomer);
+  // One-time cleanup: auto-created FBG grooming records used to carry a long
+  // explanatory blurb in their notes — now they should just say "(Boarding)".
+  // Idempotent, so safe to check on every load; only pushes a sync if it
+  // actually found something to fix.
+  let fbgNotesFixed = 0;
+  state.customers.forEach(c=>{
+    c.pets.forEach(p=>{
+      (p.groomingHistory||[]).forEach(g=>{
+        if((g.apptTypes||[]).includes('FBG') && g.notes !== '(Boarding)'){
+          g.notes = '(Boarding)';
+          fbgNotesFixed++;
+        }
+      });
+    });
+  });
+  // One-time backfill: free groomings (FBG) earned by a 7+ night dog
+  // stay used to only be auto-assigned to the pet the stay was booked
+  // under, not to any pet(s) only sharing the room — give those sharing
+  // partners the same earned FBG appointments they missed. Scoped to
+  // currently-Active stays only (a Past stay's free grooming is moot,
+  // the pet's already gone home). Idempotent — skips dates that already
+  // have an FBG for that pet.
+  let fbgSharingBackfilled = 0;
+  state.customers.forEach(c=>{
+    c.pets.forEach(p=>{
+      (p.stays||[]).forEach(stay=>{
+        if(stay.status !== 'Active') return;
+        const dates = computeFreeGroomingDates(stay.checkIn, stay.checkOut);
+        if(dates.length === 0) return;
+        stay.pets.forEach(sp=>{
+          (sp.sharingWith||[]).forEach(sharedId=>{
+            const { pet: sharedPet, cust: sharedCust } = findPetWithCustomer(sharedId);
+            if(!sharedPet || sharedPet.type !== 'Dog') return;
+            const owner = sharedCust || c;
+            dates.forEach((date, idx)=>{
+              const alreadyHas = (sharedPet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
+              if(alreadyHas) return;
+              const isCheckoutDay = idx === dates.length - 1;
+              const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
+              if(!slot) return;
+              sharedPet.groomingHistory.push({
+                id: uid('groom'), date, time: slot.time, bay: slot.bay,
+                apptTypes: ['FBG'], sizeCode: sharedPet.groomingSize || '', cutCode:'', details:'',
+                addons: [], photos: [], status:'Not arrived', notes: '(Boarding)',
+                customerId: owner.id, petId: sharedPet.id,
+              });
+              fbgSharingBackfilled++;
+            });
+          });
+        });
+      });
+    });
+  });
+  state.rates = remote.rates ?? state.rates;
+  state.surchargeSM = remote.surchargeSM ?? state.surchargeSM;
+  state.surchargeLXL = remote.surchargeLXL ?? state.surchargeLXL;
+  state.holidays = remote.holidays ?? state.holidays;
+  state.closedDates = remote.closedDates ?? state.closedDates;
+  state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
+  state.cancellations = remote.cancellations ?? state.cancellations;
+  state.policyText = remote.policyText ?? state.policyText;
+  if(typeof remote.LARGE_normal === 'number') LARGE.normal = remote.LARGE_normal;
+  if(typeof remote.LARGE_holiday === 'number') LARGE.holiday = remote.LARGE_holiday;
+  if(resetSelection){
+    state.selectedCustomerId = state.customers[0]?.id || null;
+    state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+  } else if(!state.customers.some(c=>c.id===state.selectedCustomerId)){
+    state.selectedCustomerId = state.customers[0]?.id || null;
+    state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+  } else {
+    const selCust = state.customers.find(c=>c.id===state.selectedCustomerId);
+    if(!selCust.pets.some(p=>p.id===state.selectedPetId)) state.selectedPetId = selCust.pets[0]?.id || null;
+  }
+  document.getElementById('shopName').value = state.shopName;
+  _lastSyncedJSON = JSON.stringify(remote);
+  if(fbgNotesFixed>0 || fbgSharingBackfilled>0) scheduleSync();
+}
 async function loadFromCloud(){
   if(!cloudEnabled){ setSyncStatus('off','Cloud sync not set up'); return; }
   setSyncStatus('saving','Loading from cloud…');
@@ -655,78 +750,8 @@ async function loadFromCloud(){
     const { data, error } = result;
     if(error) throw error;
     if(data && data.data){
-      const remote = data.data;
-      // hydrate persisted fields only — keep runtime-only UI state (open/close, selection) as-is
-      state.shopName = remote.shopName ?? state.shopName;
-      state.customers = (remote.customers ?? state.customers).map(normalizeCustomer);
-      // One-time cleanup: auto-created FBG grooming records used to carry a long
-      // explanatory blurb in their notes — now they should just say "(Boarding)".
-      // Idempotent, so safe to check on every load; only pushes a sync if it
-      // actually found something to fix.
-      let fbgNotesFixed = 0;
-      state.customers.forEach(c=>{
-        c.pets.forEach(p=>{
-          (p.groomingHistory||[]).forEach(g=>{
-            if((g.apptTypes||[]).includes('FBG') && g.notes !== '(Boarding)'){
-              g.notes = '(Boarding)';
-              fbgNotesFixed++;
-            }
-          });
-        });
-      });
-      // One-time backfill: free groomings (FBG) earned by a 7+ night dog
-      // stay used to only be auto-assigned to the pet the stay was booked
-      // under, not to any pet(s) only sharing the room — give those sharing
-      // partners the same earned FBG appointments they missed. Scoped to
-      // currently-Active stays only (a Past stay's free grooming is moot,
-      // the pet's already gone home). Idempotent — skips dates that already
-      // have an FBG for that pet.
-      let fbgSharingBackfilled = 0;
-      state.customers.forEach(c=>{
-        c.pets.forEach(p=>{
-          (p.stays||[]).forEach(stay=>{
-            if(stay.status !== 'Active') return;
-            const dates = computeFreeGroomingDates(stay.checkIn, stay.checkOut);
-            if(dates.length === 0) return;
-            stay.pets.forEach(sp=>{
-              (sp.sharingWith||[]).forEach(sharedId=>{
-                const { pet: sharedPet, cust: sharedCust } = findPetWithCustomer(sharedId);
-                if(!sharedPet || sharedPet.type !== 'Dog') return;
-                const owner = sharedCust || c;
-                dates.forEach((date, idx)=>{
-                  const alreadyHas = (sharedPet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
-                  if(alreadyHas) return;
-                  const isCheckoutDay = idx === dates.length - 1;
-                  const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
-                  if(!slot) return;
-                  sharedPet.groomingHistory.push({
-                    id: uid('groom'), date, time: slot.time, bay: slot.bay,
-                    apptTypes: ['FBG'], sizeCode: sharedPet.groomingSize || '', cutCode:'', details:'',
-                    addons: [], photos: [], status:'Not arrived', notes: '(Boarding)',
-                    customerId: owner.id, petId: sharedPet.id,
-                  });
-                  fbgSharingBackfilled++;
-                });
-              });
-            });
-          });
-        });
-      });
-      state.rates = remote.rates ?? state.rates;
-      state.surchargeSM = remote.surchargeSM ?? state.surchargeSM;
-      state.surchargeLXL = remote.surchargeLXL ?? state.surchargeLXL;
-      state.holidays = remote.holidays ?? state.holidays;
-      state.closedDates = remote.closedDates ?? state.closedDates;
-      state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
-      state.policyText = remote.policyText ?? state.policyText;
-      if(typeof remote.LARGE_normal === 'number') LARGE.normal = remote.LARGE_normal;
-      if(typeof remote.LARGE_holiday === 'number') LARGE.holiday = remote.LARGE_holiday;
-      state.selectedCustomerId = state.customers[0]?.id || null;
-      state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
-      document.getElementById('shopName').value = state.shopName;
-      _lastSyncedJSON = JSON.stringify(remote);
+      hydrateStateFromRemote(data.data, {resetSelection:true});
       setSyncStatus('ok','Synced');
-      if(fbgNotesFixed>0 || fbgSharingBackfilled>0) scheduleSync();
     } else {
       // nothing saved yet — push current (seed) state as the first save
       await saveToCloudNow();
@@ -741,6 +766,7 @@ async function loadFromCloud(){
   _cloudLoaded = true;
   render();
   checkSignedAgreements();
+  subscribeRealtime();
   if(!_agreementPollStarted && cloudEnabled && sbSession){
     _agreementPollStarted = true;
     setInterval(checkSignedAgreements, 60000);
@@ -751,6 +777,7 @@ function snapshotForCloud(){
   return {
     shopName: state.shopName, customers: state.customers, rates: state.rates,
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
+    cancellations: state.cancellations,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
   };
@@ -763,6 +790,18 @@ async function saveToCloudNow(){
   if(json === _lastSyncedJSON) { setSyncStatus('ok','Synced'); return; }
   setSyncStatus('saving','Saving…');
   try{
+    // Overwrite-protection: before pushing, check whether the cloud copy has
+    // moved on from the baseline this device last knew about (i.e. another
+    // device saved in between). If so, don't silently clobber that other
+    // save — surface a conflict popup and let staff choose how to resolve it.
+    const { data: remoteRow, error: fetchErr } = await sb.from(SUPABASE_TABLE).select('data').eq('id', WORKSPACE_ID).maybeSingle();
+    if(fetchErr) throw fetchErr;
+    const remoteJSON = (remoteRow && remoteRow.data) ? JSON.stringify(remoteRow.data) : null;
+    if(remoteJSON !== null && _lastSyncedJSON !== null && remoteJSON !== _lastSyncedJSON){
+      setSyncStatus('error','Conflict — tap to resolve');
+      openSyncConflictModal();
+      return;
+    }
     const { error } = await sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() });
     if(error) throw error;
     _lastSyncedJSON = json;
@@ -775,6 +814,119 @@ async function saveToCloudNow(){
     setSyncStatus('error','Save failed — tap for details');
     toast('Save failed: ' + msg);
   }
+}
+/* Shown when this device is about to save but another device has already
+   saved newer changes to the cloud since this device last loaded/saved —
+   staff pick whether to grab the other device's version (discarding this
+   device's unsaved edits) or push this device's version anyway (overwriting
+   the other device's save). Replaces the old silent "last save wins". */
+function openSyncConflictModal(){
+  openModal(`
+    <div class="modal-head"><h3>⚠️ Another device made changes</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--ink-soft);line-height:1.6;">
+        Someone saved changes on another device or tab since this one last loaded the dashboard. Saving now would overwrite that work.
+      </div>
+    </div>
+    <div class="modal-foot" style="flex-wrap:wrap;">
+      <button class="btn" id="conflictReloadBtn">Reload their version (discard my unsaved changes)</button>
+      <button class="btn btn-danger" id="conflictOverwriteBtn">Keep my version (overwrite theirs)</button>
+    </div>
+  `);
+  document.getElementById('conflictReloadBtn').addEventListener('click', async ()=>{
+    closeModal();
+    toast('Reloading latest data…');
+    await loadFromCloud();
+  });
+  document.getElementById('conflictOverwriteBtn').addEventListener('click', async ()=>{
+    closeModal();
+    setSyncStatus('saving','Saving…');
+    try{
+      const snap = snapshotForCloud();
+      const json = JSON.stringify(snap);
+      const { error } = await sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() });
+      if(error) throw error;
+      _lastSyncedJSON = json;
+      _lastSyncError = null;
+      setSyncStatus('ok','Synced');
+      toast('Saved — your changes overwrote the other device\'s update');
+    } catch(err){
+      const msg = describeSupabaseError(err);
+      console.error('Supabase save failed:', msg, err);
+      _lastSyncError = msg;
+      setSyncStatus('error','Save failed — tap for details');
+      toast('Save failed: ' + msg);
+    }
+  });
+}
+
+/* =========================================================
+   LIVE SYNC — Supabase Realtime. Requires Realtime to be turned on for the
+   paw_salon_data table (Supabase dashboard → Database → Replication →
+   toggle the table on) — without that this silently just never fires and
+   the app still works exactly as before (load-on-open, save-on-change).
+   ========================================================= */
+let _realtimeChannel = null;
+function subscribeRealtime(){
+  if(!cloudEnabled || !sb || _realtimeChannel) return;
+  try{
+    _realtimeChannel = sb.channel('paw_salon_live')
+      .on('postgres_changes', { event:'UPDATE', schema:'public', table:SUPABASE_TABLE, filter:`id=eq.${WORKSPACE_ID}` }, payload=>{
+        handleRemoteRowChange(payload.new);
+      })
+      .on('broadcast', { event:'editing' }, payload=>{
+        handleEditingBroadcast(payload.payload);
+      })
+      .subscribe();
+  } catch(err){
+    console.error('Realtime subscribe failed (live updates disabled for this session):', err);
+  }
+}
+/* A row changed in the cloud — either our own save echoing back (ignored)
+   or another device's save. If this device has no unsaved local edits, pull
+   the new data straight in so everyone sees the same board within a second
+   or two, without needing to leave & reopen the page. If this device DOES
+   have unsaved edits, don't clobber them — just flag the status pill; the
+   existing save-time conflict check will catch it properly when they save. */
+function handleRemoteRowChange(row){
+  if(!row || !row.data) return;
+  const remoteJSON = JSON.stringify(row.data);
+  if(remoteJSON === _lastSyncedJSON) return; // our own write echoing back
+  const localJSON = JSON.stringify(snapshotForCloud());
+  if(localJSON === _lastSyncedJSON){
+    hydrateStateFromRemote(row.data, {resetSelection:false});
+    render();
+    setSyncStatus('ok','Synced');
+  } else {
+    setSyncStatus('error','Newer version available — tap to resolve');
+  }
+}
+/* Ephemeral "who's editing what" map, built from broadcast pings — not
+   persisted, not part of the saved data, just a live in-memory overlay so
+   staff on different devices can see "✂️ someone's already editing this"
+   before they both start typing into the same appointment. Entries expire
+   on their own after 3 minutes in case a tab closes without sending 'stop'. */
+const _activeEditors = {};
+function handleEditingBroadcast(msg){
+  if(!msg || !msg.recordId) return;
+  if(msg.action === 'stop'){ delete _activeEditors[msg.recordId]; }
+  else { _activeEditors[msg.recordId] = { user: msg.user || 'Someone', ts: Date.now() }; }
+  render();
+}
+function broadcastEditing(recordId, action){
+  if(!_realtimeChannel) return;
+  const user = (sbSession && sbSession.user && sbSession.user.email) ? sbSession.user.email.split('@')[0] : 'Someone';
+  _realtimeChannel.send({ type:'broadcast', event:'editing', payload:{ recordId, action, user } });
+}
+/* Small inline badge shown next to a stay/grooming card's title (or a grid
+   slot) when another device is currently editing that exact record — auto-
+   expires stale entries older than 3 minutes rather than trusting every
+   device to always send a clean 'stop'. */
+function editingBadgeHtml(recordId){
+  const e = _activeEditors[recordId];
+  if(!e) return '';
+  if(Date.now() - e.ts > 3*60*1000){ delete _activeEditors[recordId]; return ''; }
+  return ` <span class="badge badge-active" title="Currently being edited on another device">✏️ ${esc(e.user)} editing</span>`;
 }
 
 function scheduleSync(){
@@ -862,6 +1014,7 @@ let state = {
   ],
   closedDates: [], // {id, name, start, end} — days the shop is fully closed: no grooming appointments taken, and any boarding check-in/out landing here needs a scheduled drop-off/pick-up appointment instead
   closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
+  cancellations: [], // log of deleted grooming appointments & boarding stays — {id, type:'Grooming'|'Boarding', reason, note, cancelledAt, customerName, petName, summary}
   selectedCustomerId: null,
   selectedPetId: null,
   activeTab: 'customers',
@@ -1137,6 +1290,72 @@ function holidayOverlapsForStay(checkIn, checkOut){
     });
   }
   return hit;
+}
+/* Shared "why was this cancelled" popup — shown before a grooming appointment
+   or boarding stay is actually deleted, so the shop keeps a record of
+   whether it was a data-entry mistake or a real customer cancellation.
+   `onConfirm(reason, note)` performs the actual deletion + logs it. */
+function openCancelReasonModal(title, onConfirm){
+  openModal(`
+    <div class="modal-head"><h3>${esc(title)}</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="field">
+        <label>Reason for deleting</label>
+        <select id="cancelReasonSelect">
+          <option value="Customer cancelled">Customer cancelled</option>
+          <option value="Wrongly keyed in">Wrongly keyed in</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
+      <div class="field"><label>Note (optional)</label><textarea id="cancelReasonNote" placeholder="Any extra detail…"></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelReasonBack">Back</button>
+      <button class="btn btn-danger" id="cancelReasonConfirm">Delete</button>
+    </div>
+  `);
+  document.getElementById('cancelReasonBack').addEventListener('click', closeModal);
+  document.getElementById('cancelReasonConfirm').addEventListener('click', ()=>{
+    const reason = document.getElementById('cancelReasonSelect').value;
+    const note = document.getElementById('cancelReasonNote').value.trim();
+    closeModal();
+    onConfirm(reason, note);
+  });
+}
+/* Records one cancelled grooming appointment or boarding stay into the
+   Cancellations log (state.cancellations), newest first. `summary` is a
+   short human-readable line describing what was deleted (date/time/room etc). */
+function logCancellation(type, reason, note, cust, pet, summary){
+  state.cancellations.unshift({
+    id: uid('cancel'), type, reason, note,
+    cancelledAt: new Date().toISOString(),
+    customerName: cust ? cust.name : '', petName: pet ? petLabel(pet) : '',
+    summary,
+  });
+}
+/* Read-only log of every cancelled grooming appointment / boarding stay,
+   newest first, with the reason recorded at delete-time. */
+function openCancellationsModal(){
+  const list = state.cancellations || [];
+  openModal(`
+    <div class="modal-head"><h3>Cancellations</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No cancellations recorded yet.</div>` : list.map(c=>`
+        <div class="today-card" style="cursor:default;">
+          <div class="today-card-main">
+            <div class="today-card-pet">${c.type==='Grooming'?'✂️':'🏨'} ${esc(c.petName)||'—'} <span class="badge badge-past">${esc(c.reason)}</span></div>
+            <div class="today-card-sub">${esc(c.customerName)} · ${esc(c.summary)}</div>
+            ${c.note ? `<div class="today-card-sub" style="font-style:italic;">"${esc(c.note)}"</div>` : ''}
+            <div class="today-card-sub">Deleted ${fmtDateWithDay(c.cancelledAt.slice(0,10))} at ${new Date(c.cancelledAt).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
 }
 /* Informational popup shown right before a boarding stay is saved, if any
    night of the stay falls inside a holiday-rate period — lets staff catch it
@@ -1903,7 +2122,7 @@ function stayCardHtml(cust, pet, stay){
     <div class="card-head ${isOpen?'open':''}" data-toggle-stay="${stay.id}">
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
-        <div class="card-head-title">${fmtDateWithDay(stay.checkIn)} → ${fmtDateWithDay(stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${stay.status==='Active'&&stay.checkedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}</div>
+        <div class="card-head-title">${fmtDateWithDay(stay.checkIn)} → ${fmtDateWithDay(stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${stay.status==='Active'&&stay.checkedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
         <div class="card-head-sub">${nights} night${nights===1?'':'s'} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(mySlot.room):'—'}</div>
       </div>
       <div class="card-head-actions">
@@ -2284,7 +2503,7 @@ function groomCardHtml(g){
       <input type="checkbox" data-groom-select-check="${g.id}" ${isSelected?'checked':''} onclick="event.stopPropagation()" style="width:auto;margin-right:2px;">
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
-        <div class="card-head-title">${fmtDateWithDay(g.date)} · ${g.time} — ${esc((g.apptTypes||[]).join(', ')||'—')} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
+        <div class="card-head-title">${fmtDateWithDay(g.date)} · ${g.time} — ${esc((g.apptTypes||[]).join(', ')||'—')} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span>${editingBadgeHtml(g.id)}</div>
         <div class="card-head-sub">${esc(g.bay)} ${g.addons.length?'· '+g.addons.length+' add-on(s)':''} ${g.photos.length?'· '+g.photos.length+' photo(s)':''}</div>
       </div>
       <div class="card-head-actions">
@@ -2380,15 +2599,21 @@ function wireSubContentEvents(cust, pet){
   root.querySelectorAll('[data-act="delete-stay"]').forEach(el=>{
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
-      if(confirm('Delete this stay record permanently?')){
-        const ownerCust = findStayOwnerCustomer(el.dataset.stay) || cust;
+      const stayId = el.dataset.stay;
+      const st = findStayById(stayId);
+      if(!st) return;
+      const ownerCust = findStayOwnerCustomer(stayId) || cust;
+      const summary = `${fmtDate(st.checkIn)} → ${fmtDate(st.checkOut)}${st.pets[0]?.room?' · '+st.pets[0].room:''}`;
+      openCancelReasonModal('Cancel this stay', (reason, note)=>{
         // A shared stay is only physically stored on one pet's array (whichever
         // pet it was created against) — filter every pet on the real owning
         // customer so it's removed cleanly regardless of whose page (this
         // customer's own, or a sharing partner's) it's being deleted from.
-        ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==el.dataset.stay); });
+        ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==stayId); });
+        logCancellation('Boarding', reason, note, ownerCust, pet, summary);
+        scheduleSync();
         renderPetSubContent(cust, pet); toast('Stay deleted');
-      }
+      });
     });
   });
   root.querySelectorAll('[data-add-stay-payment]').forEach(btn=>{
@@ -2688,12 +2913,18 @@ function wireSubContentEvents(cust, pet){
   if(bulkDeleteGroomBtn){
     bulkDeleteGroomBtn.addEventListener('click', ()=>{
       const count = _groomSelection.size;
-      if(!confirm(`Delete ${count} selected grooming appointment${count===1?'':'s'} permanently?`)) return;
-      pet.groomingHistory = pet.groomingHistory.filter(g=>!_groomSelection.has(g.id));
-      _groomSelection.clear();
-      scheduleSync();
-      renderPetSubContent(cust, pet);
-      toast(`${count} appointment${count===1?'':'s'} deleted`);
+      if(count===0) return;
+      openCancelReasonModal(`Cancel ${count} selected appointment${count===1?'':'s'}`, (reason, note)=>{
+        const toDelete = pet.groomingHistory.filter(g=>_groomSelection.has(g.id));
+        toDelete.forEach(g=>{
+          logCancellation('Grooming', reason, note, cust, pet, `${fmtDate(g.date)} ${g.time} · ${g.bay}`);
+        });
+        pet.groomingHistory = pet.groomingHistory.filter(g=>!_groomSelection.has(g.id));
+        _groomSelection.clear();
+        scheduleSync();
+        renderPetSubContent(cust, pet);
+        toast(`${count} appointment${count===1?'':'s'} deleted`);
+      });
     });
   }
   root.querySelectorAll('[data-act="edit-groom"]').forEach(el=>{
@@ -2702,10 +2933,14 @@ function wireSubContentEvents(cust, pet){
   root.querySelectorAll('[data-act="delete-groom"]').forEach(el=>{
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
-      if(confirm('Delete this grooming record permanently?')){
-        pet.groomingHistory = pet.groomingHistory.filter(g=>g.id!==el.dataset.groom);
+      const g = pet.groomingHistory.find(x=>x.id===el.dataset.groom);
+      if(!g) return;
+      openCancelReasonModal('Cancel this appointment', (reason, note)=>{
+        logCancellation('Grooming', reason, note, cust, pet, `${fmtDate(g.date)} ${g.time} · ${g.bay}`);
+        pet.groomingHistory = pet.groomingHistory.filter(x=>x.id!==el.dataset.groom);
+        scheduleSync();
         renderPetSubContent(cust, pet); toast('Appointment deleted');
-      }
+      });
     });
   });
   root.querySelectorAll('[data-act="add-photo"]').forEach(el=>{
@@ -2787,7 +3022,12 @@ function openPhotoLightbox(dataUrl){
 /* =========================================================
    MODALS — generic helpers
    ========================================================= */
+let _currentEditingRecordId = null;
+function stopEditingTracking(){
+  if(_currentEditingRecordId){ broadcastEditing(_currentEditingRecordId, 'stop'); _currentEditingRecordId = null; }
+}
 function openModal(html, {wide=false}={}){
+  stopEditingTracking(); // opening any new modal implicitly ends whatever was showing before
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-backdrop" id="mBackdrop"><div class="modal ${wide?'wide':''}">${html}</div></div>`;
   document.getElementById('mBackdrop').addEventListener('click', (e)=>{ if(e.target.id==='mBackdrop') closeModal(); });
@@ -2805,7 +3045,7 @@ function openModal(html, {wide=false}={}){
     if(primaryBtn) primaryBtn.click();
   });
 }
-function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
+function closeModal(){ stopEditingTracking(); document.getElementById('modalRoot').innerHTML=''; }
 
 /* ---- Customer modal ---- */
 function openCustomerModal(existing){
@@ -3244,8 +3484,7 @@ function openStayModal(cust, primaryPet, existing){
   let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings]}));
   const rows = workingPets.map((sp,idx)=> stayPetRowHtml(cust, sp, idx)).join('');
   openModal(`
-    <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>
-    <div class="modal-body">
+    <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>    <div class="modal-body">
       <div class="form-grid c3">
         <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="s_in" value="${s.checkIn}"><span class="date-overlay-label" id="s_in_wd">${fmtDateSlashDay(s.checkIn)}</span></div></div>
         <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="s_out" value="${s.checkOut}"><span class="date-overlay-label" id="s_out_wd">${fmtDateSlashDay(s.checkOut)}</span></div></div>
@@ -3271,6 +3510,7 @@ function openStayModal(cust, primaryPet, existing){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Create stay'}</button>
     </div>
   `, {wide:true});
+  if(existing){ _currentEditingRecordId = existing.id; broadcastEditing(existing.id, 'start'); }
 
   let workingDropoff = s.dropoff ? {...s.dropoff} : {time:'09:00', contactName:'', contactPhone:''};
   let workingPickup = s.pickup ? {...s.pickup} : {time:'17:00', contactName:'', contactPhone:''};
@@ -3678,6 +3918,7 @@ function openGroomModal(cust, pet, existing, opts){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Book appointment'}</button>
     </div>
   `, {wide:true});
+  if(existing){ _currentEditingRecordId = existing.id; broadcastEditing(existing.id, 'start'); }
   document.querySelectorAll('#g_colour_row [data-g-colour]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       selectedColor = btn.dataset.gColour;
@@ -3932,6 +4173,7 @@ function bayOptionsHtml(date, time, selectedBay, excludeId){
    ========================================================= */
 document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
+document.getElementById('cancellationsBtn').addEventListener('click', openCancellationsModal);
 function openPoliciesModal(){
   openModal(`
     <div class="modal-head"><h3>Boarding policies</h3><button class="modal-close">✕</button></div>
@@ -4351,18 +4593,23 @@ function openCalendarCellModal(roomId, dateStr){
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
       const stayId = btn.dataset.calDeleteStay;
-      if(confirm('Delete this stay record permanently?')){
-        const ownerCust = findStayOwnerCustomer(stayId);
+      const st = findStayById(stayId);
+      if(!st) return;
+      const ownerCust = findStayOwnerCustomer(stayId);
+      const ownerPet = ownerCust ? getPet(ownerCust, st.pets[0]?.petId) : null;
+      const summary = `${fmtDate(st.checkIn)} → ${fmtDate(st.checkOut)}${st.pets[0]?.room?' · '+st.pets[0].room:''}`;
+      openCancelReasonModal('Cancel this stay', (reason, note)=>{
         if(ownerCust){
           // A shared stay is only physically stored on one pet's array — filter
           // every pet on the real owning customer so it's removed cleanly.
           ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==stayId); });
         }
+        logCancellation('Boarding', reason, note, ownerCust, ownerPet, summary);
         closeModal();
         renderBoardingCalendar();
         scheduleSync();
         toast('Stay deleted');
-      }
+      });
     });
   });
   document.querySelectorAll('[data-cal-edit-closed-appt]').forEach(el=>{
@@ -4674,6 +4921,7 @@ function gridRowHtml(time, date, apptsForDay){
       const apptStatus = appt.status || 'Not arrived';
       const dimmed = state.groomStatusFilter && state.groomStatusFilter !== apptStatus;
       return `<td class="slot-cell slot-booked slot-status-${apptStatus.replace(/[^a-z]/gi,'')} ${dimmed?'slot-dimmed':''}" style="background:${color};color:${textColor};--cal-text-shadow:${textShadow};" data-groomid="${appt.id}">        ${hasNotes ? `<span class="slot-note-badge" title="Has notes — click to view">📝</span>` : ''}
+        ${_activeEditors[appt.id] ? `<span class="slot-note-badge" style="right:auto;left:5px;" title="Currently being edited by ${esc(_activeEditors[appt.id].user)} on another device">✏️</span>` : ''}
         <div class="slot-pet-name">${esc(pet?.name||'—')} <span class="slot-breed-inline">${esc(pet?.breed||'')}</span></div>
         <div class="slot-apt-type">${esc((appt.apptTypes||[]).join(', ')||'—')}</div>
         <div class="slot-status-label">${GROOM_STATUS_ICON[apptStatus]||''} ${esc(apptStatus)}</div>
@@ -4720,13 +4968,14 @@ function openApptDetailModal(groomId){
   });
   document.getElementById('editHere').addEventListener('click', ()=>{ closeModal(); openGroomModal(owner, pet, appt); });
   document.getElementById('deleteApptBtn').addEventListener('click', ()=>{
-    if(confirm('Delete this grooming appointment permanently?')){
+    openCancelReasonModal('Cancel this appointment', (reason, note)=>{
+      logCancellation('Grooming', reason, note, owner, pet, `${fmtDate(appt.date)} ${appt.time} · ${appt.bay}`);
       pet.groomingHistory = pet.groomingHistory.filter(g=>g.id!==appt.id);
       closeModal();
       if(state.activeTab==='grooming') renderGroomingAvailability();
       scheduleSync();
       toast('Appointment deleted');
-    }
+    });
   });
   document.getElementById('jumpBtn').addEventListener('click', ()=>{
     closeModal();
