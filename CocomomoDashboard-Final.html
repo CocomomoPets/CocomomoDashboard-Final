@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -419,6 +419,15 @@
   .field.span2{ grid-column:span 2; }
   .field.span3{ grid-column:span 3; }
   .date-weekday-hint{ display:block; font-size:11px; font-weight:600; color:var(--ink-soft); margin-top:3px; }
+  .date-overlay-wrap{ position:relative; }
+  .date-overlay-wrap input[type="date"]{ color:transparent; min-width:148px; padding-right:26px; box-sizing:border-box; }
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit,
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-fields-wrapper,
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-text,
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-month-field,
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-day-field,
+  .date-overlay-wrap input[type="date"]::-webkit-datetime-edit-year-field{ color:transparent; }
+  .date-overlay-label{ position:absolute; left:11px; right:24px; top:50%; transform:translateY(-50%); pointer-events:none; font-size:14px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .checks{ display:flex; flex-wrap:wrap; gap:8px; }
   .check-pill{ display:flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:99px; padding:6px 11px; font-size:12.5px; }
   .check-pill input{ width:auto; }
@@ -429,7 +438,8 @@
   .mini-remove{ border:none; background:var(--line-soft); color:var(--danger); width:32px; height:32px; border-radius:7px; flex-shrink:0; font-weight:700; }
   .add-line{ font-size:12.5px; font-weight:700; color:var(--teal); border:1px dashed var(--teal); background:transparent; border-radius:7px; padding:6px 10px; }
 
-  .holiday-row, .rate-row{ display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .holiday-row, .rate-row{ display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .holiday-row .date-overlay-wrap{ flex-shrink:0; }
   .rate-row .rname{ width:260px; font-weight:600; font-size:12.5px; flex-shrink:0; }
 
   .toast{
@@ -495,6 +505,7 @@
     </div>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
+    <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
   </div>
 
   <div class="body">
@@ -705,6 +716,8 @@ async function loadFromCloud(){
       state.surchargeSM = remote.surchargeSM ?? state.surchargeSM;
       state.surchargeLXL = remote.surchargeLXL ?? state.surchargeLXL;
       state.holidays = remote.holidays ?? state.holidays;
+      state.closedDates = remote.closedDates ?? state.closedDates;
+      state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
       state.policyText = remote.policyText ?? state.policyText;
       if(typeof remote.LARGE_normal === 'number') LARGE.normal = remote.LARGE_normal;
       if(typeof remote.LARGE_holiday === 'number') LARGE.holiday = remote.LARGE_holiday;
@@ -737,7 +750,7 @@ async function loadFromCloud(){
 function snapshotForCloud(){
   return {
     shopName: state.shopName, customers: state.customers, rates: state.rates,
-    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays,
+    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
   };
@@ -847,6 +860,8 @@ let state = {
     {id:'h1', name:'Hari Raya', start:'2026-08-10', end:'2026-08-13'},
     {id:'h2', name:'School holidays', start:'2026-08-20', end:'2026-08-30'},
   ],
+  closedDates: [], // {id, name, start, end} — days the shop is fully closed: no grooming appointments taken, and any boarding check-in/out landing here needs a scheduled drop-off/pick-up appointment instead
+  closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
   selectedCustomerId: null,
   selectedPetId: null,
   activeTab: 'customers',
@@ -895,6 +910,41 @@ const GROOM_STATUSES = ['Not arrived','In progress','Done & informed','Picked up
 const GROOM_STATUS_BADGE = { 'Not arrived':'badge-past', 'In progress':'badge-active', 'Done & informed':'badge-active', 'Picked up':'badge-past' };
 const GROOM_STATUS_ICON = { 'Not arrived':'⬜', 'In progress':'✂️', 'Done & informed':'✅', 'Picked up':'🏁' };
 const PET_SIZES = ['S','M','L','XL','XXL'];
+/* Preset grooming prices for the "Additional charges" (Grooming category)
+   picker on a stay — Bath/Cut are priced by the pet's own grooming size
+   (auto-detected from pet.groomingSize), the rest are flat per-visit fees.
+   Cat-only services are only offered when the selected pet is a Cat. */
+const GROOM_CHARGE_SIZED = {
+  Bath: {S:75, M:95, L:125, XL:165, XXL:215},
+  Cut: {S:130, M:170, L:230, XL:310, XXL:410},
+};
+const GROOM_CHARGE_FLAT_COMMON = { 'Trim Nail':15, 'Clean Ear':15, 'Trim Paw Pad':15 };
+const GROOM_CHARGE_FLAT_CAT = { 'Cat Basic grooming':90, 'Cat Full Grooming':155 };
+/* Returns the list of preset grooming charge options for a given pet, each
+   with the auto-computed rate already applied — Bath/Cut use the pet's own
+   grooming size (falls back to 'S' if somehow unset). */
+function groomChargeOptionsFor(pet){
+  if(!pet) return [];
+  const opts = [];
+  if(pet.type === 'Cat'){
+    Object.keys(GROOM_CHARGE_FLAT_CAT).forEach(k=>opts.push({ key:k, label:k, amount:GROOM_CHARGE_FLAT_CAT[k] }));
+  } else {
+    const size = PET_SIZES.includes(pet.groomingSize) ? pet.groomingSize : 'S';
+    Object.keys(GROOM_CHARGE_SIZED).forEach(k=>{
+      opts.push({ key:k, label:`${k} (${size})`, amount: GROOM_CHARGE_SIZED[k][size] });
+    });
+  }
+  Object.keys(GROOM_CHARGE_FLAT_COMMON).forEach(k=>opts.push({ key:k, label:k, amount:GROOM_CHARGE_FLAT_COMMON[k] }));
+  return opts;
+}
+/* Transient UI-only state for the "add charge" row per stay (which category/
+   pet/grooming item is currently picked) — kept outside the saved data model
+   so it never gets persisted to the cloud, and resets naturally on reload. */
+const chargeAddUiState = {};
+function getChargeAddState(stay){
+  if(!chargeAddUiState[stay.id]) chargeAddUiState[stay.id] = { cat:'Retail purchase', petId: stay.pets[0]?.petId || '', item:'' };
+  return chargeAddUiState[stay.id];
+}
 const DOG_BREEDS = ['Affenpinscher','Afghan Hound','Airedale Terrier','Akita','Alaskan Malamute','American Bulldog','American Cocker Spaniel','American Eskimo Dog','American Pit Bull Terrier','American Staffordshire Terrier','Australian Cattle Dog','Australian Shepherd','Australian Terrier','Basenji','Basset Hound','Beagle','Bearded Collie','Bedlington Terrier','Belgian Malinois','Belgian Shepherd','Bernese Mountain Dog','Bichon Frise','Bloodhound','Border Collie','Border Terrier','Borzoi','Boston Terrier','Bouvier des Flandres','Boxer','Boykin Spaniel','Briard','Brittany','Brussels Griffon','Bull Terrier','Bulldog','Bullmastiff','Cairn Terrier','Canaan Dog','Cane Corso','Cavalier King Charles Spaniel','Chesapeake Bay Retriever','Chihuahua','Chinese Crested','Chinese Shar-Pei','Chow Chow','Clumber Spaniel','Cocker Spaniel','Collie','Corgi (Cardigan Welsh)','Corgi (Pembroke Welsh)','Coton de Tulear','Dachshund','Dalmatian','Doberman Pinscher','Dogue de Bordeaux','English Bulldog','English Cocker Spaniel','English Setter','English Springer Spaniel','Entlebucher Mountain Dog','Eurasier','Field Spaniel','Finnish Lapphund','Flat-Coated Retriever','Fox Terrier','French Bulldog','German Pinscher','German Shepherd','German Shorthaired Pointer','German Wirehaired Pointer','Golden Retriever','Gordon Setter','Great Dane','Great Pyrenees','Greater Swiss Mountain Dog','Greyhound','Havanese','Ibizan Hound','Icelandic Sheepdog','Irish Setter','Irish Terrier','Irish Water Spaniel','Irish Wolfhound','Italian Greyhound','Jack Russell Terrier','Japanese Chin','Japanese Spitz','Keeshond','Kerry Blue Terrier','King Charles Spaniel','Komondor','Kuvasz','Labrador Retriever','Lagotto Romagnolo','Lakeland Terrier','Lhasa Apso','Löwchen','Maltese','Manchester Terrier','Mastiff','Miniature Bull Terrier','Miniature Pinscher','Miniature Schnauzer','Mixed Breed','Neapolitan Mastiff','Newfoundland','Norfolk Terrier','Norwegian Elkhound','Norwich Terrier','Nova Scotia Duck Tolling Retriever','Old English Sheepdog','Otterhound','Papillon','Parson Russell Terrier','Pekingese','Pharaoh Hound','Plott Hound','Pointer','Pomeranian','Poodle (Miniature)','Poodle (Standard)','Poodle (Toy)','Portuguese Water Dog','Pug','Puli','Rat Terrier','Redbone Coonhound','Rhodesian Ridgeback','Rottweiler','Saint Bernard','Saluki','Samoyed','Schipperke','Schnauzer (Giant)','Scottish Deerhound','Scottish Terrier','Sealyham Terrier','Shetland Sheepdog','Shiba Inu','Shih Tzu','Siberian Husky','Silky Terrier','Skye Terrier','Sloughi','Soft Coated Wheaten Terrier','Spinone Italiano','Staffordshire Bull Terrier','Standard Schnauzer','Sussex Spaniel','Swedish Vallhund','Tibetan Mastiff','Tibetan Spaniel','Tibetan Terrier','Toy Fox Terrier','Vizsla','Weimaraner','Welsh Terrier','West Highland White Terrier','Whippet','Wire Fox Terrier','Xoloitzcuintli','Yorkshire Terrier'];
 const CAT_BREEDS = ['Abyssinian','American Bobtail','American Curl','American Shorthair','American Wirehair','Balinese','Bengal','Birman','Bombay','British Longhair','British Shorthair','Burmese','Burmilla','Chartreux','Chausie','Cornish Rex','Devon Rex','Domestic Longhair','Domestic Medium Hair','Domestic Shorthair','Egyptian Mau','European Shorthair','Exotic Shorthair','Havana Brown','Himalayan','Japanese Bobtail','Javanese','Korat','LaPerm','Maine Coon','Manx','Mixed Breed','Munchkin','Nebelung','Norwegian Forest Cat','Ocicat','Oriental Longhair','Oriental Shorthair','Persian','Pixie-bob','Ragamuffin','Ragdoll','Russian Blue','Savannah','Scottish Fold','Selkirk Rex','Siamese','Siberian','Singapura','Snowshoe','Somali','Sphynx','Tonkinese','Toyger','Turkish Angora','Turkish Van'];
 const CUSTOMER_TYPE_GROUPS = [
@@ -1017,6 +1067,7 @@ function wireSharingPicker(fieldId, ids, getExcludeId){
   });
 }
 const BAYS = ['Bay 1','Bay 2','Bay 3','Bay 4'];
+const WEEKDAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 const TIME_SLOTS = (() => { // 10:00 -> 18:00, 30-min increments
   const out = [];
   for(let mins = 10*60; mins <= 18*60; mins += 30){
@@ -1034,7 +1085,88 @@ function todayStr(){
 function fmtDate(s){ if(!s) return '—'; const d = new Date(s+'T00:00:00'); return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}); }
 function fmtDateLong(s){ const d = new Date(s+'T00:00:00'); return d.toLocaleDateString('en-GB',{weekday:'long',day:'2-digit',month:'long',year:'numeric'}); }
 function weekdayShort(s){ if(!s) return ''; const d = new Date(s+'T00:00:00'); return d.toLocaleDateString('en-GB',{weekday:'short'}); }
+function fmtDateSlashDay(s){ if(!s) return ''; const [y,m,d] = s.split('-'); return `${d}/${m}/${y} (${weekdayShort(s)})`; }
+function fmtDateSlash(s){ if(!s) return ''; const [y,m,d] = s.split('-'); return `${d}/${m}/${y}`; }
+/* Reusable helpers so every date field in the app — present and future —
+   shows its value as dd/mm/yyyy (day) drawn directly inside the field
+   itself (native date text hidden via .date-overlay-wrap CSS), instead of
+   a separate note next to it. Use dateOverlayHtml() when building a date
+   <input>'s markup, then call wireDateOverlay() once it's in the DOM to
+   fill the initial text and keep it updated as the value changes. */
+function dateOverlayHtml(id, value, showDay=true){
+  return `<div class="date-overlay-wrap"><input type="date" id="${id}" value="${value||''}"><span class="date-overlay-label" id="${id}_wd">${value?(showDay?fmtDateSlashDay(value):fmtDateSlash(value)):''}</span></div>`;
+}
+function wireDateOverlay(id, showDay=true){
+  const el = document.getElementById(id);
+  const lbl = document.getElementById(id+'_wd');
+  if(!el || !lbl) return;
+  const update = ()=>{ lbl.textContent = el.value?(showDay?fmtDateSlashDay(el.value):fmtDateSlash(el.value)):''; };
+  update();
+  el.addEventListener('change', update);
+}
 function fmtDateWithDay(s){ if(!s) return '—'; return `${fmtDate(s)} (${weekdayShort(s)})`; }
+/* Reusable "special rate" field for boarding stays — a flat RM/night override
+   or a % discount off the standard (normal/holiday) rate, picked via a small
+   mode selector next to the number input. idPrefix must be unique per modal
+   instance (e.g. 's_rate' or 'cb_rate'). */
+function customRateFieldHtml(idPrefix, customRate, customRateMode){
+  const mode = customRateMode==='percent' ? 'percent' : 'flat';
+  return `<div style="display:flex;gap:6px;">
+    <select id="${idPrefix}_mode" style="width:98px;padding:6px;border:1px solid var(--line);border-radius:6px;">
+      <option value="flat" ${mode==='flat'?'selected':''}>RM/night</option>
+      <option value="percent" ${mode==='percent'?'selected':''}>% off</option>
+    </select>
+    <input type="number" step="0.01" min="0" id="${idPrefix}" value="${customRate==null?'':customRate}" placeholder="Leave blank to use standard rate" style="flex:1;">
+  </div>`;
+}
+function readCustomRate(idPrefix){
+  const rateInput = document.getElementById(idPrefix).value;
+  const customRate = rateInput === '' ? null : +rateInput;
+  const customRateMode = document.getElementById(idPrefix+'_mode').value === 'percent' ? 'percent' : 'flat';
+  return { customRate, customRateMode };
+}
+/* Any date within [checkIn, checkOut) that falls inside a defined holiday
+   period — used to pop up a heads-up when booking over a special rate. */
+function holidayOverlapsForStay(checkIn, checkOut){
+  const nights = nightsBetween(checkIn, checkOut);
+  const hit = [];
+  for(let n=0;n<nights;n++){
+    const d = addDays(checkIn, n);
+    (state.holidays||[]).forEach(h=>{
+      if(d>=h.start && d<=h.end && !hit.some(x=>x.id===h.id)) hit.push(h);
+    });
+  }
+  return hit;
+}
+/* Informational popup shown right before a boarding stay is saved, if any
+   night of the stay falls inside a holiday-rate period — lets staff catch it
+   before confirming. Rendered as a stacked overlay (appended alongside the
+   modal, not replacing it) so the underlying booking form and everything
+   staff already typed into it is left completely untouched — "Back" just
+   removes this overlay and they're right back where they were. `onContinue`
+   performs the actual save. */
+function openHolidayRateNoticeModal(holidayHits, onContinue){
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-backdrop';
+  wrap.style.zIndex = '200';
+  wrap.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>Holiday rate applies</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">Part of this stay falls within a holiday period, so the holiday room rate will apply for those nights:</div>
+      ${holidayHits.map(h=>`<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(h.name)||'Holiday period'}</div><div class="today-card-sub">${fmtDate(h.start)} → ${fmtDate(h.end)}</div></div></div>`).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="holNoticeCancel">Back</button>
+      <button class="btn btn-primary" id="holNoticeContinue">Continue &amp; save</button>
+    </div>
+  </div>`;
+  document.body.appendChild(wrap);
+  const remove = ()=> wrap.remove();
+  wrap.addEventListener('click', (e)=>{ if(e.target===wrap) remove(); });
+  wrap.querySelector('.modal-close').addEventListener('click', remove);
+  wrap.querySelector('#holNoticeCancel').addEventListener('click', remove);
+  wrap.querySelector('#holNoticeContinue').addEventListener('click', ()=>{ remove(); onContinue(); });
+}
 function nightsBetween(a,b){ const d1=new Date(a), d2=new Date(b); return Math.max(0, Math.round((d2-d1)/86400000)); }
 function daysBetweenAbs(a,b){ return Math.abs(Math.round((new Date(b) - new Date(a))/86400000)); }
 /* Same-week duplicate-booking check ("within 6 days" either direction) — used
@@ -1181,6 +1313,12 @@ function normalizeStayPet(sp){
     belongings: Array.isArray(sp?.belongings) ? sp.belongings.map(normalizeBelonging) : [],
   };
 }
+function normalizeClosedAppt(a){
+  if(!a) return null;
+  const time = a.time || '', contactName = a.contactName || '', contactPhone = a.contactPhone || '';
+  if(!time && !contactName && !contactPhone) return null;
+  return { time, contactName, contactPhone };
+}
 function normalizeStay(s){
   return {
     id: s?.id || uid('stay'),
@@ -1190,12 +1328,15 @@ function normalizeStay(s){
     checkedIn: s?.checkedIn || false,
     notes: s?.notes || '',
     customRate: (s?.customRate === '' || s?.customRate == null) ? null : +s.customRate,
+    customRateMode: s?.customRateMode === 'percent' ? 'percent' : 'flat', // 'flat' = RM/night override, 'percent' = % off the standard rate
     charges: Array.isArray(s?.charges) ? s.charges.map(c=>({ id:c?.id||uid('charge'), category:c?.category||'Others', description:c?.description||'', amount:+c?.amount||0, qty:c?.qty?+c.qty:1 })) : [],
     pets: Array.isArray(s?.pets) ? s.pets.map(normalizeStayPet) : [],
+    dropoff: normalizeClosedAppt(s?.dropoff), // set when check-in lands on a closed day — {time, contactName, contactPhone} for whoever drops the pet off
+    pickup: normalizeClosedAppt(s?.pickup),   // set when check-out lands on a closed day — same shape, for whoever picks the pet up
   };
 }
 function normalizeGroom(g){
-  const merged = { addons:[], photos:[], notes:'', sizeCode:'', cutCode:'', details:'', status:'Not arrived', ...g };
+  const merged = { addons:[], photos:[], notes:'', sizeCode:'', cutCode:'', details:'', status:'Not arrived', groomColor:null, ...g };
   if(!Array.isArray(merged.apptTypes)){
     merged.apptTypes = merged.apptType ? [merged.apptType] : [];
   }
@@ -1248,6 +1389,15 @@ function addDays(s,n){
   const [y,m,d] = s.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m-1, d));
   dt.setUTCDate(dt.getUTCDate()+n);
+  return dt.toISOString().slice(0,10);
+}
+function addMonths(s,n){
+  const [y,m,d] = s.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m-1, d));
+  dt.setUTCMonth(dt.getUTCMonth()+n);
+  // If the day overflowed into the next month (e.g. Jan 31 + 1 month),
+  // clamp to the last day of the intended month instead of skipping ahead.
+  if(dt.getUTCDate() !== d) dt.setUTCDate(0);
   return dt.toISOString().slice(0,10);
 }
 
@@ -1521,6 +1671,7 @@ function renderCustomersMain(){
 let _subTab = 'info';
 function curSub(){ return _subTab; }
 function setSub(s){ _subTab = s; document.querySelectorAll('#petSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.sub===s)); }
+let _groomSelection = new Set(); // ids of grooming appointments currently ticked for bulk actions on the pet's Grooming history tab — cleared whenever a different pet/tab is opened
 
 function renderPetTabs(cust, activePet){
   const wrap = document.getElementById('petTabs');
@@ -1579,11 +1730,11 @@ function petInfoHtml(p){
       <div class="info-field"><label>Spayed / neutered</label><div>${esc(p.spayed)}</div></div>
       <div class="info-field">
         <label>Last vaccination date</label>
-        <div><input type="date" value="${p.lastVax||''}" data-inline="lastVax" style="border:1px solid var(--line);border-radius:6px;padding:4px 6px;"></div>
+        <div style="max-width:170px;">${dateOverlayHtml('pet_lastVax', p.lastVax||'')}</div>
       </div>
       <div class="info-field">
         <label>Last tick treatment date</label>
-        <div><input type="date" value="${p.lastTick||''}" data-inline="lastTick" style="border:1px solid var(--line);border-radius:6px;padding:4px 6px;"></div>
+        <div style="max-width:170px;">${dateOverlayHtml('pet_lastTick', p.lastTick||'')}</div>
       </div>
       <div class="info-field span2"><label>Medical condition</label><div>${esc(p.medical)||'None reported'}</div></div>
       <div class="info-field"><label>Personality</label><div>${esc(p.personality)||'—'}</div></div>
@@ -1765,6 +1916,8 @@ function stayCardHtml(cust, pet, stay){
     </div>
     <div class="card-body ${isOpen?'':'closed'}">
       ${stay.notes ? `<div style="margin-top:12px;font-size:12.5px;color:var(--ink-soft);"><strong>Notes:</strong> ${esc(stay.notes)}</div>` : ''}
+      ${stay.dropoff ? `<div data-edit-closed-appt="${stay.id}|dropoff" style="cursor:pointer;margin-top:12px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day drop-off: ${esc(stay.dropoff.time)} · ${esc(stay.dropoff.contactName)} (${esc(stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
+      ${stay.pickup ? `<div data-edit-closed-appt="${stay.id}|pickup" style="cursor:pointer;margin-top:8px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day pick-up: ${esc(stay.pickup.time)} · ${esc(stay.pickup.contactName)} (${esc(stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
       ${stay.pets.map(sp => {
         const spPet = findPetById(sp.petId);
         const editable = stay.status==='Active';
@@ -1798,18 +1951,7 @@ function stayCardHtml(cust, pet, stay){
         <div class="charges-list">
           ${stay.charges.length ? stay.charges.map(c=>chargeRowHtml(stay.id, c, stay.status==='Active')).join('') : `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">None recorded</div>`}
         </div>
-        ${stay.status==='Active' ? `
-        <div class="charge-add-row">
-          <select data-charge-cat="${stay.id}">
-            <option>Retail purchase</option>
-            <option>Grooming</option>
-            <option>Others</option>
-          </select>
-          <input placeholder="Item / description…" data-charge-desc="${stay.id}">
-          <input type="number" min="1" step="1" placeholder="Qty" value="1" data-charge-newqty="${stay.id}">
-          <input type="number" step="0.01" min="0" placeholder="RM each" data-charge-amount="${stay.id}">
-          <button type="button" class="btn btn-sm" data-charge-add="${stay.id}">Add</button>
-        </div>` : ''}
+        ${stay.status==='Active' ? chargeAddRowHtml(stay) : ''}
       </div>
       <div class="payments-section" style="margin-top:14px;">
         <div class="payments-head" style="margin-bottom:6px;">
@@ -1842,6 +1984,39 @@ function stayCardHtml(cust, pet, stay){
         }
       </div>
     </div>
+  </div>`;
+}
+/* The "add charge" row: Retail purchase / Others still take a free-typed
+   description + amount. Grooming instead offers a preset picker (auto-priced
+   off the selected pet's grooming size for Bath/Cut, flat rate for the rest)
+   — qty stays freely editable either way. */
+function chargeAddRowHtml(stay){
+  const ui = getChargeAddState(stay);
+  const isGroom = ui.cat === 'Grooming';
+  const petOptions = stay.pets.map(sp=>findPetById(sp.petId)).filter(Boolean);
+  let selectedPet = petOptions.find(p=>p.id===ui.petId) || petOptions[0];
+  let groomOpts = [], selectedOpt = null;
+  if(isGroom && selectedPet){
+    groomOpts = groomChargeOptionsFor(selectedPet);
+    selectedOpt = groomOpts.find(o=>o.key===ui.item) || groomOpts[0];
+  }
+  return `<div class="charge-add-row" data-charge-add-row="${stay.id}">
+    <select data-charge-cat="${stay.id}">
+      <option ${ui.cat==='Retail purchase'?'selected':''}>Retail purchase</option>
+      <option ${ui.cat==='Grooming'?'selected':''}>Grooming</option>
+      <option ${ui.cat==='Others'?'selected':''}>Others</option>
+    </select>
+    ${isGroom ? `
+      ${petOptions.length>1 ? `<select data-charge-groom-pet="${stay.id}">${petOptions.map(p=>`<option value="${p.id}" ${p.id===selectedPet?.id?'selected':''}>${esc(petLabel(p))}</option>`).join('')}</select>` : ''}
+      <select data-charge-groom-item="${stay.id}">${groomOpts.map(o=>`<option value="${o.key}" ${o.key===selectedOpt?.key?'selected':''}>${esc(o.label)} — RM${o.amount.toFixed(2)}</option>`).join('')}</select>
+      <input type="number" min="1" step="1" placeholder="Qty" value="1" data-charge-newqty="${stay.id}">
+      <input type="number" step="0.01" min="0" value="${selectedOpt?selectedOpt.amount.toFixed(2):''}" data-charge-amount="${stay.id}" readonly title="Preset rate — pick a different item to change it" style="background:var(--line-soft);">
+    ` : `
+      <input placeholder="Item / description…" data-charge-desc="${stay.id}">
+      <input type="number" min="1" step="1" placeholder="Qty" value="1" data-charge-newqty="${stay.id}">
+      <input type="number" step="0.01" min="0" placeholder="RM each" data-charge-amount="${stay.id}">
+    `}
+    <button type="button" class="btn btn-sm" data-charge-add="${stay.id}">Add</button>
   </div>`;
 }
 function chargeRowHtml(stayId, c, editable){
@@ -1963,7 +2138,14 @@ function computeStayCost(stay){
       }
       if(!rate) rate = {normal:0, holiday:0};
       const usingCustomRate = stay.customRate != null && stay.customRate >= 0;
-      total += usingCustomRate ? stay.customRate : (holiday ? rate.holiday : rate.normal);
+      const standardRate = holiday ? rate.holiday : rate.normal;
+      let nightRate = standardRate;
+      if(usingCustomRate){
+        nightRate = stay.customRateMode === 'percent'
+          ? standardRate * (1 - Math.min(stay.customRate,100)/100)
+          : stay.customRate;
+      }
+      total += nightRate;
       if(occupants.length>1){
         // every pet after the first sharing this room pays a per-night surcharge, based on its own size
         occupants.slice(1).forEach(o=>{
@@ -2020,6 +2202,19 @@ function isHoliday(dateStr){
 function holidayFor(dateStr){
   return state.holidays.find(h => dateStr >= h.start && dateStr <= h.end) || null;
 }
+function getWeekdayIndex(dateStr){
+  const [y,m,d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, m-1, d)).getUTCDay();
+}
+function closedDateFor(dateStr){
+  if((state.closedWeekdays||[]).includes(getWeekdayIndex(dateStr))){
+    return { id:'weekly-'+getWeekdayIndex(dateStr), name:`Closed every ${WEEKDAY_NAMES[getWeekdayIndex(dateStr)]}`, start:dateStr, end:dateStr, weekly:true };
+  }
+  return (state.closedDates||[]).find(c => dateStr >= c.start && dateStr <= c.end) || null;
+}
+function isClosedDate(dateStr){
+  return !!closedDateFor(dateStr);
+}
 
 /* Is `roomId` free for the [checkIn, checkOut) window? Checks every stay across
    every customer, skipping the stay being edited (excludeStayId) so a room already
@@ -2045,12 +2240,34 @@ function petGroomingHtml(cust, pet){
   const all = pet.groomingHistory.slice();
   const upcoming = all.filter(g => g.date >= today).sort((a,b)=> (a.date+a.time).localeCompare(b.date+b.time));
   const past = all.filter(g => g.date < today).sort((a,b)=> (b.date+b.time).localeCompare(a.date+a.time));
+  // Selection is scoped to this pet's appointment ids only, so switching pets
+  // never carries a stale selection over.
+  const idsHere = new Set(all.map(g=>g.id));
+  Array.from(_groomSelection).forEach(id=>{ if(!idsHere.has(id)) _groomSelection.delete(id); });
+  const selCount = _groomSelection.size;
   return `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div class="section-title" style="margin:0;">Grooming history</div>
       <button class="btn btn-primary btn-sm" data-act="new-groom">+ New appointment</button>
     </div>
     ${all.length===0 ? `<div class="placeholder" style="height:140px;"><b>No grooming sessions yet</b><div>Book ${esc(pet.name)}'s first appointment.</div></div>` : `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);">
+        <label class="check-pill" style="cursor:pointer;"><input type="checkbox" id="groomSelectAll" ${selCount>0 && selCount===all.length?'checked':''}> Select all</label>
+        <span style="font-size:12.5px;color:var(--ink-soft);">${selCount} selected</span>
+        ${selCount>0 ? `
+        <span style="width:1px;height:20px;background:var(--line);"></span>
+        <select id="bulkGroomStatus" style="padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${GROOM_STATUSES.map(s=>`<option>${esc(s)}</option>`).join('')}</select>
+        <button class="btn btn-sm" id="bulkApplyStatusBtn">Set status</button>
+        <input type="number" id="bulkShiftDays" placeholder="±days" style="width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">
+        <button class="btn btn-sm" id="bulkShiftBtn">Shift date(s)</button>
+        <select id="bulkSetTime" style="padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${TIME_SLOTS.map(t=>`<option>${t}</option>`).join('')}</select>
+        <button class="btn btn-sm" id="bulkSetTimeBtn">Set time</button>
+        <select id="bulkSetBay" style="padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${BAYS.map(b=>`<option>${b}</option>`).join('')}</select>
+        <button class="btn btn-sm" id="bulkSetBayBtn">Set bay</button>
+        <button class="btn btn-sm" id="bulkEditFieldsBtn">Edit add-ons / notes</button>
+        <button class="btn btn-sm btn-danger" id="bulkDeleteGroomBtn">Delete selected</button>
+        ` : ''}
+      </div>
       ${upcoming.length ? `<div class="history-group-label">Present &amp; upcoming</div>${upcoming.map(g => groomCardHtml(g)).join('')}` : ''}
       ${past.length ? `<div class="history-group-label">Past</div>${past.map(g => groomCardHtml(g)).join('')}` : ''}
     `}
@@ -2060,12 +2277,14 @@ function petGroomingHtml(cust, pet){
 function groomCardHtml(g){
   const isOpen = state.openGrooms[g.id] ?? false;
   const gStatus = g.status || 'Not arrived';
+  const isSelected = _groomSelection.has(g.id);
   return `
   <div class="groom-card">
     <div class="card-head ${isOpen?'open':''}" data-toggle-groom="${g.id}">
+      <input type="checkbox" data-groom-select-check="${g.id}" ${isSelected?'checked':''} onclick="event.stopPropagation()" style="width:auto;margin-right:2px;">
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
-        <div class="card-head-title">${fmtDate(g.date)} · ${g.time} — ${esc((g.apptTypes||[]).join(', ')||'—')} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
+        <div class="card-head-title">${fmtDateWithDay(g.date)} · ${g.time} — ${esc((g.apptTypes||[]).join(', ')||'—')} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
         <div class="card-head-sub">${esc(g.bay)} ${g.addons.length?'· '+g.addons.length+' add-on(s)':''} ${g.photos.length?'· '+g.photos.length+' photo(s)':''}</div>
       </div>
       <div class="card-head-actions">
@@ -2100,9 +2319,10 @@ function wireSubContentEvents(cust, pet){
   const root = document.getElementById('petSubContent');
   if(!root) return;
 
-  root.querySelectorAll('[data-inline="lastVax"], [data-inline="lastTick"]').forEach(inp=>{
-    inp.addEventListener('change', ()=>{ pet[inp.dataset.inline] = inp.value; toast('Updated'); scheduleSync(); });
-  });
+  const lastVaxEl = root.querySelector('#pet_lastVax');
+  const lastTickEl = root.querySelector('#pet_lastTick');
+  if(lastVaxEl){ lastVaxEl.addEventListener('change', ()=>{ pet.lastVax = lastVaxEl.value; toast('Updated'); scheduleSync(); }); wireDateOverlay('pet_lastVax'); }
+  if(lastTickEl){ lastTickEl.addEventListener('change', ()=>{ pet.lastTick = lastTickEl.value; toast('Updated'); scheduleSync(); }); wireDateOverlay('pet_lastTick'); }
   const editPetBtn = root.querySelector('[data-act="edit-pet"]');
   if(editPetBtn) editPetBtn.addEventListener('click', ()=>openPetModal(cust, pet));
   const delPetBtn = root.querySelector('[data-act="delete-pet"]');
@@ -2223,6 +2443,14 @@ function wireSubContentEvents(cust, pet){
       if(s){ s.status='Past'; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked out'); }
     });
   });
+  root.querySelectorAll('[data-edit-closed-appt]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [stayId, kind] = el.dataset.editClosedAppt.split('|');
+      const s = findStayById(stayId);
+      if(s) openClosedApptEditModal(s, kind, ()=>renderPetSubContent(cust, pet));
+    });
+  });
 
   // --- inline feeding edit (active stays) ---
   root.querySelectorAll('[data-inline-feeding]').forEach(ta=>{
@@ -2234,21 +2462,70 @@ function wireSubContentEvents(cust, pet){
   });
 
   // --- inline additional charges: retail purchases, grooming, other fees (active stays) ---
+  root.querySelectorAll('[data-charge-cat]').forEach(sel=>{
+    sel.addEventListener('change', ()=>{
+      const stayId = sel.dataset.chargeCat;
+      const stay = findStayById(stayId);
+      if(!stay) return;
+      const ui = getChargeAddState(stay);
+      ui.cat = sel.value;
+      if(ui.cat==='Grooming'){
+        const petOptions = stay.pets.map(sp=>findPetById(sp.petId)).filter(Boolean);
+        if(!ui.petId || !petOptions.some(p=>p.id===ui.petId)) ui.petId = petOptions[0]?.id || '';
+        const opts = groomChargeOptionsFor(petOptions.find(p=>p.id===ui.petId));
+        if(!ui.item || !opts.some(o=>o.key===ui.item)) ui.item = opts[0]?.key || '';
+      }
+      renderPetSubContent(cust, pet);
+    });
+  });
+  root.querySelectorAll('[data-charge-groom-pet]').forEach(sel=>{
+    sel.addEventListener('change', ()=>{
+      const stayId = sel.dataset.chargeGroomPet;
+      const stay = findStayById(stayId);
+      if(!stay) return;
+      const ui = getChargeAddState(stay);
+      ui.petId = sel.value;
+      const opts = groomChargeOptionsFor(findPetById(ui.petId));
+      ui.item = opts[0]?.key || '';
+      renderPetSubContent(cust, pet);
+    });
+  });
+  root.querySelectorAll('[data-charge-groom-item]').forEach(sel=>{
+    sel.addEventListener('change', ()=>{
+      const stayId = sel.dataset.chargeGroomItem;
+      const stay = findStayById(stayId);
+      if(!stay) return;
+      getChargeAddState(stay).item = sel.value;
+      renderPetSubContent(cust, pet);
+    });
+  });
   root.querySelectorAll('[data-charge-add]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const stayId = btn.dataset.chargeAdd;
       const stay = findStayById(stayId);
       if(!stay) return;
+      const ui = getChargeAddState(stay);
       const cat = root.querySelector(`[data-charge-cat="${stayId}"]`).value;
-      const descEl = root.querySelector(`[data-charge-desc="${stayId}"]`);
       const qtyEl = root.querySelector(`[data-charge-newqty="${stayId}"]`);
+      const qty = +qtyEl.value || 1;
+      if(qty<1){ toast('Quantity must be at least 1'); return; }
+      if(cat==='Grooming'){
+        const petOptions = stay.pets.map(sp=>findPetById(sp.petId)).filter(Boolean);
+        const selectedPet = petOptions.find(p=>p.id===ui.petId) || petOptions[0];
+        const opts = groomChargeOptionsFor(selectedPet);
+        const opt = opts.find(o=>o.key===ui.item) || opts[0];
+        if(!opt){ toast('No grooming option available for this pet'); return; }
+        stay.charges.push({ id: uid('charge'), category:'Grooming', description: opt.label, amount: opt.amount, qty });
+        renderPetSubContent(cust, pet);
+        toast('Charge added');
+        return;
+      }
+      const descEl = root.querySelector(`[data-charge-desc="${stayId}"]`);
       const amountEl = root.querySelector(`[data-charge-amount="${stayId}"]`);
       const description = descEl.value.trim();
-      const qty = +qtyEl.value || 1;
       const amount = +amountEl.value;
       if(!description){ toast('Please describe the item/charge'); return; }
       if(!amount || amount<=0){ toast('Please enter a valid amount'); return; }
-      if(qty<1){ toast('Quantity must be at least 1'); return; }
       stay.charges.push({ id: uid('charge'), category: cat, description, amount, qty });
       renderPetSubContent(cust, pet);
       toast('Charge added');
@@ -2327,6 +2604,98 @@ function wireSubContentEvents(cust, pet){
       if(g){ g.status = sel.value; scheduleSync(); toast(`Status set to "${g.status}"`); }
     });
   });
+  // --- bulk selection & bulk actions on the Grooming history tab ---
+  root.querySelectorAll('[data-groom-select-check]').forEach(cb=>{
+    cb.addEventListener('change', ()=>{
+      const id = cb.dataset.groomSelectCheck;
+      if(cb.checked) _groomSelection.add(id); else _groomSelection.delete(id);
+      renderPetSubContent(cust, pet);
+    });
+  });
+  const selectAllCb = root.querySelector('#groomSelectAll');
+  if(selectAllCb){
+    selectAllCb.addEventListener('change', ()=>{
+      if(selectAllCb.checked){ pet.groomingHistory.forEach(g=>_groomSelection.add(g.id)); }
+      else { _groomSelection.clear(); }
+      renderPetSubContent(cust, pet);
+    });
+  }
+  const bulkApplyStatusBtn = root.querySelector('#bulkApplyStatusBtn');
+  if(bulkApplyStatusBtn){
+    bulkApplyStatusBtn.addEventListener('click', ()=>{
+      const newStatus = root.querySelector('#bulkGroomStatus').value;
+      let count = 0;
+      pet.groomingHistory.forEach(g=>{ if(_groomSelection.has(g.id)){ g.status = newStatus; count++; } });
+      scheduleSync();
+      renderPetSubContent(cust, pet);
+      toast(`Status set to "${newStatus}" for ${count} appointment${count===1?'':'s'}`);
+    });
+  }
+  // Shared by "Shift date(s)", "Set time", and "Set bay" below: applies
+  // computeNew(g) — which returns the target {date, time, bay} — to every
+  // selected appointment. Anything that would land on an already-booked
+  // bay/time is held back and handed to a follow-up popup so staff can pick
+  // a new time/bay for just those, instead of silently skipping them.
+  function bulkApplyBooking(computeNew, verb){
+    let moved = 0; const conflicts = [];
+    pet.groomingHistory.forEach(g=>{
+      if(!_groomSelection.has(g.id)) return;
+      const { date:newDate, time:newTime, bay:newBay } = computeNew(g);
+      if(findGroomConflict(newDate, newTime, newBay, g.id)){
+        conflicts.push({ groomId: g.id, newDate, newTime, newBay });
+      } else {
+        g.date = newDate; g.time = newTime; g.bay = newBay;
+        moved++;
+      }
+    });
+    scheduleSync();
+    renderPetSubContent(cust, pet);
+    if(conflicts.length){
+      toast(`${verb} ${moved} appointment${moved===1?'':'s'} — ${conflicts.length} need a new time/bay`);
+      openShiftConflictsModal(cust, pet, conflicts);
+    } else {
+      toast(`${verb} ${moved} appointment${moved===1?'':'s'}`);
+    }
+  }
+  const bulkShiftBtn = root.querySelector('#bulkShiftBtn');
+  if(bulkShiftBtn){
+    bulkShiftBtn.addEventListener('click', ()=>{
+      const daysInput = root.querySelector('#bulkShiftDays');
+      const days = parseInt(daysInput.value, 10);
+      if(!days){ toast('Enter a number of days to shift by (e.g. 7, or -7)'); return; }
+      bulkApplyBooking(g=>({date:addDays(g.date, days), time:g.time, bay:g.bay}), 'Shifted');
+    });
+  }
+  const bulkSetTimeBtn = root.querySelector('#bulkSetTimeBtn');
+  if(bulkSetTimeBtn){
+    bulkSetTimeBtn.addEventListener('click', ()=>{
+      const newTime = root.querySelector('#bulkSetTime').value;
+      bulkApplyBooking(g=>({date:g.date, time:newTime, bay:g.bay}), 'Set time for');
+    });
+  }
+  const bulkSetBayBtn = root.querySelector('#bulkSetBayBtn');
+  if(bulkSetBayBtn){
+    bulkSetBayBtn.addEventListener('click', ()=>{
+      const newBay = root.querySelector('#bulkSetBay').value;
+      bulkApplyBooking(g=>({date:g.date, time:g.time, bay:newBay}), 'Set bay for');
+    });
+  }
+  const bulkEditFieldsBtn = root.querySelector('#bulkEditFieldsBtn');
+  if(bulkEditFieldsBtn){
+    bulkEditFieldsBtn.addEventListener('click', ()=>{ openBulkGroomFieldsModal(cust, pet, new Set(_groomSelection)); });
+  }
+  const bulkDeleteGroomBtn = root.querySelector('#bulkDeleteGroomBtn');
+  if(bulkDeleteGroomBtn){
+    bulkDeleteGroomBtn.addEventListener('click', ()=>{
+      const count = _groomSelection.size;
+      if(!confirm(`Delete ${count} selected grooming appointment${count===1?'':'s'} permanently?`)) return;
+      pet.groomingHistory = pet.groomingHistory.filter(g=>!_groomSelection.has(g.id));
+      _groomSelection.clear();
+      scheduleSync();
+      renderPetSubContent(cust, pet);
+      toast(`${count} appointment${count===1?'':'s'} deleted`);
+    });
+  }
   root.querySelectorAll('[data-act="edit-groom"]').forEach(el=>{
     el.addEventListener('click', (e)=>{ e.stopPropagation(); openGroomModal(cust, pet, pet.groomingHistory.find(g=>g.id===el.dataset.groom)); });
   });
@@ -2452,7 +2821,7 @@ function openCustomerModal(existing){
         <div class="field"><label>Gender</label>
           <select id="f_gender"><option ${c.gender==='Female'?'selected':''}>Female</option><option ${c.gender==='Male'?'selected':''}>Male</option><option ${c.gender==='Other'?'selected':''}>Other</option></select>
         </div>
-        <div class="field"><label>Date of birth</label><input type="date" id="f_dob" value="${c.dob||''}"></div>
+        <div class="field"><label>Date of birth</label>${dateOverlayHtml('f_dob', c.dob||'')}</div>
         <div class="field"><label>Emergency contact name</label><input id="f_ename" value="${esc(c.emergencyName)}"></div>
         <div class="field span2"><label>Emergency contact phone</label><input id="f_ephone" value="${esc(c.emergencyPhone)}"></div>
       </div>
@@ -2470,6 +2839,7 @@ function openCustomerModal(existing){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Add customer'}</button>
     </div>
   `);
+  wireDateOverlay('f_dob');
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const name = document.getElementById('f_name').value.trim();
@@ -2531,7 +2901,7 @@ function openPaymentModal(cust, existing, presetStayId){
           <select id="pay_type"><option ${p.type==='Deposit'?'selected':''}>Deposit</option><option ${p.type==='Full payment'?'selected':''}>Full payment</option></select>
         </div>
         <div class="field"><label>Amount (RM)</label><input type="number" step="0.01" min="0" id="pay_amount" value="${esc(p.amount)}" placeholder="0.00"></div>
-        <div class="field"><label>Date</label><input type="date" id="pay_date" value="${p.date}"></div>
+        <div class="field"><label>Date</label>${dateOverlayHtml('pay_date', p.date)}</div>
         <div class="field span3">
           <label>Which stay(s) is this for? <span style="font-weight:500;color:var(--ink-soft);">— tick just one to keep it separate, or tick several if the customer is paying one bill for multiple bookings</span></label>
           <div class="checks" id="pay_stayChecks">
@@ -2550,6 +2920,7 @@ function openPaymentModal(cust, existing, presetStayId){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Add payment'}</button>
     </div>
   `);
+  wireDateOverlay('pay_date');
   function updateStaySummary(){
     const ids = Array.from(document.querySelectorAll('#pay_stayChecks input[data-pay-stay-check]:checked')).map(cb=>cb.value);
     const box = document.getElementById('pay_staySummary');
@@ -2599,7 +2970,7 @@ function openPointsModal(cust, existing){
           <select id="pts_type"><option value="Add" ${p.type==='Add'?'selected':''}>Add (top-up)</option><option value="Deduct" ${p.type==='Deduct'?'selected':''}>Deduct (used)</option></select>
         </div>
         <div class="field"><label>Points</label><input type="number" step="1" min="0" id="pts_amount" value="${esc(p.amount)}" placeholder="0"></div>
-        <div class="field"><label>Date</label><input type="date" id="pts_date" value="${p.date}"></div>
+        <div class="field"><label>Date</label>${dateOverlayHtml('pts_date', p.date)}</div>
         <div class="field span3" id="pts_receipt_field">
           <label>Receipt / invoice number <span style="font-weight:400;color:var(--ink-soft);">(when redeemed)</span></label>
           <input id="pts_receipt" value="${esc(p.receiptNo)}" placeholder="e.g. INV-2026-0142">
@@ -2612,6 +2983,7 @@ function openPointsModal(cust, existing){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Save'}</button>
     </div>
   `);
+  wireDateOverlay('pts_date');
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const amount = +document.getElementById('pts_amount').value;
@@ -2782,7 +3154,7 @@ function openPetModal(cust, existing){
         <div class="field"><label>Gender</label>
           <select id="p_gender"><option ${p.gender==='Male'?'selected':''}>Male</option><option ${p.gender==='Female'?'selected':''}>Female</option></select>
         </div>
-        <div class="field"><label>Date of birth</label><input type="date" id="p_dob" value="${p.dob||''}"></div>
+        <div class="field"><label>Date of birth</label>${dateOverlayHtml('p_dob', p.dob||'')}</div>
         <div class="field"><label>Boarding size</label>
           <select id="p_bsize">${PET_SIZES.map(s=>`<option ${p.boardingSize===s?'selected':''}>${s}</option>`).join('')}</select>
         </div>
@@ -2792,8 +3164,8 @@ function openPetModal(cust, existing){
         <div class="field"><label>Spayed / neutered</label>
           <select id="p_spayed"><option ${p.spayed==='Yes'?'selected':''}>Yes</option><option ${p.spayed==='No'?'selected':''}>No</option></select>
         </div>
-        <div class="field"><label>Last vaccination date</label><input type="date" id="p_vax" value="${p.lastVax||''}"></div>
-        <div class="field span2"><label>Last tick treatment date</label><input type="date" id="p_tick" value="${p.lastTick||''}"></div>
+        <div class="field"><label>Last vaccination date</label>${dateOverlayHtml('p_vax', p.lastVax||'')}</div>
+        <div class="field span2"><label>Last tick treatment date</label>${dateOverlayHtml('p_tick', p.lastTick||'')}</div>
         <div class="field span2"><label>Medical condition (if any)</label><textarea id="p_medical">${esc(p.medical)}</textarea></div>
         <div class="field span2"><label>Personality</label><textarea id="p_pers">${esc(p.personality)}</textarea></div>
         <div class="field span2"><label>Special requests (if any)</label><textarea id="p_special">${esc(p.special)}</textarea></div>
@@ -2804,6 +3176,9 @@ function openPetModal(cust, existing){
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Add pet'}</button>
     </div>
   `);
+  wireDateOverlay('p_dob');
+  wireDateOverlay('p_vax');
+  wireDateOverlay('p_tick');
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('p_type').addEventListener('change', (e)=>{
     const breeds = e.target.value === 'Cat' ? CAT_BREEDS : DOG_BREEDS;
@@ -2829,6 +3204,40 @@ function openPetModal(cust, existing){
 }
 
 /* ---- Stay modal ---- */
+/* ---- Quick edit for a closed-day drop-off/pick-up appointment, without
+   reopening the full stay modal. `onSaved` lets each caller decide how to
+   refresh its own view afterward (pet page vs. boarding calendar). ---- */
+function openClosedApptEditModal(stay, kind, onSaved){
+  const isDropoff = kind==='dropoff';
+  const current = stay[kind] || {time:'', contactName:'', contactPhone:''};
+  openModal(`
+    <div class="modal-head"><h3>Edit ${isDropoff?'drop-off':'pick-up'} appointment</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="form-grid c3">
+        <div class="field"><label>${isDropoff?'Drop-off':'Pick-up'} time</label><input type="time" id="ca_time" value="${esc(current.time)}"></div>
+        <div class="field"><label>Contact name</label><input id="ca_name" value="${esc(current.contactName)}" placeholder="${isDropoff?"Who's dropping off":"Who's picking up"}"></div>
+        <div class="field"><label>Contact number</label><input id="ca_phone" value="${esc(current.contactPhone)}" placeholder="Phone number"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const time = document.getElementById('ca_time').value;
+    const contactName = document.getElementById('ca_name').value.trim();
+    const contactPhone = document.getElementById('ca_phone').value.trim();
+    if(!time || !contactName || !contactPhone){ toast('Please fill in time, contact name, and contact number'); return; }
+    stay[kind] = { time, contactName, contactPhone };
+    closeModal();
+    scheduleSync();
+    toast(`${isDropoff?'Drop-off':'Pick-up'} appointment updated`);
+    if(onSaved) onSaved();
+  });
+}
+
 function openStayModal(cust, primaryPet, existing){
   const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: addDays(todayStr(),2), status:'Active', notes:'',
     pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[] }] };
@@ -2838,17 +3247,18 @@ function openStayModal(cust, primaryPet, existing){
     <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div class="form-grid c3">
-        <div class="field"><label>Check-in date</label><input type="date" id="s_in" value="${s.checkIn}"><span class="date-weekday-hint" id="s_in_wd">${weekdayShort(s.checkIn)}</span></div>
-        <div class="field"><label>Check-out date</label><input type="date" id="s_out" value="${s.checkOut}"><span class="date-weekday-hint" id="s_out_wd">${weekdayShort(s.checkOut)}</span></div>
+        <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="s_in" value="${s.checkIn}"><span class="date-overlay-label" id="s_in_wd">${fmtDateSlashDay(s.checkIn)}</span></div></div>
+        <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="s_out" value="${s.checkOut}"><span class="date-overlay-label" id="s_out_wd">${fmtDateSlashDay(s.checkOut)}</span></div></div>
         <div class="field"><label>Stay status</label>
           <select id="s_status"><option ${s.status==='Active'?'selected':''}>Active</option><option ${s.status==='Past'?'selected':''}>Past</option></select>
         </div>
         <div class="field">
-          <label>Custom room rate / night (RM)</label>
-          <input type="number" step="0.01" min="0" id="s_rate" value="${s.customRate==null?'':s.customRate}" placeholder="Leave blank to use standard rate">
+          <label>Special rate (promo/custom, per night)</label>
+          ${customRateFieldHtml('s_rate', s.customRate, s.customRateMode)}
         </div>
         <div class="field span3"><label>General stay notes</label><textarea id="s_notes">${esc(s.notes)}</textarea></div>
       </div>
+      <div id="closedApptWrap"></div>
       <fieldset id="stayPetsWrap">
         <legend>Pets in this stay</legend>
         <div id="stayPetRows">${rows}</div>
@@ -2862,11 +3272,57 @@ function openStayModal(cust, primaryPet, existing){
     </div>
   `, {wide:true});
 
+  let workingDropoff = s.dropoff ? {...s.dropoff} : {time:'09:00', contactName:'', contactPhone:''};
+  let workingPickup = s.pickup ? {...s.pickup} : {time:'17:00', contactName:'', contactPhone:''};
+  function closedApptSectionHtml(){
+    const inClosed = closedDateFor(document.getElementById('s_in').value);
+    const outClosed = closedDateFor(document.getElementById('s_out').value);
+    if(!inClosed && !outClosed) return '';
+    return `<fieldset style="border-color:#EEB3AC;background:#FBE4E2;">
+      <legend style="color:#A23B2C;">🚫 Closed-day drop-off / pick-up</legend>
+      ${inClosed ? `
+      <div style="margin-bottom:${outClosed?'12px':'0'};">
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(document.getElementById('s_in').value)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
+        <div class="form-grid c3">
+          <div class="field"><label>Drop-off time</label><input type="time" id="s_dropoff_time" value="${esc(workingDropoff.time)}"></div>
+          <div class="field"><label>Contact name</label><input id="s_dropoff_name" value="${esc(workingDropoff.contactName)}" placeholder="Who's dropping off"></div>
+          <div class="field"><label>Contact number</label><input id="s_dropoff_phone" value="${esc(workingDropoff.contactPhone)}" placeholder="Phone number"></div>
+        </div>
+      </div>` : ''}
+      ${outClosed ? `
+      <div>
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(document.getElementById('s_out').value)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
+        <div class="form-grid c3">
+          <div class="field"><label>Pick-up time</label><input type="time" id="s_pickup_time" value="${esc(workingPickup.time)}"></div>
+          <div class="field"><label>Contact name</label><input id="s_pickup_name" value="${esc(workingPickup.contactName)}" placeholder="Who's picking up"></div>
+          <div class="field"><label>Contact number</label><input id="s_pickup_phone" value="${esc(workingPickup.contactPhone)}" placeholder="Phone number"></div>
+        </div>
+      </div>` : ''}
+    </fieldset>`;
+  }
+  function wireClosedApptInputs(){
+    const dt = document.getElementById('s_dropoff_time'), dn = document.getElementById('s_dropoff_name'), dp = document.getElementById('s_dropoff_phone');
+    if(dt) dt.addEventListener('input', ()=>{ workingDropoff.time = dt.value; });
+    if(dn) dn.addEventListener('input', ()=>{ workingDropoff.contactName = dn.value; });
+    if(dp) dp.addEventListener('input', ()=>{ workingDropoff.contactPhone = dp.value; });
+    const pt = document.getElementById('s_pickup_time'), pn = document.getElementById('s_pickup_name'), pp = document.getElementById('s_pickup_phone');
+    if(pt) pt.addEventListener('input', ()=>{ workingPickup.time = pt.value; });
+    if(pn) pn.addEventListener('input', ()=>{ workingPickup.contactName = pn.value; });
+    if(pp) pp.addEventListener('input', ()=>{ workingPickup.contactPhone = pp.value; });
+  }
+  function refreshClosedApptWrap(){
+    document.getElementById('closedApptWrap').innerHTML = closedApptSectionHtml();
+    wireClosedApptInputs();
+  }
+  refreshClosedApptWrap();
+
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('s_in').addEventListener('change', refreshStayRows);
   document.getElementById('s_out').addEventListener('change', refreshStayRows);
-  document.getElementById('s_in').addEventListener('change', (e)=>{ document.getElementById('s_in_wd').textContent = weekdayShort(e.target.value); });
-  document.getElementById('s_out').addEventListener('change', (e)=>{ document.getElementById('s_out_wd').textContent = weekdayShort(e.target.value); });
+  document.getElementById('s_in').addEventListener('change', refreshClosedApptWrap);
+  document.getElementById('s_out').addEventListener('change', refreshClosedApptWrap);
+  document.getElementById('s_in').addEventListener('change', (e)=>{ document.getElementById('s_in_wd').textContent = fmtDateSlashDay(e.target.value); });
+  document.getElementById('s_out').addEventListener('change', (e)=>{ document.getElementById('s_out_wd').textContent = fmtDateSlashDay(e.target.value); });
   document.getElementById('addStayPetBtn').addEventListener('click', ()=>{
     const otherPets = allPetsExcept(cust, workingPets.map(w=>w.petId));
     if(otherPets.length===0){ toast('No other pets on this customer to add'); return; }
@@ -3000,39 +3456,189 @@ function openStayModal(cust, primaryPet, existing){
     const checkOut = document.getElementById('s_out').value;
     if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid check-in/check-out dates'); return; }
     if(workingPets.some(w=>!w.room)){ toast('Please assign a room to every pet in the stay'); return; }
+    const inClosed = closedDateFor(checkIn);
+    const outClosed = closedDateFor(checkOut);
+    if(inClosed && !(workingDropoff.time && workingDropoff.contactName && workingDropoff.contactPhone)){
+      toast('Check-in falls on a closed day — please fill in the drop-off time and contact details');
+      return;
+    }
+    if(outClosed && !(workingPickup.time && workingPickup.contactName && workingPickup.contactPhone)){
+      toast('Check-out falls on a closed day — please fill in the pick-up time and contact details');
+      return;
+    }
     const conflictRoom = workingPets.find(w => !isRoomAvailable(w.room, checkIn, checkOut, existing?.id));
     if(conflictRoom){ toast(`${conflictRoom.room} is already booked for these dates — please choose a different room`); return; }
     for(const w of workingPets){
       const wPet = findPetAcrossStay(cust, w.petId);
       if(wPet && !confirmIfNearbyStay(wPet, checkIn, existing?.id)) return;
     }
-    const rateInput = document.getElementById('s_rate').value;
-    const customRate = rateInput === '' ? null : +rateInput;
-    const payload = { checkIn, checkOut, status:document.getElementById('s_status').value, notes:document.getElementById('s_notes').value, customRate, pets:workingPets };
-    let freeResult = { assignedCount:0, assignedList:[] };
-    if(existing){ Object.assign(existing, payload); }
-    else{
-      primaryPet.stays.push({ id:uid('stay'), charges:[], ...payload });
-      freeResult = assignFreeGroomings(cust, checkIn, checkOut, workingPets.flatMap(w=>[w.petId, ...(w.sharingWith||[])]));
-    }
-    closeModal(); renderPetSubContent(cust, primaryPet);
-    if(freeResult.assignedCount > 0){
-      toast(`Stay created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
-      openFreeGroomingSummaryModal(freeResult.assignedList);
-    } else {
-      toast(existing ? 'Stay updated' : 'Stay created');
-    }
+    const { customRate, customRateMode } = readCustomRate('s_rate');
+    const payload = {
+      checkIn, checkOut, status:document.getElementById('s_status').value, notes:document.getElementById('s_notes').value, customRate, customRateMode, pets:workingPets,
+      dropoff: inClosed ? {...workingDropoff} : null,
+      pickup: outClosed ? {...workingPickup} : null,
+    };
+    const doSave = ()=>{
+      let freeResult = { assignedCount:0, assignedList:[] };
+      if(existing){ Object.assign(existing, payload); }
+      else{
+        primaryPet.stays.push({ id:uid('stay'), charges:[], ...payload });
+        freeResult = assignFreeGroomings(cust, checkIn, checkOut, workingPets.flatMap(w=>[w.petId, ...(w.sharingWith||[])]));
+      }
+      closeModal(); renderPetSubContent(cust, primaryPet);
+      if(freeResult.assignedCount > 0){
+        toast(`Stay created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
+        openFreeGroomingSummaryModal(freeResult.assignedList);
+      } else {
+        toast(existing ? 'Stay updated' : 'Stay created');
+      }
+    };
+    const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
+    if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
   });
 }
 
 /* ---- Grooming modal ---- */
-function openGroomModal(cust, pet, existing){
-  const g = existing || { id:'', date:todayStr(), time:'10:00', bay:'Bay 1', apptTypes:[], sizeCode: pet.groomingSize || '', cutCode:'', details:'', addons:[], photos:[], notes:'', status:'Not arrived' };
+/* ---- After a bulk date-shift, resolve appointments whose original time/bay
+   is already taken on their new date — let staff pick a new time and bay
+   for each, right here, instead of leaving them unshifted. ---- */
+/* ---- Bulk-edit add-ons and/or notes across every selected grooming
+   appointment on a pet's card, in one pass. Add-ons can either replace
+   what's on each appointment or be added on top of whatever's already
+   there; notes can replace or append. Each section applies independently
+   so staff can do one or both without reopening the modal. ---- */
+function openBulkGroomFieldsModal(cust, pet, ids){
+  const count = ids.size;
+  openModal(`
+    <div class="modal-head"><h3>Edit ${count} selected appointment${count===1?'':'s'}</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <fieldset>
+        <legend>Add-ons</legend>
+        ${multiSelectFieldHtml('bulk_addon', 'Add-ons to apply', ADDONS)}
+        <div class="checks" style="margin-top:8px;">
+          <label class="check-pill"><input type="radio" name="bulk_addon_mode" value="replace" checked style="width:auto;"> Replace existing add-ons</label>
+          <label class="check-pill"><input type="radio" name="bulk_addon_mode" value="append" style="width:auto;"> Add to existing add-ons</label>
+        </div>
+        <button class="btn btn-sm btn-primary" id="bulkApplyAddonsBtn" style="margin-top:10px;">Apply add-ons to ${count} appointment${count===1?'':'s'}</button>
+      </fieldset>
+      <fieldset>
+        <legend>Notes</legend>
+        <div class="field span3"><textarea id="bulk_notes" placeholder="Notes text…"></textarea></div>
+        <div class="checks" style="margin-top:8px;">
+          <label class="check-pill"><input type="radio" name="bulk_notes_mode" value="append" checked style="width:auto;"> Add to existing notes</label>
+          <label class="check-pill"><input type="radio" name="bulk_notes_mode" value="replace" style="width:auto;"> Replace existing notes</label>
+        </div>
+        <button class="btn btn-sm btn-primary" id="bulkApplyNotesBtn" style="margin-top:10px;">Apply notes to ${count} appointment${count===1?'':'s'}</button>
+      </fieldset>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Done</button>
+    </div>
+  `, {wide:true});
+  const getBulkAddons = wireMultiSelectEditor('bulk_addon', ADDONS, []);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('bulkApplyAddonsBtn').addEventListener('click', ()=>{
+    const chosen = getBulkAddons();
+    if(chosen.length===0){ toast('Pick at least one add-on to apply'); return; }
+    const mode = document.querySelector('[name="bulk_addon_mode"]:checked').value;
+    let applied = 0;
+    pet.groomingHistory.forEach(g=>{
+      if(!ids.has(g.id)) return;
+      g.addons = mode==='replace' ? [...chosen] : [...new Set([...(g.addons||[]), ...chosen])];
+      applied++;
+    });
+    scheduleSync();
+    if(state.activeTab==='customers') renderPetSubContent(cust, pet);
+    toast(`Add-ons applied to ${applied} appointment${applied===1?'':'s'}`);
+  });
+  document.getElementById('bulkApplyNotesBtn').addEventListener('click', ()=>{
+    const text = document.getElementById('bulk_notes').value.trim();
+    if(!text){ toast('Enter some notes text to apply'); return; }
+    const mode = document.querySelector('[name="bulk_notes_mode"]:checked').value;
+    let applied = 0;
+    pet.groomingHistory.forEach(g=>{
+      if(!ids.has(g.id)) return;
+      g.notes = mode==='replace' ? text : [g.notes, text].filter(Boolean).join(' · ');
+      applied++;
+    });
+    scheduleSync();
+    if(state.activeTab==='customers') renderPetSubContent(cust, pet);
+    toast(`Notes applied to ${applied} appointment${applied===1?'':'s'}`);
+  });
+}
+
+function openShiftConflictsModal(cust, pet, conflicts){
+  const rows = conflicts.map(c=>{
+    const g = pet.groomingHistory.find(x=>x.id===c.groomId);
+    if(!g) return '';
+    const wantTime = c.newTime || g.time;
+    const wantBay = c.newBay || g.bay;
+    return `<div class="form-grid c3" data-shiftrow="${g.id}" style="margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line-soft);">
+      <div class="field span3" style="margin-bottom:0;"><label>${esc((g.apptTypes||[]).join(', ')||'Appointment')} — new date ${fmtDateWithDay(c.newDate)}</label></div>
+      <div class="field"><label>Time</label>
+        <select data-shift-time>${TIME_SLOTS.map(t=>`<option ${t===wantTime?'selected':''}>${t}</option>`).join('')}</select>
+      </div>
+      <div class="field span2"><label>Bay</label>
+        <select data-shift-bay>${bayOptionsHtml(c.newDate, wantTime, wantBay, g.id)}</select>
+      </div>
+    </div>`;
+  }).join('');
+  openModal(`
+    <div class="modal-head"><h3>Pick a new time/bay</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">These appointments' usual time/bay is already booked on their shifted date — choose a different one for each.</div>
+      <div id="shiftRows">${rows}</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Leave unshifted</button>
+      <button class="btn btn-primary" id="saveBtn">Apply</button>
+    </div>
+  `, {wide:true});
+  function refreshBayOptions(row){
+    const g = pet.groomingHistory.find(x=>x.id===row.dataset.shiftrow);
+    const c = conflicts.find(x=>x.groomId===row.dataset.shiftrow);
+    const timeSel = row.querySelector('[data-shift-time]');
+    const baySel = row.querySelector('[data-shift-bay]');
+    const cur = baySel.value;
+    baySel.innerHTML = bayOptionsHtml(c.newDate, timeSel.value, cur, g.id);
+  }
+  document.querySelectorAll('#shiftRows [data-shiftrow]').forEach(row=>{
+    row.querySelector('[data-shift-time]').addEventListener('change', ()=>refreshBayOptions(row));
+  });
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const rowsEls = document.querySelectorAll('#shiftRows [data-shiftrow]');
+    // Validate every row has a non-occupied bay selected before applying any of them.
+    for(const row of rowsEls){
+      const baySel = row.querySelector('[data-shift-bay]');
+      if(!baySel.value){ toast('Please pick an available bay for every appointment'); return; }
+    }
+    let applied = 0;
+    rowsEls.forEach(row=>{
+      const g = pet.groomingHistory.find(x=>x.id===row.dataset.shiftrow);
+      const c = conflicts.find(x=>x.groomId===row.dataset.shiftrow);
+      if(!g || !c) return;
+      g.date = c.newDate;
+      g.time = row.querySelector('[data-shift-time]').value;
+      g.bay = row.querySelector('[data-shift-bay]').value;
+      applied++;
+    });
+    closeModal();
+    renderPetSubContent(cust, pet);
+    scheduleSync();
+    toast(`${applied} appointment${applied===1?'':'s'} shifted with a new time/bay`);
+  });
+}
+
+function openGroomModal(cust, pet, existing, opts){
+  opts = opts || {};
+  const g = existing || { id:'', date:todayStr(), time:'10:00', bay:'Bay 1', apptTypes:[], sizeCode: pet.groomingSize || '', cutCode:'', details:'', addons:[], photos:[], notes:'', status:'Not arrived', groomColor:null };
+  let selectedColor = g.groomColor || null;
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit appointment':'New grooming appointment'} — ${petLabel(pet)}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div class="form-grid c3">
-        <div class="field"><label>Date</label><input type="date" id="g_date" value="${g.date}"></div>
+        <div class="field"><label>Date</label><div class="date-overlay-wrap"><input type="date" id="g_date" value="${g.date}"><span class="date-overlay-label" id="g_date_wd">${fmtDateSlashDay(g.date)}</span></div></div>
         <div class="field"><label>Time</label>
           <select id="g_time">${TIME_SLOTS.map(t=>`<option ${t===g.time?'selected':''}>${t}</option>`).join('')}</select>
         </div>
@@ -3042,19 +3648,49 @@ function openGroomModal(cust, pet, existing){
         <div class="field span3"><label>Status</label>
           <select id="g_status">${GROOM_STATUSES.map(s=>`<option ${s===g.status?'selected':''}>${s}</option>`).join('')}</select>
         </div>
+        <div class="field span3"><label>Slot colour (grid display)</label>
+          <div class="colour-swatch-row" id="g_colour_row">
+            ${CATEGORICAL_COLORS.map(c=>`<button type="button" class="colour-swatch ${selectedColor===c?'colour-swatch-active':''}" style="background:${c};" data-g-colour="${c}" title="${c}"></button>`).join('')}
+            <button type="button" class="colour-swatch colour-swatch-auto ${!selectedColor?'colour-swatch-active':''}" data-g-colour-auto title="Back to automatic (owner colour)">↺</button>
+          </div>
+        </div>
         ${multiSelectFieldHtml('g_apt', 'Appointment type', APPT_TYPES)}
         <div class="field"><label>Size</label><input id="g_size" value="${esc(g.sizeCode)}" placeholder="e.g. Small"></div>
         <div class="field span2"><label>Cut code</label><input id="g_cutcode" value="${esc(g.cutCode)}" placeholder="e.g. 8 inch blade, teddy bear face"></div>
         <div class="field span3"><label>Grooming details (internal notes)</label><textarea id="g_details">${esc(g.details)}</textarea></div>
         ${multiSelectFieldHtml('g_addon', 'Add-on services', ADDONS)}
         <div class="field span3"><label>Notes</label><textarea id="g_notes">${esc(g.notes)}</textarea></div>
+        ${!existing ? `
+        <div class="field span3"><label>Repeat</label>
+          <select id="g_repeat">
+            <option value="none">Doesn't repeat — book just this one</option>
+            <option value="weekly">Every week</option>
+            <option value="biweekly">Every 2 weeks</option>
+            <option value="monthly">Every month</option>
+          </select>
+        </div>
+        <div class="field span3 hidden" id="g_repeat_until_wrap"><label>Repeat until (last appointment on or before this date)</label>${dateOverlayHtml('g_repeat_until', '')}</div>
+        ` : ''}
       </div>
     </div>
     <div class="modal-foot">
-      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn" id="cancelBtn">${opts.onCancel?'Back':'Cancel'}</button>
       <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Book appointment'}</button>
     </div>
   `, {wide:true});
+  document.querySelectorAll('#g_colour_row [data-g-colour]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      selectedColor = btn.dataset.gColour;
+      document.querySelectorAll('#g_colour_row .colour-swatch').forEach(b=>b.classList.remove('colour-swatch-active'));
+      btn.classList.add('colour-swatch-active');
+    });
+  });
+  const gColourAutoBtn = document.querySelector('[data-g-colour-auto]');
+  if(gColourAutoBtn) gColourAutoBtn.addEventListener('click', ()=>{
+    selectedColor = null;
+    document.querySelectorAll('#g_colour_row .colour-swatch').forEach(b=>b.classList.remove('colour-swatch-active'));
+    gColourAutoBtn.classList.add('colour-swatch-active');
+  });
   const getGTypes = wireMultiSelectEditor('g_apt', APPT_TYPES, g.apptTypes||[]);
   const getGAddons = wireMultiSelectEditor('g_addon', ADDONS, g.addons||[]);
   function refreshGBay(){
@@ -3063,34 +3699,82 @@ function openGroomModal(cust, pet, existing){
     bayEl.innerHTML = bayOptionsHtml(document.getElementById('g_date').value, document.getElementById('g_time').value, cur, existing?.id);
   }
   document.getElementById('g_date').addEventListener('change', refreshGBay);
+  document.getElementById('g_date').addEventListener('change', (e)=>{ document.getElementById('g_date_wd').textContent = fmtDateSlashDay(e.target.value); });
   document.getElementById('g_time').addEventListener('change', refreshGBay);
   if(!existing){
     const gNotesEl = document.getElementById('g_notes');
     const checkBoardingTag = ()=> applyBoardingNoteTag(gNotesEl, isPetBoardingOnDate(pet, document.getElementById('g_date').value));
     document.getElementById('g_date').addEventListener('change', checkBoardingTag);
     checkBoardingTag();
+    const repeatSel = document.getElementById('g_repeat');
+    const repeatWrap = document.getElementById('g_repeat_until_wrap');
+    repeatSel.addEventListener('change', ()=>{
+      repeatWrap.classList.toggle('hidden', repeatSel.value==='none');
+    });
+    wireDateOverlay('g_repeat_until');
   }
-  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('cancelBtn').addEventListener('click', ()=>{ if(opts.onCancel) opts.onCancel(); else closeModal(); });
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const date = document.getElementById('g_date').value;
     const time = document.getElementById('g_time').value;
     const bay = document.getElementById('g_bay').value;
     const apptTypes = getGTypes();
     if(apptTypes.length===0){ toast('Please pick at least one appointment type'); return; }
+    if(!existing && isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
     const conflict = findGroomConflict(date, time, bay, existing?.id);
     if(conflict){ toast(`${bay} is already booked at ${time} on that date`); return; }
     if(!confirmIfNearbyGroom(pet, date, existing?.id)) return;
     const addons = getGAddons();
-    const payload = {
-      date, time, bay, apptTypes,
+    const basePayload = {
+      time, bay, apptTypes, groomColor: selectedColor,
       sizeCode:document.getElementById('g_size').value, cutCode:document.getElementById('g_cutcode').value, details:document.getElementById('g_details').value,
       addons, notes:document.getElementById('g_notes').value, status:document.getElementById('g_status').value, customerId:cust.id, petId:pet.id,
     };
-    if(existing){ Object.assign(existing, payload); }
-    else{ pet.groomingHistory.push({ id:uid('groom'), photos:[], ...payload }); }
+    if(existing){
+      Object.assign(existing, { date, ...basePayload });
+      if(opts.onDone){ opts.onDone(); } else { closeModal(); if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render(); }
+      toast('Appointment updated');
+      return;
+    }
+    const repeatMode = document.getElementById('g_repeat')?.value || 'none';
+    const repeatUntil = document.getElementById('g_repeat_until')?.value;
+    if(repeatMode==='none' || !repeatUntil){
+      pet.groomingHistory.push({ id:uid('groom'), photos:[], date, ...basePayload });
+      closeModal();
+      if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render();
+      toast('Appointment booked');
+      return;
+    }
+    // Bulk-book a recurring series: step from the first date by the chosen
+    // frequency up to (and including) the "repeat until" date. Each occurrence
+    // keeps the same time/bay/details — dates where that bay/time is already
+    // taken are skipped rather than overwritten, and reported back so staff
+    // can manually place those few instead.
+    const step = repeatMode==='weekly' ? (d)=>addDays(d,7) : repeatMode==='biweekly' ? (d)=>addDays(d,14) : (d)=>addMonths(d,1);
+    let cursor = date;
+    let booked = 0, skipped = [], skippedClosed = [];
+    while(cursor <= repeatUntil){
+      if(isClosedDate(cursor)){
+        skippedClosed.push(cursor);
+      } else if(findGroomConflict(cursor, time, bay, null)){
+        skipped.push(cursor);
+      } else {
+        pet.groomingHistory.push({ id:uid('groom'), photos:[], date:cursor, ...basePayload });
+        booked++;
+      }
+      cursor = step(cursor);
+    }
     closeModal();
     if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render();
-    toast(existing?'Appointment updated':'Appointment booked');
+    scheduleSync();
+    const parts = [];
+    if(skipped.length) parts.push(`${skipped.length} skipped (bay already booked): ${skipped.map(fmtDate).join(', ')}`);
+    if(skippedClosed.length) parts.push(`${skippedClosed.length} skipped (shop closed): ${skippedClosed.map(fmtDate).join(', ')}`);
+    if(parts.length){
+      toast(`Booked ${booked} appointment${booked===1?'':'s'} — ${parts.join('; ')}`);
+    } else {
+      toast(`Booked ${booked} appointment${booked===1?'':'s'}`);
+    }
   });
 }
 
@@ -3199,19 +3883,21 @@ function assignFreeGroomings(cust, checkIn, checkOut, petIds){
   return { assignedCount, assignedList };
 }
 /* Shown right after a stay is created if any free groomings were earned —
-   lets staff jump straight into editing one if the owner wants changes. */
+   lets staff jump straight into editing any of them, one at a time, and land
+   back on this same summary after each save (rather than losing the list). */
 function openFreeGroomingSummaryModal(assignedList){
   openModal(`
     <div class="modal-head"><h3>Free grooming auto-booked</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">This stay earned ${assignedList.length} free Basic Grooming (FBG) appointment${assignedList.length===1?'':'s'}. Review or edit them below if needed.</div>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">This stay earned ${assignedList.length} free Basic Grooming (FBG) appointment${assignedList.length===1?'':'s'}. Tap any appointment below to edit its date, time, bay, status, colour, or anything else — you'll come back to this list afterward.</div>
       ${assignedList.map((a,i)=>`
         <div class="today-card" data-fbg-edit="${i}" style="cursor:pointer;">
-          <div class="avatar" style="${avatarStyle(colorFor(a.cust.id))}">${initials(a.cust.name)}</div>
+          <div class="avatar" style="${avatarStyle(a.record.groomColor || colorFor(a.cust.id))}">${initials(a.cust.name)}</div>
           <div class="today-card-main">
             <div class="today-card-pet">${ANIMAL_ICON[a.pet.type]||'🐾'} ${petLabel(a.pet)} <span class="badge badge-active">FBG</span></div>
-            <div class="today-card-sub">${fmtDate(a.record.date)} · ${a.record.time} · ${a.record.bay}</div>
+            <div class="today-card-sub">${fmtDateWithDay(a.record.date)} · ${a.record.time} · ${a.record.bay} · ${GROOM_STATUS_ICON[a.record.status]||''} ${esc(a.record.status||'Not arrived')}</div>
           </div>
+          <div style="color:var(--ink-soft);font-size:12px;font-weight:600;">Edit ›</div>
         </div>
       `).join('')}
     </div>
@@ -3223,8 +3909,10 @@ function openFreeGroomingSummaryModal(assignedList){
   document.querySelectorAll('[data-fbg-edit]').forEach(el=>{
     el.addEventListener('click', ()=>{
       const a = assignedList[+el.dataset.fbgEdit];
-      closeModal();
-      openGroomModal(a.cust, a.pet, a.record);
+      openGroomModal(a.cust, a.pet, a.record, {
+        onDone: ()=>{ if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); openFreeGroomingSummaryModal(assignedList); },
+        onCancel: ()=> openFreeGroomingSummaryModal(assignedList),
+      });
     });
   });
 }
@@ -3302,6 +3990,16 @@ function openRatesModal(){
         <div id="holidayRows">${state.holidays.map(h=>holidayRowHtml(h)).join('')}</div>
         <button class="add-line" id="addHolidayBtn">+ Add holiday period</button>
       </fieldset>
+      <fieldset>
+        <legend>Closed days <span style="font-weight:400;color:var(--ink-soft);">— shop fully closed: no grooming taken, boarding check-in/out needs a scheduled drop-off/pick-up appointment</span></legend>
+        <div style="font-size:12.5px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Closed every week on:</div>
+        <div class="checks" style="margin-bottom:14px;">
+          ${WEEKDAY_NAMES.map((wd,idx)=>`<label class="check-pill"><input type="checkbox" value="${idx}" data-closed-weekday ${(state.closedWeekdays||[]).includes(idx)?'checked':''}> ${wd}</label>`).join('')}
+        </div>
+        <div style="font-size:12.5px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Specific closed date(s):</div>
+        <div id="closedRows">${(state.closedDates||[]).map(c=>closedRowHtml(c)).join('')}</div>
+        <button class="add-line" id="addClosedBtn">+ Add closed day(s)</button>
+      </fieldset>
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Cancel</button>
@@ -3311,10 +4009,19 @@ function openRatesModal(){
   function holidayRowHtml(h){
     return `<div class="holiday-row" data-hrow="${h.id}">
       <input placeholder="Name" value="${esc(h.name)}" data-h-name style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
-      <input type="date" value="${h.start}" data-h-start style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+      <div class="date-overlay-wrap"><input type="date" id="h_start_${h.id}" value="${h.start}" data-h-start><span class="date-overlay-label" id="h_start_${h.id}_wd">${h.start?fmtDateSlashDay(h.start):''}</span></div>
       <span style="color:var(--ink-soft);">to</span>
-      <input type="date" value="${h.end}" data-h-end style="padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+      <div class="date-overlay-wrap"><input type="date" id="h_end_${h.id}" value="${h.end}" data-h-end><span class="date-overlay-label" id="h_end_${h.id}_wd">${h.end?fmtDateSlashDay(h.end):''}</span></div>
       <button type="button" class="mini-remove" data-h-remove="${h.id}">✕</button>
+    </div>`;
+  }
+  function closedRowHtml(c){
+    return `<div class="holiday-row" data-crow="${c.id}">
+      <input placeholder="Reason (e.g. Public holiday)" value="${esc(c.name)}" data-c-name style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+      <div class="date-overlay-wrap"><input type="date" id="c_start_${c.id}" value="${c.start}" data-c-start><span class="date-overlay-label" id="c_start_${c.id}_wd">${c.start?fmtDateSlashDay(c.start):''}</span></div>
+      <span style="color:var(--ink-soft);">to</span>
+      <div class="date-overlay-wrap"><input type="date" id="c_end_${c.id}" value="${c.end}" data-c-end><span class="date-overlay-label" id="c_end_${c.id}_wd">${c.end?fmtDateSlashDay(c.end):''}</span></div>
+      <button type="button" class="mini-remove" data-c-remove="${c.id}">✕</button>
     </div>`;
   }
   let workingHolidays = state.holidays.map(h=>({...h}));
@@ -3326,12 +4033,29 @@ function openRatesModal(){
     document.querySelectorAll('[data-h-remove]').forEach(btn=>{
       btn.addEventListener('click', ()=>{ workingHolidays = workingHolidays.filter(h=>h.id!==btn.dataset.hRemove); refreshHolidays(); });
     });
+    workingHolidays.forEach(h=>{ wireDateOverlay('h_start_'+h.id); wireDateOverlay('h_end_'+h.id); });
   }
   document.getElementById('addHolidayBtn').addEventListener('click', ()=>{
     workingHolidays.push({id:uid('hol'), name:'', start:todayStr(), end:todayStr()});
     refreshHolidays();
   });
   wireHolidayEvents();
+  let workingClosed = (state.closedDates||[]).map(c=>({...c}));
+  function refreshClosed(){
+    document.getElementById('closedRows').innerHTML = workingClosed.map(closedRowHtml).join('');
+    wireClosedEvents();
+  }
+  function wireClosedEvents(){
+    document.querySelectorAll('[data-c-remove]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{ workingClosed = workingClosed.filter(c=>c.id!==btn.dataset.cRemove); refreshClosed(); });
+    });
+    workingClosed.forEach(c=>{ wireDateOverlay('c_start_'+c.id); wireDateOverlay('c_end_'+c.id); });
+  }
+  document.getElementById('addClosedBtn').addEventListener('click', ()=>{
+    workingClosed.push({id:uid('closed'), name:'', start:todayStr(), end:todayStr()});
+    refreshClosed();
+  });
+  wireClosedEvents();
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     state.rates['Dog Deluxe (Bottom)'] = {label:'Dog Deluxe S/M', normal:+document.getElementById('r_dsm_n').value, holiday:+document.getElementById('r_dsm_h').value};
@@ -3349,6 +4073,13 @@ function openRatesModal(){
       if(h){ h.name = row.querySelector('[data-h-name]').value; h.start = row.querySelector('[data-h-start]').value; h.end = row.querySelector('[data-h-end]').value; }
     });
     state.holidays = workingHolidays.filter(h=>h.name && h.start && h.end);
+    document.querySelectorAll('#closedRows [data-crow]').forEach(row=>{
+      const id = row.dataset.crow;
+      const c = workingClosed.find(x=>x.id===id);
+      if(c){ c.name = row.querySelector('[data-c-name]').value; c.start = row.querySelector('[data-c-start]').value; c.end = row.querySelector('[data-c-end]').value; }
+    });
+    state.closedDates = workingClosed.filter(c=>c.start && c.end);
+    state.closedWeekdays = Array.from(document.querySelectorAll('[data-closed-weekday]:checked')).map(cb=>+cb.value);
     closeModal(); render(); toast('Rates & holidays saved');
   });
 }
@@ -3448,7 +4179,7 @@ function renderBoardingCalendar(){
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--amber-tint);border:1px solid #F0D2AC;"></span>Holiday rate period</span>
       </div>
     </div>
-    <div style="margin-bottom:10px;font-family:var(--font-display);font-size:16px;font-weight:600;">${monthLabel}</div>
+    <div style="margin-bottom:10px;font-family:var(--font-display);font-size:24px;font-weight:600;">${monthLabel}</div>
     <div class="grid-wrap cal-wrap">
       <table class="cal-grid">
         <thead>
@@ -3557,17 +4288,21 @@ function openCalendarCellModal(roomId, dateStr){
   const room = roomTypeFor(roomId);
   const isTurnover = new Set(occ.map(o=>o.stay.id)).size > 1;
   const hol = holidayFor(dateStr);
+  const closed = closedDateFor(dateStr);
   const uniqueOwners = [...new Map(occ.map(o=>[o.cust.id, o])).values()]; // one entry per distinct owner present
   openModal(`
     <div class="modal-head"><h3>${roomId} · ${fmtDate(dateStr)}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">${esc(room?.type||'')}</div>
       ${hol ? `<div style="background:var(--amber-tint);border:1px solid #F0D2AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#8A5A22;margin-bottom:12px;">🎉 Holiday rate applies — ${esc(hol.name)}</div>` : ''}
+      ${closed ? `<div style="background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:12px;">🚫 Shop closed${closed.name?` — ${esc(closed.name)}`:''}</div>` : ''}
       ${occ.length===0 ? `<div class="today-empty">This room is free on ${fmtDate(dateStr)}.</div>` :
         occ.map((o)=>{
           const idx = ownerPetIndex(o.cust, o.pet);
           const label = isTurnover ? turnoverLabel(o.kind) : (idx?`${idx}. `:'');
           const sharing = !isTurnover && occ.length > 1;
+          const showDropoff = closed && (o.kind==='checkin'||o.kind==='both') && o.stay.dropoff;
+          const showPickup = closed && (o.kind==='checkout'||o.kind==='both') && o.stay.pickup;
           return `
         <div class="today-card" data-cal-jump="${o.cust.id}|${o.pet.id}" style="cursor:pointer;">
           <div class="avatar" style="${avatarStyle(calendarColorFor(o.cust.id))}">${initials(o.cust.name)}</div>
@@ -3579,7 +4314,10 @@ function openCalendarCellModal(roomId, dateStr){
               ${sharing?'<span class="badge badge-active">Sharing room</span>':''}
             </div>
             <div class="today-card-sub">${esc(o.cust.name)} · ${esc(o.cust.phone)} · ${fmtDate(o.stay.checkIn)} → ${fmtDate(o.stay.checkOut)}</div>
+            ${showDropoff ? `<div data-cal-edit-closed-appt="${o.stay.id}|dropoff|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Drop-off: ${esc(o.stay.dropoff.time)} · ${esc(o.stay.dropoff.contactName)} (${esc(o.stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
+            ${showPickup ? `<div data-cal-edit-closed-appt="${o.stay.id}|pickup|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Pick-up: ${esc(o.stay.pickup.time)} · ${esc(o.stay.pickup.contactName)} (${esc(o.stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
           </div>
+          <button class="btn btn-sm btn-danger" data-cal-delete-stay="${o.stay.id}" title="Delete this stay">Delete</button>
         </div>`;
         }).join('')}
       ${uniqueOwners.length ? `
@@ -3607,6 +4345,32 @@ function openCalendarCellModal(roomId, dateStr){
       closeModal();
       state.activeTab='customers'; state.selectedCustomerId=custId; state.selectedPetId=petId; _subTab='boarding';
       render();
+    });
+  });
+  document.querySelectorAll('[data-cal-delete-stay]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const stayId = btn.dataset.calDeleteStay;
+      if(confirm('Delete this stay record permanently?')){
+        const ownerCust = findStayOwnerCustomer(stayId);
+        if(ownerCust){
+          // A shared stay is only physically stored on one pet's array — filter
+          // every pet on the real owning customer so it's removed cleanly.
+          ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==stayId); });
+        }
+        closeModal();
+        renderBoardingCalendar();
+        scheduleSync();
+        toast('Stay deleted');
+      }
+    });
+  });
+  document.querySelectorAll('[data-cal-edit-closed-appt]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [stayId, kind] = el.dataset.calEditClosedAppt.split('|');
+      const s = findStayById(stayId);
+      if(s) openClosedApptEditModal(s, kind, ()=>{ openCalendarCellModal(roomId, dateStr); renderBoardingCalendar(); });
     });
   });
   document.querySelectorAll('[data-set-cust-colour]').forEach(btn=>{
@@ -3642,13 +4406,14 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
         </div>
         <div class="field"><label>Customer</label><select id="cb_cust"></select></div>
         <div class="field span2"><label>Pet</label><select id="cb_pet"></select></div>
-        <div class="field"><label>Check-in date</label><input type="date" id="cb_in" value="${initialCheckIn}"></div>
-        <div class="field"><label>Check-out date</label><input type="date" id="cb_out" value="${initialCheckOut}"></div>
+        <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="cb_in" value="${initialCheckIn}"><span class="date-overlay-label" id="cb_in_day"></span></div></div>
+        <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="cb_out" value="${initialCheckOut}"><span class="date-overlay-label" id="cb_out_day"></span></div></div>
         <div class="field"><label>Room assignment</label><select id="cb_room"></select></div>
         ${sharingPickerHtml('cb_share', cbSharingIds, 'field span3')}
-        <div class="field span3"><label>Custom room rate / night (RM)</label><input type="number" step="0.01" min="0" id="cb_rate" placeholder="Leave blank to use standard rate"></div>
+        <div class="field span3"><label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('cb_rate', null, 'flat')}</div>
         <div class="field span3"><label>Feeding instructions</label><textarea id="cb_feeding"></textarea></div>
       </div>
+      <div id="cbClosedApptWrap"></div>
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Cancel</button>
@@ -3656,6 +4421,50 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     </div>
   `, {wide:true});
   wireSharingPicker('cb_share', cbSharingIds, () => document.getElementById('cb_pet')?.value || null);
+
+  let cbWorkingDropoff = {time:'09:00', contactName:'', contactPhone:''};
+  let cbWorkingPickup = {time:'17:00', contactName:'', contactPhone:''};
+  function cbClosedApptSectionHtml(){
+    const inClosed = closedDateFor(document.getElementById('cb_in').value);
+    const outClosed = closedDateFor(document.getElementById('cb_out').value);
+    if(!inClosed && !outClosed) return '';
+    return `<fieldset style="border-color:#EEB3AC;background:#FBE4E2;margin-top:14px;">
+      <legend style="color:#A23B2C;">🚫 Closed-day drop-off / pick-up</legend>
+      ${inClosed ? `
+      <div style="margin-bottom:${outClosed?'12px':'0'};">
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(document.getElementById('cb_in').value)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
+        <div class="form-grid c3">
+          <div class="field"><label>Drop-off time</label><input type="time" id="cb_dropoff_time" value="${esc(cbWorkingDropoff.time)}"></div>
+          <div class="field"><label>Contact name</label><input id="cb_dropoff_name" value="${esc(cbWorkingDropoff.contactName)}" placeholder="Who's dropping off"></div>
+          <div class="field"><label>Contact number</label><input id="cb_dropoff_phone" value="${esc(cbWorkingDropoff.contactPhone)}" placeholder="Phone number"></div>
+        </div>
+      </div>` : ''}
+      ${outClosed ? `
+      <div>
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(document.getElementById('cb_out').value)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
+        <div class="form-grid c3">
+          <div class="field"><label>Pick-up time</label><input type="time" id="cb_pickup_time" value="${esc(cbWorkingPickup.time)}"></div>
+          <div class="field"><label>Contact name</label><input id="cb_pickup_name" value="${esc(cbWorkingPickup.contactName)}" placeholder="Who's picking up"></div>
+          <div class="field"><label>Contact number</label><input id="cb_pickup_phone" value="${esc(cbWorkingPickup.contactPhone)}" placeholder="Phone number"></div>
+        </div>
+      </div>` : ''}
+    </fieldset>`;
+  }
+  function cbWireClosedApptInputs(){
+    const dt = document.getElementById('cb_dropoff_time'), dn = document.getElementById('cb_dropoff_name'), dp = document.getElementById('cb_dropoff_phone');
+    if(dt) dt.addEventListener('input', ()=>{ cbWorkingDropoff.time = dt.value; });
+    if(dn) dn.addEventListener('input', ()=>{ cbWorkingDropoff.contactName = dn.value; });
+    if(dp) dp.addEventListener('input', ()=>{ cbWorkingDropoff.contactPhone = dp.value; });
+    const pt = document.getElementById('cb_pickup_time'), pn = document.getElementById('cb_pickup_name'), pp = document.getElementById('cb_pickup_phone');
+    if(pt) pt.addEventListener('input', ()=>{ cbWorkingPickup.time = pt.value; });
+    if(pn) pn.addEventListener('input', ()=>{ cbWorkingPickup.contactName = pn.value; });
+    if(pp) pp.addEventListener('input', ()=>{ cbWorkingPickup.contactPhone = pp.value; });
+  }
+  function cbRefreshClosedApptWrap(){
+    document.getElementById('cbClosedApptWrap').innerHTML = cbClosedApptSectionHtml();
+    cbWireClosedApptInputs();
+  }
+  cbRefreshClosedApptWrap();
 
   function refreshRoomOptions(){
     const cust = getCustomer(document.getElementById('cb_cust').value);
@@ -3698,8 +4507,17 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   document.getElementById('cb_cust_search').addEventListener('input', (e)=>refreshCustOptions(e.target.value));
   document.getElementById('cb_cust').addEventListener('change', ()=>refreshPetOptions(document.getElementById('cb_cust_search').value.trim().toLowerCase()));
   document.getElementById('cb_pet').addEventListener('change', refreshRoomOptions);
+  function refreshInOutDayHints(){
+    document.getElementById('cb_in_day').textContent = fmtDateSlashDay(document.getElementById('cb_in').value);
+    document.getElementById('cb_out_day').textContent = fmtDateSlashDay(document.getElementById('cb_out').value);
+  }
   document.getElementById('cb_in').addEventListener('change', refreshRoomOptions);
   document.getElementById('cb_out').addEventListener('change', refreshRoomOptions);
+  document.getElementById('cb_in').addEventListener('change', refreshInOutDayHints);
+  document.getElementById('cb_out').addEventListener('change', refreshInOutDayHints);
+  document.getElementById('cb_in').addEventListener('change', cbRefreshClosedApptWrap);
+  document.getElementById('cb_out').addEventListener('change', cbRefreshClosedApptWrap);
+  refreshInOutDayHints();
   refreshCustOptions('');
   document.getElementById('cb_cust_search').focus();
 
@@ -3711,27 +4529,42 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     const checkIn = document.getElementById('cb_in').value;
     const checkOut = document.getElementById('cb_out').value;
     if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid check-in/check-out dates'); return; }
+    const inClosed = closedDateFor(checkIn);
+    const outClosed = closedDateFor(checkOut);
+    if(inClosed && !(cbWorkingDropoff.time && cbWorkingDropoff.contactName && cbWorkingDropoff.contactPhone)){
+      toast('Check-in falls on a closed day — please fill in the drop-off time and contact details');
+      return;
+    }
+    if(outClosed && !(cbWorkingPickup.time && cbWorkingPickup.contactName && cbWorkingPickup.contactPhone)){
+      toast('Check-out falls on a closed day — please fill in the pick-up time and contact details');
+      return;
+    }
     const room = document.getElementById('cb_room').value;
     if(!room){ toast('Please select a room'); return; }
     if(!isRoomAvailable(room, checkIn, checkOut, null)){ toast(`${room} is already booked for these dates`); return; }
     if(!confirmIfNearbyStay(pet, checkIn, null)) return;
-    const rateInput = document.getElementById('cb_rate').value;
-    const customRate = rateInput === '' ? null : +rateInput;
-    pet.stays.push({
-      id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, charges:[],
-      pets: [{ petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[] }],
-    });
-    const freeResult = assignFreeGroomings(cust, checkIn, checkOut, [pet.id, ...cbSharingIds]);
-    closeModal();
-    state.calendarMonth = checkIn.slice(0,7);
-    renderBoardingCalendar();
-    scheduleSync();
-    if(freeResult.assignedCount > 0){
-      toast(`Booking created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
-      openFreeGroomingSummaryModal(freeResult.assignedList);
-    } else {
-      toast('Booking created');
-    }
+    const { customRate, customRateMode } = readCustomRate('cb_rate');
+    const doSave = ()=>{
+      pet.stays.push({
+        id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, charges:[],
+        pets: [{ petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[] }],
+        dropoff: inClosed ? {...cbWorkingDropoff} : null,
+        pickup: outClosed ? {...cbWorkingPickup} : null,
+      });
+      const freeResult = assignFreeGroomings(cust, checkIn, checkOut, [pet.id, ...cbSharingIds]);
+      closeModal();
+      state.calendarMonth = checkIn.slice(0,7);
+      renderBoardingCalendar();
+      scheduleSync();
+      if(freeResult.assignedCount > 0){
+        toast(`Booking created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
+        openFreeGroomingSummaryModal(freeResult.assignedList);
+      } else {
+        toast('Booking created');
+      }
+    };
+    const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
+    if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
   });
 }
 
@@ -3741,6 +4574,7 @@ function renderGroomingAvailability(){
   const apptsForDay = allGroomAppointmentsOn(date);
   const totalSlots = TIME_SLOTS.length * BAYS.length;
   const booked = apptsForDay.length;
+  const closed = closedDateFor(date);
 
   main.innerHTML = `
     <div class="avail-toolbar">
@@ -3748,13 +4582,13 @@ function renderGroomingAvailability(){
         <button id="prevDay" type="button" title="Previous day">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><path d="M15 18l-6-6 6-6"/></svg>
         </button>
-        <input type="date" id="gDatePick" value="${date}">
+        ${dateOverlayHtml('gDatePick', date, false)}
         <button id="nextDay" type="button" title="Next day">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><path d="M9 18l6-6-6-6"/></svg>
         </button>
       </div>
       <button class="btn" id="todayBtn">Today</button>
-      <button class="btn btn-amber" id="bookApptBtn">+ Book appointment</button>
+      <button class="btn btn-amber" id="bookApptBtn" ${closed?'disabled title="Shop is closed on this date"':''}>+ Book appointment</button>
       <div class="legend-row">
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>${totalSlots-booked} available</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--teal);"></span>${booked} booked</span>
@@ -3769,7 +4603,8 @@ function renderGroomingAvailability(){
       }).join('')}
       ${state.groomStatusFilter ? `<button type="button" class="status-filter-chip status-filter-clear" data-status-filter-clear>✕ Clear filter</button>` : ''}
     </div>
-    <div style="margin-bottom:10px;font-family:var(--font-display);font-size:16px;font-weight:600;">${fmtDateLong(date)}</div>
+    <div style="margin-bottom:10px;font-family:var(--font-display);font-size:24px;font-weight:600;">${fmtDateLong(date)}</div>
+    ${closed ? `<div style="background:var(--danger-tint,#FBE4E2);border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:12px;">🚫 Shop closed${closed.name?` — ${esc(closed.name)}`:''}. No grooming appointments are taken today.</div>` : ''}
     <div class="grid-wrap">
       <table class="avail-grid">
         <thead>
@@ -3796,13 +4631,17 @@ function renderGroomingAvailability(){
   if(clearFilterBtn) clearFilterBtn.addEventListener('click', ()=>{ state.groomStatusFilter = null; renderGroomingAvailability(); });
 
   document.getElementById('gDatePick').addEventListener('change', (e)=>{ state.groomingDate = e.target.value; renderGroomingAvailability(); });
+  wireDateOverlay('gDatePick', false);
   document.getElementById('prevDay').addEventListener('click', ()=>{ state.groomingDate = addDays(state.groomingDate,-1); renderGroomingAvailability(); });
   document.getElementById('nextDay').addEventListener('click', ()=>{ state.groomingDate = addDays(state.groomingDate,1); renderGroomingAvailability(); });
   document.getElementById('todayBtn').addEventListener('click', ()=>{ state.groomingDate = todayStr(); renderGroomingAvailability(); });
   document.getElementById('bookApptBtn').addEventListener('click', ()=>openFullBookingModal(null, null));
 
   document.querySelectorAll('.slot-free').forEach(el=>{
-    el.addEventListener('click', ()=> openFullBookingModal(el.dataset.time, el.dataset.bay));
+    el.addEventListener('click', ()=>{
+      if(closedDateFor(date)){ toast('Shop is closed on this date — no grooming appointments taken'); return; }
+      openFullBookingModal(el.dataset.time, el.dataset.bay);
+    });
   });
   document.querySelectorAll('.slot-booked').forEach(el=>{
     el.addEventListener('click', ()=> openApptDetailModal(el.dataset.groomid));
@@ -3828,7 +4667,7 @@ function gridRowHtml(time, date, apptsForDay){
       }
       const cust = getCustomer(appt.customerId);
       const pet = cust ? getPet(cust, appt.petId) : null;
-      const color = cust ? colorFor(cust.id) : 'var(--teal)';
+      const color = appt.groomColor || (cust ? colorFor(cust.id) : 'var(--teal)');
       const textColor = textColorFor(color);
       const textShadow = textColor === '#FFFFFF' ? '0 1px 1px rgba(0,0,0,.3)' : 'none';
       const hasNotes = !!(appt.notes && appt.notes.trim());
@@ -3857,7 +4696,7 @@ function openApptDetailModal(groomId){
       <div class="info-grid" style="grid-template-columns:1fr 1fr;">
         <div class="info-field"><label>Owner</label><div>${esc(owner.name)} · ${esc(owner.phone)}</div></div>
         <div class="info-field"><label>Pet</label><div>${ANIMAL_ICON[pet.type]} ${petLabel(pet)}</div></div>
-        <div class="info-field"><label>Date &amp; time</label><div>${fmtDate(appt.date)} · ${appt.time}</div></div>
+        <div class="info-field"><label>Date &amp; time</label><div>${fmtDateWithDay(appt.date)} · ${appt.time}</div></div>
         <div class="info-field"><label>Bay</label><div>${esc(appt.bay)}</div></div>
         <div class="info-field"><label>Size</label><div>${esc(appt.sizeCode)||'—'}</div></div>
         <div class="info-field"><label>Cut code</label><div>${esc(appt.cutCode)||'—'}</div></div>
@@ -3867,6 +4706,7 @@ function openApptDetailModal(groomId){
       </div>
     </div>
     <div class="modal-foot">
+      <button class="btn btn-danger" id="deleteApptBtn">Delete</button>
       <button class="btn" id="editHere">Edit</button>
       <button class="btn btn-primary" id="jumpBtn">Open pet record →</button>
     </div>
@@ -3879,6 +4719,15 @@ function openApptDetailModal(groomId){
     closeModal();
   });
   document.getElementById('editHere').addEventListener('click', ()=>{ closeModal(); openGroomModal(owner, pet, appt); });
+  document.getElementById('deleteApptBtn').addEventListener('click', ()=>{
+    if(confirm('Delete this grooming appointment permanently?')){
+      pet.groomingHistory = pet.groomingHistory.filter(g=>g.id!==appt.id);
+      closeModal();
+      if(state.activeTab==='grooming') renderGroomingAvailability();
+      scheduleSync();
+      toast('Appointment deleted');
+    }
+  });
   document.getElementById('jumpBtn').addEventListener('click', ()=>{
     closeModal();
     state.activeTab='customers'; state.selectedCustomerId=owner.id; state.selectedPetId=pet.id; _subTab='grooming';
@@ -3900,7 +4749,7 @@ function openFullBookingModal(prefTime, prefBay){
         </div>
         <div class="field"><label>Customer</label><select id="b_cust"></select></div>
         <div class="field span2"><label>Pet</label><select id="b_pet"></select></div>
-        <div class="field"><label>Date</label><input type="date" id="b_date" value="${initialDate}"></div>
+        <div class="field"><label>Date</label><div class="date-overlay-wrap"><input type="date" id="b_date" value="${initialDate}"><span class="date-overlay-label" id="b_date_day"></span></div></div>
         <div class="field"><label>Time</label>
           <select id="b_time">${TIME_SLOTS.map(t=>`<option ${t===initialTime?'selected':''}>${t}</option>`).join('')}</select>
         </div>
@@ -3967,13 +4816,18 @@ function openFullBookingModal(prefTime, prefBay){
     const cur = bayEl.value;
     bayEl.innerHTML = bayOptionsHtml(document.getElementById('b_date').value, document.getElementById('b_time').value, cur, null);
   }
+  function refreshBDateDay(){
+    document.getElementById('b_date_day').textContent = fmtDateSlashDay(document.getElementById('b_date').value);
+  }
   document.getElementById('b_cust_search').addEventListener('input', (e)=>refreshCustOptions(e.target.value));
   document.getElementById('b_cust').addEventListener('change', ()=>refreshPetOptions(document.getElementById('b_cust_search').value.trim().toLowerCase()));
   document.getElementById('b_pet').addEventListener('change', checkBoardingTag);
   document.getElementById('b_pet').addEventListener('change', applyGroomingSizeDefault);
   document.getElementById('b_date').addEventListener('change', refreshBBay);
   document.getElementById('b_date').addEventListener('change', checkBoardingTag);
+  document.getElementById('b_date').addEventListener('change', refreshBDateDay);
   document.getElementById('b_time').addEventListener('change', refreshBBay);
+  refreshBDateDay();
   refreshCustOptions('');
   document.getElementById('b_cust_search').focus();
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
@@ -3986,6 +4840,7 @@ function openFullBookingModal(prefTime, prefBay){
     const bay = document.getElementById('b_bay').value;
     const apptTypes = getBTypes();
     if(apptTypes.length===0){ toast('Please pick at least one appointment type'); return; }
+    if(isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
     if(findGroomConflict(date,time,bay,null)){ toast(`${bay} is already booked at ${time} on that date`); return; }
     if(!confirmIfNearbyGroom(pet, date, null)) return;
     const addons = getBAddons();
@@ -4007,6 +4862,20 @@ document.querySelectorAll('.tab-btn').forEach(b=>{
 document.getElementById('custSearch').addEventListener('input', renderSidebarOrHide);
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
+document.getElementById('backupBtn').addEventListener('click', ()=>{
+  const snapshot = snapshotForCloud();
+  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+  a.href = url;
+  a.download = `cocomomo-backup-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast('Backup downloaded');
+});
 
 let _pendingBelongingTarget = null;
 document.getElementById('belongingFileInput').addEventListener('change', async (e)=>{
