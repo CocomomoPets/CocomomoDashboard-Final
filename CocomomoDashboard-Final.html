@@ -505,7 +505,10 @@
     </div>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
+    <button class="btn" id="remindersBtn" title="Tomorrow's grooming appointments and boarding checkouts, with a ready-to-send WhatsApp message for each">Reminders</button>
+    <button class="btn" id="reportsBtn" title="View monthly revenue, occupancy, and grooming report">Reports</button>
     <button class="btn" id="cancellationsBtn" title="View the log of cancelled grooming appointments and boarding stays">Cancellations</button>
+    <button class="btn" id="changeLogBtn" title="Recent edits to prices, dates, and notes — with undo">Change log</button>
     <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
   </div>
 
@@ -893,6 +896,7 @@ let state = {
   closedDates: [], // {id, name, start, end} — days the shop is fully closed: no grooming appointments taken, and any boarding check-in/out landing here needs a scheduled drop-off/pick-up appointment instead
   closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
   cancellations: [], // log of deleted grooming appointments & boarding stays — {id, type:'Grooming'|'Boarding', reason, note, cancelledAt, customerName, petName, summary}
+  changeLog: [], // log of edits to stay dates/rates, charges, payments, pet notes — {id, ts, entityType, ref, entityLabel, field, fieldLabel, oldValue, newValue, undone}
   selectedCustomerId: null,
   selectedPetId: null,
   activeTab: 'customers',
@@ -941,6 +945,10 @@ const GROOM_STATUSES = ['Not arrived','In progress','Done & informed','Picked up
 const GROOM_STATUS_BADGE = { 'Not arrived':'badge-past', 'In progress':'badge-active', 'Done & informed':'badge-active', 'Picked up':'badge-past' };
 const GROOM_STATUS_ICON = { 'Not arrived':'⬜', 'In progress':'✂️', 'Done & informed':'✅', 'Picked up':'🏁' };
 const PET_SIZES = ['S','M','L','XL','XXL'];
+/* Risk flags — surfaced as a prominent badge wherever staff need to see them
+   at a glance (pet header, Today grid, booking), instead of relying on
+   someone reading through free-typed medical/personality/special-request text. */
+const RISK_FLAGS = ['Aggressive','Bite history','Escape risk','Allergy','Reactive to other pets','Anxious/fearful','Other'];
 /* Preset grooming prices for the "Additional charges" (Grooming category)
    picker on a stay — Bath/Cut are priced by the pet's own grooming size
    (auto-detected from pet.groomingSize), the rest are flat per-visit fees.
@@ -1038,38 +1046,102 @@ function wireMultiSelectEditor(prefix, stdOptions, initialSelected){
    mutate in place; `getExcludeId` is a function returning the petId that
    can't be added to itself (the row's own pet), re-checked on every keystroke
    so it stays correct if the pet dropdown changes afterward. */
-function sharingChipsInnerHtml(fieldId, ids){
+/* datesMap (optional, mutable object keyed by petId -> {checkIn,checkOut}) lets
+   any pet in `ids` have its own check-in/check-out for this shared room,
+   different from the stay's own dates — e.g. Pet A boards 13→18 Aug, Pet B
+   joins the same room 14→18 Aug. getBaseDates (optional fn) returns the
+   stay's current {checkIn, checkOut} to default a newly-enabled override to. */
+function sharingChipsInnerHtml(fieldId, ids, datesMap){
   const chips = ids.map(id=>{
     const {pet, cust} = findPetWithCustomer(id);
     if(!pet) return '';
     const label = cust ? `${esc(pet.name)} (${esc(cust.name)})` : esc(pet.name);
-    return `<span class="check-pill">${label} <button type="button" data-share-rm="${fieldId}:${id}" style="border:none;background:none;color:var(--danger);cursor:pointer;font-weight:700;margin-left:2px;">✕</button></span>`;
+    const ov = datesMap && datesMap[id];
+    const dateNote = ov ? ` <span style="font-weight:600;color:var(--accent,#1B5EAC);">📅 ${esc(fmtDate(ov.checkIn))}→${esc(fmtDate(ov.checkOut))}</span>` : '';
+    return `<span class="check-pill">${label}${dateNote} <button type="button" data-share-rm="${fieldId}:${id}" style="border:none;background:none;color:var(--danger);cursor:pointer;font-weight:700;margin-left:2px;">✕</button></span>`;
   }).join('');
   return chips || '<span style="font-size:12px;color:var(--ink-soft);">Not sharing</span>';
 }
-function sharingPickerHtml(fieldId, ids, wrapperClass){
+function sharingDateRowsHtml(fieldId, ids, datesMap){
+  if(!datesMap) return '';
+  return ids.map(id=>{
+    const {pet} = findPetWithCustomer(id);
+    if(!pet) return '';
+    const ov = datesMap[id];
+    return `
+    <div class="share-dates-row" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;margin-top:4px;">
+      <label style="display:flex;align-items:center;gap:4px;font-weight:500;color:var(--ink-soft);cursor:pointer;">
+        <input type="checkbox" data-share-dates-toggle="${fieldId}:${id}" ${ov?'checked':''}> ${esc(pet.name)} joins/leaves on different dates
+      </label>
+      ${ov ? `
+        <input type="date" data-share-dates-in="${fieldId}:${id}" value="${esc(ov.checkIn)}" style="padding:3px 5px;border:1px solid var(--line);border-radius:5px;">
+        <span>→</span>
+        <input type="date" data-share-dates-out="${fieldId}:${id}" value="${esc(ov.checkOut)}" style="padding:3px 5px;border:1px solid var(--line);border-radius:5px;">
+      ` : ''}
+    </div>`;
+  }).join('');
+}
+function sharingPickerHtml(fieldId, ids, wrapperClass, datesMap){
   return `
   <div class="${wrapperClass||'field'}" style="margin-bottom:8px;">
     <label>Sharing room with <span style="font-weight:500;color:var(--ink-soft);">(this customer's other pets, or another customer's pet)</span></label>
-    <div class="checks" id="${fieldId}_chips">${sharingChipsInnerHtml(fieldId, ids)}</div>
+    <div class="checks" id="${fieldId}_chips">${sharingChipsInnerHtml(fieldId, ids, datesMap)}</div>
+    <div id="${fieldId}_daterows">${sharingDateRowsHtml(fieldId, ids, datesMap)}</div>
     <input placeholder="Search a pet name to add…" data-share-search="${fieldId}" autocomplete="off" style="margin-top:6px;width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
     <div class="checks" id="${fieldId}_results" style="margin-top:4px;"></div>
   </div>`;
 }
-function wireSharingPicker(fieldId, ids, getExcludeId){
-  function refreshChips(){
+function wireSharingPicker(fieldId, ids, getExcludeId, datesMap, getBaseDates){
+  function refreshAll(){
     const box = document.getElementById(`${fieldId}_chips`);
-    if(box) box.innerHTML = sharingChipsInnerHtml(fieldId, ids);
+    if(box) box.innerHTML = sharingChipsInnerHtml(fieldId, ids, datesMap);
+    const rowsBox = document.getElementById(`${fieldId}_daterows`);
+    if(rowsBox) rowsBox.innerHTML = sharingDateRowsHtml(fieldId, ids, datesMap);
+    wireRowEvents();
+  }
+  function wireRowEvents(){
     document.querySelectorAll(`[data-share-rm^="${fieldId}:"]`).forEach(btn=>{
       btn.addEventListener('click', ()=>{
         const id = btn.dataset.shareRm.slice(fieldId.length+1);
         const i = ids.indexOf(id);
         if(i>-1) ids.splice(i,1);
-        refreshChips();
+        if(datesMap) delete datesMap[id];
+        refreshAll();
+      });
+    });
+    if(!datesMap) return;
+    document.querySelectorAll(`[data-share-dates-toggle^="${fieldId}:"]`).forEach(cb=>{
+      cb.addEventListener('change', ()=>{
+        const id = cb.dataset.shareDatesToggle.slice(fieldId.length+1);
+        if(cb.checked){
+          const base = getBaseDates ? getBaseDates() : { checkIn: todayStr(), checkOut: addDays(todayStr(),1) };
+          datesMap[id] = { checkIn: base.checkIn, checkOut: base.checkOut };
+        } else {
+          delete datesMap[id];
+        }
+        refreshAll();
+      });
+    });
+    document.querySelectorAll(`[data-share-dates-in^="${fieldId}:"]`).forEach(inp=>{
+      inp.addEventListener('change', ()=>{
+        const id = inp.dataset.shareDatesIn.slice(fieldId.length+1);
+        if(datesMap[id]) datesMap[id].checkIn = inp.value;
+        const box = document.getElementById(`${fieldId}_chips`);
+        if(box) box.innerHTML = sharingChipsInnerHtml(fieldId, ids, datesMap);
+        wireRowEvents();
+      });
+    });
+    document.querySelectorAll(`[data-share-dates-out^="${fieldId}:"]`).forEach(inp=>{
+      inp.addEventListener('change', ()=>{
+        const id = inp.dataset.shareDatesOut.slice(fieldId.length+1);
+        if(datesMap[id]) datesMap[id].checkOut = inp.value;
+        const box = document.getElementById(`${fieldId}_chips`);
+        if(box) box.innerHTML = sharingChipsInnerHtml(fieldId, ids, datesMap);
+        wireRowEvents();
       });
     });
   }
-  refreshChips();
+  wireRowEvents();
   const input = document.querySelector(`[data-share-search="${fieldId}"]`);
   const results = document.getElementById(`${fieldId}_results`);
   if(!input || !results) return;
@@ -1092,7 +1164,7 @@ function wireSharingPicker(fieldId, ids, getExcludeId){
         const id = btn.dataset.shareAdd.slice(fieldId.length+1);
         if(!ids.includes(id)) ids.push(id);
         input.value=''; results.innerHTML='';
-        refreshChips();
+        refreshAll();
       });
     });
   });
@@ -1118,6 +1190,16 @@ function fmtDateLong(s){ const d = new Date(s+'T00:00:00'); return d.toLocaleDat
 function weekdayShort(s){ if(!s) return ''; const d = new Date(s+'T00:00:00'); return d.toLocaleDateString('en-GB',{weekday:'short'}); }
 function fmtDateSlashDay(s){ if(!s) return ''; const [y,m,d] = s.split('-'); return `${d}/${m}/${y} (${weekdayShort(s)})`; }
 function fmtDateSlash(s){ if(!s) return ''; const [y,m,d] = s.split('-'); return `${d}/${m}/${y}`; }
+function fmtDateSlashYY(s){ if(!s) return ''; const [y,m,d] = s.split('-'); return `${d}/${m}/${y.slice(2)}`; }
+/* "14:30" -> "2:30pm", "10:00" -> "10am" (drops :00 on the hour, matching the
+   style already used in the check-in/checkout reminder wording). */
+function fmtTimeAMPM(t){
+  if(!t) return '';
+  const [h,m] = t.split(':').map(Number);
+  const period = h>=12 ? 'pm' : 'am';
+  let h12 = h%12; if(h12===0) h12=12;
+  return m===0 ? `${h12}${period}` : `${h12}:${String(m).padStart(2,'0')}${period}`;
+}
 /* Reusable helpers so every date field in the app — present and future —
    shows its value as dd/mm/yyyy (day) drawn directly inside the field
    itself (native date text hidden via .date-overlay-wrap CSS), instead of
@@ -1213,6 +1295,89 @@ function logCancellation(type, reason, note, cust, pet, summary){
 }
 /* Read-only log of every cancelled grooming appointment / boarding stay,
    newest first, with the reason recorded at delete-time. */
+/* =========================================================
+   CHANGE LOG — lightweight edit history + undo for prices,
+   dates, and notes (the things a mistyped edit most often ruins
+   and previously had no record and no way to undo). Each entry
+   stores the entity type + a small `ref` describing exactly
+   where to find the live record again (works even for nested
+   things like one charge inside one stay), the field that
+   changed, and its old/new values. Undo just writes the old
+   value back and logs that as its own new entry, so the trail
+   stays honest instead of being edited away.
+   ========================================================= */
+function logChange(entityType, ref, entityLabel, field, fieldLabel, oldValue, newValue){
+  if((oldValue??'') === (newValue??'')) return;
+  if(!Array.isArray(state.changeLog)) state.changeLog = [];
+  state.changeLog.unshift({
+    id: uid('chg'), ts: new Date().toISOString(), entityType, ref, entityLabel,
+    field, fieldLabel: fieldLabel || field, oldValue: oldValue ?? '', newValue: newValue ?? '', undone: false,
+  });
+  if(state.changeLog.length > 300) state.changeLog.length = 300;
+}
+function logFieldChanges(entityType, ref, entityLabel, oldObj, newObj, fields, fieldLabels){
+  fields.forEach(f=>{
+    const ov = oldObj ? oldObj[f] : undefined;
+    const nv = newObj ? newObj[f] : undefined;
+    logChange(entityType, ref, entityLabel, f, (fieldLabels && fieldLabels[f]) || f, ov, nv);
+  });
+}
+function resolveChangeEntity(entry){
+  switch(entry.entityType){
+    case 'Pet': { const r = findPetWithCustomer(entry.ref.petId); return r.pet; }
+    case 'Stay': return findStayById(entry.ref.stayId);
+    case 'Charge': { const s = findStayById(entry.ref.stayId); return s ? s.charges.find(c=>c.id===entry.ref.chargeId) : null; }
+    case 'Payment': { const c = getCustomer(entry.ref.custId); return c ? (c.payments||[]).find(p=>p.id===entry.ref.paymentId) : null; }
+    default: return null;
+  }
+}
+function undoChange(entryId){
+  const entry = (state.changeLog||[]).find(e=>e.id===entryId);
+  if(!entry) return;
+  const obj = resolveChangeEntity(entry);
+  if(!obj){ toast('That record no longer exists — can\'t undo'); return; }
+  const currentVal = obj[entry.field];
+  obj[entry.field] = entry.oldValue;
+  entry.undone = true;
+  logChange(entry.entityType, entry.ref, entry.entityLabel, entry.field, entry.fieldLabel, currentVal, entry.oldValue);
+  closeModal();
+  scheduleSync();
+  render();
+  toast('Change undone');
+}
+function changeLogValueDisplay(v){
+  if(v === '' || v == null) return '(empty)';
+  const s = String(v);
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return fmtDate(s);
+  return s.length > 70 ? esc(s.slice(0,70))+'…' : esc(s);
+}
+function openChangeLogModal(){
+  const list = (state.changeLog || []).slice(0, 150);
+  openModal(`
+    <div class="modal-head"><h3>Change log</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;">Recent edits to stay dates/rates, charges, payments, and pet notes — most recent first. Undo writes the old value back (and logs that as a new entry, so nothing is silently erased).</div>
+      ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No changes logged yet.</div>` : list.map(e=>`
+        <div class="today-card" style="cursor:default;">
+          <div class="today-card-main">
+            <div class="today-card-pet">${esc(e.entityType)} · ${esc(e.entityLabel)||'—'} <span class="badge badge-past">${esc(e.fieldLabel)}</span>${e.undone?' <span class="badge badge-active">Undone</span>':''}</div>
+            <div class="today-card-sub">${changeLogValueDisplay(e.oldValue)} → ${changeLogValueDisplay(e.newValue)}</div>
+            <div class="today-card-sub">${fmtDateWithDay(e.ts.slice(0,10))} at ${new Date(e.ts).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div>
+          </div>
+          ${!e.undone ? `<button class="btn btn-sm" data-undo-change="${e.id}">Undo</button>` : ''}
+        </div>
+      `).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-undo-change]').forEach(btn=>{
+    btn.addEventListener('click', ()=> undoChange(btn.dataset.undoChange));
+  });
+}
+
 function openCancellationsModal(){
   const list = state.cancellations || [];
   openModal(`
@@ -1235,6 +1400,381 @@ function openCancellationsModal(){
   `);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
 }
+
+/* Monthly operations report — revenue breakdown, room occupancy %, grooming
+   throughput, and cancellations, all for one calendar month. Room revenue is
+   computed night-by-night for nights that actually fall in the chosen month
+   (so a stay spanning two months only counts its nights in each correctly);
+   additional charges (retail/grooming/other) aren't dated individually, so
+   they're attributed to the stay's check-in month as a reasonable proxy —
+   this is an operational snapshot for spotting trends, not exact accounting. */
+function computeMonthlyReport(monthStr){
+  const [y,m] = monthStr.split('-').map(Number);
+  const daysInMonth = new Date(y, m, 0).getDate();
+  const monthDates = new Set();
+  for(let d=1; d<=daysInMonth; d++) monthDates.add(`${monthStr}-${String(d).padStart(2,'0')}`);
+
+  let roomRevenue = 0, surchargeRevenue = 0, chargesRevenue = 0, groomingChargeRevenue = 0, paymentsReceived = 0, newStaysStarted = 0;
+  const occupiedRoomNights = new Set();
+
+  state.customers.forEach(cust=>{
+    cust.pets.forEach(pet=>{
+      (pet.stays||[]).forEach(stay=>{
+        if(stay.checkIn.slice(0,7) === monthStr) newStaysStarted++;
+        // Group into rooms with each occupant's OWN actual window (its per-pet
+        // override if the row set one, else the stay's own dates) — mirrors
+        // computeStayCost, so pets sharing a room but joining/leaving on
+        // different dates are only counted/charged for the nights they're
+        // actually there.
+        const byRoom = {};
+        stay.pets.forEach(sp=>{
+          if(!byRoom[sp.room]) byRoom[sp.room] = [];
+          const ids = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+          ids.forEach(id=>{
+            if(byRoom[sp.room].some(o=>o.petId===id)) return;
+            byRoom[sp.room].push({ petId: id, ...petDatesInStay(stay, sp, id) });
+          });
+        });
+        Object.entries(byRoom).forEach(([roomId, occupants])=>{
+          const room = roomTypeFor(roomId);
+          if(!room || occupants.length===0) return;
+          const roomCheckIn = occupants.map(o=>o.checkIn).sort()[0];
+          const roomCheckOut = occupants.map(o=>o.checkOut).sort().slice(-1)[0];
+          const roomNights = nightsBetween(roomCheckIn, roomCheckOut);
+          for(let n=0;n<roomNights;n++){
+            const dateStr = addDays(roomCheckIn, n);
+            if(!monthDates.has(dateStr)) continue;
+            const presentToday = occupants.filter(o => dateStr >= o.checkIn && dateStr < o.checkOut);
+            if(presentToday.length===0) continue;
+            occupiedRoomNights.add(`${roomId}|${dateStr}`);
+            const holiday = isHoliday(dateStr);
+            let rate;
+            if(room.type==='Dog Deluxe (Bottom)' || room.type==='Dog Deluxe (Upper)'){
+              const anyLarge = presentToday.some(o=>{ const p=findPetById(o.petId); return p && ['L','XL','XXL'].includes(p.boardingSize); });
+              rate = anyLarge ? LARGE : state.rates[room.type];
+            } else rate = state.rates[room.type];
+            if(!rate) rate = {normal:0, holiday:0};
+            const usingCustomRate = stay.customRate != null && stay.customRate >= 0;
+            const standardRate = holiday ? rate.holiday : rate.normal;
+            let nightRate = standardRate;
+            if(usingCustomRate){
+              nightRate = stay.customRateMode==='percent' ? standardRate*(1-Math.min(stay.customRate,100)/100) : stay.customRate;
+            }
+            roomRevenue += nightRate;
+            if(presentToday.length>1){
+              presentToday.slice(1).forEach(o=>{
+                const p = findPetById(o.petId);
+                const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
+                surchargeRevenue += isLarge ? state.surchargeLXL : state.surchargeSM;
+              });
+            }
+          }
+        });
+        if(stay.checkIn.slice(0,7) === monthStr){
+          (stay.charges||[]).forEach(c=>{
+            const amt = (+c.amount||0)*(+c.qty||1);
+            if(c.category==='Grooming') groomingChargeRevenue += amt; else chargesRevenue += amt;
+          });
+        }
+      });
+      (cust.payments||[]).forEach(p=>{
+        if(p.date && p.date.slice(0,7)===monthStr) paymentsReceived += (+p.amount||0);
+      });
+    });
+  });
+
+  let groomingBooked = 0, groomingCompleted = 0;
+  state.customers.forEach(cust=>{
+    cust.pets.forEach(pet=>{
+      (pet.groomingHistory||[]).forEach(g=>{
+        if(g.date && g.date.slice(0,7)===monthStr){
+          groomingBooked++;
+          if(g.status==='Picked up') groomingCompleted++;
+        }
+      });
+    });
+  });
+
+  const cancellationsThisMonth = (state.cancellations||[]).filter(c=>c.cancelledAt && c.cancelledAt.slice(0,7)===monthStr);
+  const cancelByReason = {};
+  cancellationsThisMonth.forEach(c=>{ cancelByReason[c.reason] = (cancelByReason[c.reason]||0)+1; });
+
+  const totalRoomNightsAvailable = ROOM_INVENTORY.length * daysInMonth;
+  const occupancyPct = totalRoomNightsAvailable>0 ? (occupiedRoomNights.size/totalRoomNightsAvailable*100) : 0;
+
+  return {
+    monthStr, daysInMonth,
+    roomRevenue, surchargeRevenue, chargesRevenue, groomingChargeRevenue,
+    totalRevenue: roomRevenue+surchargeRevenue+chargesRevenue+groomingChargeRevenue,
+    paymentsReceived,
+    occupiedRoomNights: occupiedRoomNights.size, totalRoomNightsAvailable, occupancyPct,
+    newStaysStarted, groomingBooked, groomingCompleted,
+    cancellationsCount: cancellationsThisMonth.length, cancelByReason,
+  };
+}
+/* Forward-looking occupancy — unlike the monthly report (which only shows
+   what already happened), this projects the next N days from stays already
+   booked, so a near-full stretch can be spotted and acted on (e.g. push
+   marketing, or flag a holiday period filling up) while there's still time,
+   not just after the fact. */
+function computeUpcomingOccupancy(days){
+  const totalRooms = ROOM_INVENTORY.length;
+  const today = todayStr();
+  const out = [];
+  for(let n=0; n<days; n++){
+    const dateStr = addDays(today, n);
+    const roomsBooked = new Set();
+    state.customers.forEach(cust=>{
+      cust.pets.forEach(pet=>{
+        (pet.stays||[]).forEach(stay=>{
+          if(stay.status!=='Active') return;
+          stay.pets.forEach(sp=>{
+            if(!sp.room) return;
+            const w = spRoomWindow(stay, sp);
+            if(dateStr>=w.checkIn && dateStr<w.checkOut) roomsBooked.add(sp.room);
+          });
+        });
+      });
+    });
+    const occupied = roomsBooked.size;
+    out.push({ date: dateStr, occupied, totalRooms, pct: totalRooms>0 ? (occupied/totalRooms*100) : 0 });
+  }
+  return out;
+}
+function upcomingOccupancyHtml(days){
+  const rows = computeUpcomingOccupancy(days);
+  return `<div class="today-card" style="cursor:default;">
+    <div class="today-card-main" style="width:100%;">
+      <div class="today-card-pet">📈 Upcoming occupancy — next ${days} days <span style="font-weight:400;color:var(--ink-soft);font-size:11.5px;">(from bookings already on the calendar)</span></div>
+      <div style="margin-top:8px;">
+        ${rows.map(r=>{
+          const near = r.pct>=90;
+          const warm = r.pct>=70 && r.pct<90;
+          const barColor = near ? '#C0392B' : warm ? '#C98A1F' : '#2E8B57';
+          return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;font-size:11.5px;">
+            <span style="width:78px;flex-shrink:0;color:var(--ink-soft);">${fmtDateSlashDay(r.date)}</span>
+            <span style="flex:1;background:var(--line-soft);border-radius:5px;overflow:hidden;height:14px;position:relative;">
+              <span style="display:block;height:100%;width:${Math.min(100,r.pct).toFixed(0)}%;background:${barColor};"></span>
+            </span>
+            <span style="width:90px;flex-shrink:0;text-align:right;${near?'color:#C0392B;font-weight:700;':''}">${r.occupied}/${r.totalRooms} (${r.pct.toFixed(0)}%)</span>
+          </div>`;
+        }).join('')}
+      </div>
+      ${rows.some(r=>r.pct>=90) ? `<div style="font-size:11.5px;color:#C0392B;font-weight:600;margin-top:6px;">⚠️ ${rows.filter(r=>r.pct>=90).length} day${rows.filter(r=>r.pct>=90).length===1?'':'s'} at 90%+ — worth checking whether to close off further bookings or plan overflow.</div>` : ''}
+    </div>
+  </div>`;
+}
+function openReportsModal(monthStr){
+  monthStr = monthStr || todayStr().slice(0,7);
+  const r = computeMonthlyReport(monthStr);
+  const [y,m] = monthStr.split('-').map(Number);
+  const monthLabel = new Date(y, m-1, 1).toLocaleDateString('en-GB', {month:'long', year:'numeric'});
+  const prevMonth = addMonthsToMonthStr(monthStr, -1);
+  const nextMonth = addMonthsToMonthStr(monthStr, 1);
+  const reasonRows = Object.entries(r.cancelByReason).map(([reason,count])=>`<div class="today-card-sub">${esc(reason)}: ${count}</div>`).join('') || '<div class="today-card-sub">None</div>';
+  openModal(`
+    <div class="modal-head"><h3>Monthly report</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
+        <button class="btn btn-sm" id="reportPrevMonth">‹</button>
+        <div style="font-weight:700;font-size:15px;">${monthLabel}</div>
+        <button class="btn btn-sm" id="reportNextMonth">›</button>
+      </div>
+      <div class="today-card" style="cursor:default;">
+        <div class="today-card-main">
+          <div class="today-card-pet">💰 Revenue (RM ${r.totalRevenue.toFixed(2)})</div>
+          <div class="today-card-sub">Room nights: RM ${r.roomRevenue.toFixed(2)}</div>
+          <div class="today-card-sub">Sharing surcharges: RM ${r.surchargeRevenue.toFixed(2)}</div>
+          <div class="today-card-sub">Grooming (add-on charges): RM ${r.groomingChargeRevenue.toFixed(2)}</div>
+          <div class="today-card-sub">Retail / other charges: RM ${r.chargesRevenue.toFixed(2)}</div>
+          <div class="today-card-sub">Payments actually received this month: RM ${r.paymentsReceived.toFixed(2)}</div>
+        </div>
+      </div>
+      <div class="today-card" style="cursor:default;">
+        <div class="today-card-main">
+          <div class="today-card-pet">🏨 Occupancy — ${r.occupancyPct.toFixed(1)}%</div>
+          <div class="today-card-sub">${r.occupiedRoomNights} of ${r.totalRoomNightsAvailable} room-nights booked</div>
+          <div class="today-card-sub">${r.newStaysStarted} new stay${r.newStaysStarted===1?'':'s'} started this month</div>
+        </div>
+      </div>
+      ${upcomingOccupancyHtml(14)}
+      <div class="today-card" style="cursor:default;">
+        <div class="today-card-main">
+          <div class="today-card-pet">✂️ Grooming</div>
+          <div class="today-card-sub">${r.groomingBooked} appointment${r.groomingBooked===1?'':'s'} booked this month, ${r.groomingCompleted} marked Picked up</div>
+        </div>
+      </div>
+      <div class="today-card" style="cursor:default;">
+        <div class="today-card-main">
+          <div class="today-card-pet">🚫 Cancellations — ${r.cancellationsCount}</div>
+          ${reasonRows}
+        </div>
+      </div>
+      <div style="font-size:11.5px;color:var(--ink-soft);margin-top:4px;">Additional charges (grooming/retail/other) are counted in the month the stay checked in, not spread across the stay — an operational snapshot, not exact accounting.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('reportPrevMonth').addEventListener('click', ()=>openReportsModal(prevMonth));
+  document.getElementById('reportNextMonth').addEventListener('click', ()=>openReportsModal(nextMonth));
+}
+function addMonthsToMonthStr(monthStr, delta){
+  const [y,m] = monthStr.split('-').map(Number);
+  const d = new Date(y, m-1+delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+}
+
+/* Turns a stored contact number into the digits-only format wa.me needs
+   (country code + number, no +/spaces/dashes). Assumes Malaysian numbers
+   when a leading 0 is used (the shop's home market) — a number already
+   typed with a country code (e.g. starting 60 or +1) is left as-is. */
+function phoneForWhatsApp(phone){
+  let digits = (phone||'').replace(/[^0-9]/g, '');
+  if(digits.startsWith('0')) digits = '60' + digits.slice(1);
+  return digits;
+}
+function waLink(phone, message){
+  return `https://wa.me/${phoneForWhatsApp(phone)}?text=${encodeURIComponent(message)}`;
+}
+/* Everything due tomorrow (relative to `dateStr`, so this can be paged) that
+   a customer would want a heads-up about: grooming appointments and boarding
+   checkouts. Each item comes with a ready-to-send WhatsApp message — tapping
+   Send opens WhatsApp with it pre-filled so staff just review and hit send,
+   rather than composing each one from scratch every day. */
+function computeReminders(dateStr){
+  const dayLabel = fmtDateWithDay(dateStr);
+  const dateShort = fmtDateSlashYY(dateStr);
+  const groomItems = [], checkinItems = [], checkoutItems = [];
+  const seenCheckin = new Set(), seenCheckout = new Set();
+  state.customers.forEach(cust=>{
+    cust.pets.forEach(pet=>{
+      (pet.groomingHistory||[]).forEach(g=>{
+        if(g.date !== dateStr) return;
+        if(g.status === 'Picked up') return; // already done, nothing to remind about
+        const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${pet.name} has a grooming appointment on tomorrow (${dateShort}) at ${fmtTimeAMPM(g.time)}.\nSee you then!`;
+        groomItems.push({ cust, pet, record:g, message, sent: !!g.reminderSent, kind:'groom', groomId:g.id });
+      });
+      (pet.stays||[]).forEach(stay=>{
+        if(stay.status !== 'Active') return;
+        // Include every pet actually in the room — the row's own pet AND any
+        // sharing partners — using each one's OWN resolved check-in/check-out
+        // (its per-pet override if set, else the stay's dates), since a
+        // sharing partner can now arrive/leave on a different date than the
+        // stay it's attached to. Each pet's real owner gets its own reminder.
+        stay.pets.forEach(sp=>{
+          const memberIds = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+          memberIds.forEach(id=>{
+            const w = petDatesInStay(stay, sp, id);
+            const { pet: memberPet, cust: memberCust } = id===sp.petId ? { pet: findPetAcrossStay(cust, id) || pet, cust } : findPetWithCustomer(id);
+            if(!memberPet) return;
+            const owner = memberCust || cust;
+            if(w.checkIn === dateStr && !seenCheckin.has(`${stay.id}:${id}`)){
+              seenCheckin.add(`${stay.id}:${id}`);
+              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
+              checkinItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkin||[]).includes(id), kind:'checkin', stayId:stay.id, petId:id });
+            }
+            if(w.checkOut === dateStr && !seenCheckout.has(`${stay.id}:${id}`)){
+              seenCheckout.add(`${stay.id}:${id}`);
+              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
+              checkoutItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkout||[]).includes(id), kind:'checkout', stayId:stay.id, petId:id });
+            }
+          });
+        });
+      });
+    });
+  });
+  return { dateStr, dayLabel, groomItems, checkinItems, checkoutItems };
+}
+function setReminderSent(item, sent){
+  if(item.kind==='groom'){
+    const groom = (findPetById(item.pet.id)?.groomingHistory||[]).find(g=>g.id===item.groomId);
+    if(groom) groom.reminderSent = sent;
+  } else {
+    const stay = findStayById(item.stayId);
+    if(!stay) return;
+    const list = stay.remindersSent[item.kind]; // 'checkin' or 'checkout'
+    const i = list.indexOf(item.petId);
+    if(sent && i===-1) list.push(item.petId);
+    if(!sent && i>-1) list.splice(i,1);
+  }
+  scheduleSync();
+}
+function openRemindersModal(dateStr){
+  dateStr = dateStr || addDays(todayStr(), 1);
+  const r = computeReminders(dateStr);
+  const prevDate = addDays(dateStr, -1);
+  const nextDate = addDays(dateStr, 1);
+  const allItems = [...r.groomItems, ...r.checkinItems, ...r.checkoutItems];
+  const itemKey = (item, i)=> item.kind==='groom' ? `groom:${item.groomId}` : `${item.kind}:${item.stayId}:${item.petId}`;
+  const itemCard = (item, icon, subLabel)=>`
+    <div class="today-card ${item.sent?'today-card-confirmed':''}" style="cursor:default;">
+      <div class="today-card-main">
+        <div class="today-card-pet">${icon} ${esc(item.pet.name)} <span class="badge badge-past">${esc(item.cust.name)}</span>${item.sent?' <span class="badge badge-active">Sent</span>':''}</div>
+        <div class="today-card-sub">${subLabel} · ${esc(item.cust.phone)}</div>
+        <div class="today-card-sub" style="white-space:pre-line;font-size:11.5px;color:var(--ink-soft);margin-top:4px;border-left:2px solid var(--line-soft);padding-left:8px;">${esc(item.message)}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <button type="button" class="btn btn-sm" data-copy-reminder="${itemKey(item)}">Copy</button>
+        <button type="button" class="btn btn-sm ${item.sent?'btn-ghost':'btn-primary'}" data-toggle-sent="${itemKey(item)}">${item.sent?'Mark unsent':'Mark as sent'}</button>
+      </div>
+    </div>`;
+  openModal(`
+    <div class="modal-head"><h3>Reminders</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
+        <button class="btn btn-sm" id="remPrevDay">‹</button>
+        <div style="font-weight:700;font-size:15px;">${r.dayLabel}</div>
+        <button class="btn btn-sm" id="remNextDay">›</button>
+      </div>
+      ${allItems.length>0 ? `<button class="btn btn-primary" id="remMarkAllSent" style="width:100%;margin-bottom:14px;">Mark all (${allItems.length}) as sent</button>` : ''}
+      <div style="font-weight:700;font-size:13px;margin-bottom:6px;">✂️ Grooming appointments (${r.groomItems.length})</div>
+      ${r.groomItems.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">None.</div>` :
+        r.groomItems.map(item=>itemCard(item, '✂️', `${item.record.time} · ${item.record.bay}`)).join('')}
+      <div style="font-weight:700;font-size:13px;margin:14px 0 6px;">🏨 Boarding check-ins (${r.checkinItems.length})</div>
+      ${r.checkinItems.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">None.</div>` :
+        r.checkinItems.map(item=>itemCard(item, '🏨', `Checking in`)).join('')}
+      <div style="font-weight:700;font-size:13px;margin:14px 0 6px;">🏨 Boarding checkouts (${r.checkoutItems.length})</div>
+      ${r.checkoutItems.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">None.</div>` :
+        r.checkoutItems.map(item=>itemCard(item, '🏨', `Checking out`)).join('')}
+      <div style="font-size:11.5px;color:var(--ink-soft);margin-top:10px;">This list doesn't send anything on its own anymore — send the message however you normally do (e.g. WhatsApp on your phone), using "Copy" to grab the text, then tap "Mark as sent" to check it off.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('remPrevDay').addEventListener('click', ()=>openRemindersModal(prevDate));
+  document.getElementById('remNextDay').addEventListener('click', ()=>openRemindersModal(nextDate));
+  function findItem(key){ return allItems.find((it,i)=>itemKey(it,i)===key); }
+  document.querySelectorAll('[data-copy-reminder]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const item = findItem(btn.dataset.copyReminder);
+      if(!item) return;
+      try{
+        await navigator.clipboard.writeText(item.message);
+        toast('Message copied');
+      }catch(err){
+        toast('Could not copy — long-press the message text instead');
+      }
+    });
+  });
+  document.querySelectorAll('[data-toggle-sent]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const item = findItem(btn.dataset.toggleSent);
+      if(!item) return;
+      setReminderSent(item, !item.sent);
+      openRemindersModal(dateStr);
+    });
+  });
+  const markAllBtn = document.getElementById('remMarkAllSent');
+  if(markAllBtn) markAllBtn.addEventListener('click', ()=>{
+    allItems.forEach(item=> setReminderSent(item, true));
+    openRemindersModal(dateStr);
+  });
+}
+
 /* Informational popup shown right before a boarding stay is saved, if any
    night of the stay falls inside a holiday-rate period — lets staff catch it
    before confirming. Rendered as a stacked overlay (appended alongside the
@@ -1395,12 +1935,41 @@ function initials(name){ return name.trim().split(/\s+/).slice(0,2).map(w=>w[0])
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2200); }
 function roomTypeFor(id){ return ROOM_INVENTORY.find(r=>r.id===id); }
 
+/* Per-pet checked-in helpers — see checkedInPets on normalizeStay(). */
+function isPetCheckedIn(stay, petId){ return (stay.checkedInPets||[]).includes(petId); }
+function setPetCheckedIn(stay, petId, val){
+  if(!Array.isArray(stay.checkedInPets)) stay.checkedInPets = [];
+  const i = stay.checkedInPets.indexOf(petId);
+  if(val && i===-1) stay.checkedInPets.push(petId);
+  if(!val && i>-1) stay.checkedInPets.splice(i,1);
+  // keep the legacy single flag roughly in sync (true once everyone's in)
+  const allIds = stay.pets.flatMap(sp=>[sp.petId, ...(sp.sharingWith||[])]).filter(Boolean);
+  stay.checkedIn = allIds.length>0 && allIds.every(id=>stay.checkedInPets.includes(id));
+}
+
 /* ---------------------------------------------------------
    Defensive normalization — fills in any missing fields on
    records (e.g. older data saved before a feature existed),
    so editing never crashes on an incomplete shape.
    --------------------------------------------------------- */
 function normalizeBelonging(b){ return { item: b?.item || '', photo: b?.photo || null }; }
+/* Optional per-pet date overrides, keyed by petId (covers the row's own
+   petId and/or any id in sharingWith) — lets pets sharing one room join or
+   leave on different dates than the stay's own checkIn/checkOut (e.g. Pet A
+   13→18 Aug, Pet B 14→18 Aug, same room). A missing/blank entry for a pet
+   just means "use the stay's own dates" — fully backward compatible with
+   older stays that never set this. */
+function sanitizeStayPetDates(raw){
+  const out = {};
+  if(raw && typeof raw === 'object'){
+    Object.entries(raw).forEach(([petId, v])=>{
+      if(!v) return;
+      const checkIn = v.checkIn || '', checkOut = v.checkOut || '';
+      if(checkIn || checkOut) out[petId] = { checkIn, checkOut };
+    });
+  }
+  return out;
+}
 function normalizeStayPet(sp){
   return {
     petId: sp?.petId ?? null,
@@ -1408,7 +1977,26 @@ function normalizeStayPet(sp){
     sharingWith: Array.isArray(sp?.sharingWith) ? sp.sharingWith : [],
     feeding: sp?.feeding || '',
     belongings: Array.isArray(sp?.belongings) ? sp.belongings.map(normalizeBelonging) : [],
+    dates: sanitizeStayPetDates(sp?.dates),
   };
+}
+/* Effective [checkIn, checkOut) for one specific pet within a stay-pet row —
+   that pet's own override if set, else the stay's own dates. */
+function petDatesInStay(stay, sp, petId){
+  const o = sp?.dates && sp.dates[petId];
+  return { checkIn: (o && o.checkIn) || stay.checkIn, checkOut: (o && o.checkOut) || stay.checkOut };
+}
+/* The full span the ROOM is occupied for one stay-pet row — the union across
+   the row's own pet and every pet in sharingWith, each using its own override
+   if set. Used for room-availability conflict checks and for showing the
+   room's overall occupied window. */
+function spRoomWindow(stay, sp){
+  const ids = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+  if(ids.length===0) return { checkIn: stay.checkIn, checkOut: stay.checkOut };
+  const wins = ids.map(id=>petDatesInStay(stay, sp, id));
+  const checkIn = wins.map(w=>w.checkIn).sort()[0];
+  const checkOut = wins.map(w=>w.checkOut).sort().slice(-1)[0];
+  return { checkIn, checkOut };
 }
 function normalizeClosedAppt(a){
   if(!a) return null;
@@ -1417,23 +2005,47 @@ function normalizeClosedAppt(a){
   return { time, contactName, contactPhone };
 }
 function normalizeStay(s){
+  // checkedInPets: array of petIds individually marked "checked in" — needed
+  // now that pets sharing one room can arrive on different dates. Old data
+  // only had one whole-stay `checkedIn` flag; migrate that to every pet in
+  // the stay once, so nothing already checked in appears to "un-check-in".
+  let checkedInPets = Array.isArray(s?.checkedInPets) ? s.checkedInPets.slice() : null;
+  if(checkedInPets === null){
+    checkedInPets = s?.checkedIn ? Array.from(new Set((Array.isArray(s?.pets)?s.pets:[]).flatMap(sp=>[sp?.petId, ...(Array.isArray(sp?.sharingWith)?sp.sharingWith:[])]).filter(Boolean))) : [];
+  }
   return {
     id: s?.id || uid('stay'),
     checkIn: s?.checkIn || todayStr(),
     checkOut: s?.checkOut || todayStr(),
     status: s?.status || 'Active',
-    checkedIn: s?.checkedIn || false,
+    checkedIn: s?.checkedIn || false, // kept for reference/back-compat; use checkedInPets/isPetCheckedIn for actual logic
+    checkedInPets,
     notes: s?.notes || '',
     customRate: (s?.customRate === '' || s?.customRate == null) ? null : +s.customRate,
     customRateMode: s?.customRateMode === 'percent' ? 'percent' : 'flat', // 'flat' = RM/night override, 'percent' = % off the standard rate
-    charges: Array.isArray(s?.charges) ? s.charges.map(c=>({ id:c?.id||uid('charge'), category:c?.category||'Others', description:c?.description||'', amount:+c?.amount||0, qty:c?.qty?+c.qty:1 })) : [],
+    charges: Array.isArray(s?.charges) ? s.charges.map(c=>({ id:c?.id||uid('charge'), category:c?.category||'Others', description:c?.description||'', amount:+c?.amount||0, qty:c?.qty?+c.qty:1, paid: !!c?.paid })) : [],
     pets: Array.isArray(s?.pets) ? s.pets.map(normalizeStayPet) : [],
     dropoff: normalizeClosedAppt(s?.dropoff), // set when check-in lands on a closed day — {time, contactName, contactPhone} for whoever drops the pet off
     pickup: normalizeClosedAppt(s?.pickup),   // set when check-out lands on a closed day — same shape, for whoever picks the pet up
+    // "Nights paid through" — a date marking how far into the stay the room
+    // charge is already covered, e.g. the customer paid at check-in for the
+    // originally-booked nights, then the stay got extended and the extra
+    // nights aren't paid yet. Purely a status label like the per-charge Paid
+    // marker — never subtracted again from the balance (that's already
+    // reflected in a recorded Payment). null/unset = not marked either way.
+    paidThrough: s?.paidThrough || null,
+    // Which check-in/check-out reminders have already been sent (manually,
+    // outside the app) for each pet in this stay — {checkin:[petId,...],
+    // checkout:[petId,...]} — so the Reminders list can be marked off
+    // without needing an actual WhatsApp redirect.
+    remindersSent: {
+      checkin: Array.isArray(s?.remindersSent?.checkin) ? s.remindersSent.checkin : [],
+      checkout: Array.isArray(s?.remindersSent?.checkout) ? s.remindersSent.checkout : [],
+    },
   };
 }
 function normalizeGroom(g){
-  const merged = { addons:[], photos:[], notes:'', sizeCode:'', cutCode:'', details:'', status:'Not arrived', groomColor:null, ...g };
+  const merged = { addons:[], photos:[], notes:'', sizeCode:'', cutCode:'', details:'', status:'Not arrived', groomColor:null, reminderSent:false, ...g };
   if(!Array.isArray(merged.apptTypes)){
     merged.apptTypes = merged.apptType ? [merged.apptType] : [];
   }
@@ -1446,6 +2058,11 @@ function normalizePet(p){
     photo: p?.photo || null,
     stays: Array.isArray(p?.stays) ? p.stays.map(normalizeStay) : [],
     groomingHistory: Array.isArray(p?.groomingHistory) ? p.groomingHistory.map(normalizeGroom) : [],
+    // Risk flags — surfaced prominently (pet header, Today grid, booking
+    // modals) instead of being buried in free-typed medical/special-request
+    // text, so staff see them automatically rather than having to remember
+    // to read the notes.
+    riskFlags: Array.isArray(p?.riskFlags) ? p.riskFlags : [],
   };
 }
 /* Payments used to link to a single stay via `stayId`. They can now link to
@@ -1467,6 +2084,9 @@ function normalizeCustomer(c){
     colorOverride: c?.colorOverride || null,
     pointsHistory: Array.isArray(c?.pointsHistory) ? c.pointsHistory : [],
     pets: Array.isArray(c?.pets) ? c.pets.map(normalizePet) : [],
+    // Who's allowed to collect this customer's pet(s) — {id, name, phone,
+    // note}. Shown on checkout so staff can verify against ID at pickup.
+    authorizedPickups: Array.isArray(c?.authorizedPickups) ? c.authorizedPickups.map(a=>({ id:a?.id||uid('pickup'), name:a?.name||'', phone:a?.phone||'', note:a?.note||'' })) : [],
   };
 }
 function pointsBalance(cust){
@@ -1639,6 +2259,21 @@ function renderCustomersMain(){
       </div>
       <div class="payments-section">
         <div class="payments-head">
+          <span class="payments-title">Authorized for pickup <span style="font-weight:500;color:var(--ink-soft);">(verify against ID at checkout)</span></span>
+          <button class="btn btn-sm" id="addPickupBtn">+ Add</button>
+        </div>
+        ${(cust.authorizedPickups||[]).length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">None recorded — verify with the owner directly if anyone else tries to collect.</div>` :
+          cust.authorizedPickups.map(a=>`
+            <div class="payment-row" data-edit-pickup="${a.id}" style="cursor:pointer;">
+              <span class="payment-amount">${esc(a.name)}</span>
+              <span class="payment-receipt">${esc(a.phone)}</span>
+              ${a.note ? `<span class="payment-date">${esc(a.note)}</span>` : ''}
+              <button class="btn btn-sm btn-danger" data-del-pickup="${a.id}">✕</button>
+            </div>
+          `).join('')}
+      </div>
+      <div class="payments-section">
+        <div class="payments-head">
           <span class="payments-title">General payments <span style="font-weight:500;color:var(--ink-soft);">(not linked to a specific stay)</span></span>
           ${cust.payments.length ? `<span class="payments-total">Total across all stays: RM ${cust.payments.reduce((s,p)=>s+(+p.amount||0),0).toFixed(2)}</span>` : ''}
           <button class="btn btn-sm" id="addPaymentBtn">+ Add payment</button>
@@ -1709,6 +2344,21 @@ function renderCustomersMain(){
     }
   });
   document.getElementById('addPaymentBtn').addEventListener('click', ()=>openPaymentModal(cust));
+  document.getElementById('addPickupBtn').addEventListener('click', ()=>openPickupModal(cust, null));
+  document.querySelectorAll('[data-edit-pickup]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      if(e.target.closest('[data-del-pickup]')) return;
+      const entry = (cust.authorizedPickups||[]).find(a=>a.id===el.dataset.editPickup);
+      if(entry) openPickupModal(cust, entry);
+    });
+  });
+  document.querySelectorAll('[data-del-pickup]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      cust.authorizedPickups = (cust.authorizedPickups||[]).filter(a=>a.id!==btn.dataset.delPickup);
+      renderCustomersMain(); toast('Removed');
+    });
+  });
   document.querySelectorAll('[data-del-payment]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
@@ -1770,11 +2420,19 @@ function curSub(){ return _subTab; }
 function setSub(s){ _subTab = s; document.querySelectorAll('#petSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.sub===s)); }
 let _groomSelection = new Set(); // ids of grooming appointments currently ticked for bulk actions on the pet's Grooming history tab — cleared whenever a different pet/tab is opened
 
+/* Prominent red badge for a pet's risk flags — shown at every point staff
+   look at or book this pet, instead of relying on someone reading through
+   free-typed medical/personality/special-request text. */
+function riskFlagBadgesHtml(pet, compact){
+  if(!pet || !(pet.riskFlags||[]).length) return '';
+  if(compact) return ` <span title="${pet.riskFlags.map(esc).join(', ')}" style="color:#A23B2C;">⚠️</span>`;
+  return pet.riskFlags.map(f=>`<span class="badge" style="background:#FBE4E2;color:#A23B2C;border:1px solid #EEB3AC;margin-left:4px;">⚠️ ${esc(f)}</span>`).join('');
+}
 function renderPetTabs(cust, activePet){
   const wrap = document.getElementById('petTabs');
   wrap.innerHTML = cust.pets.map(p=>`
     <div class="pet-tab ${activePet && p.id===activePet.id ? 'active':''}" data-pet="${p.id}">
-      ${p.photo ? `<img class="pet-tab-thumb" src="${p.photo}">` : `<span class="pt-icon">${ANIMAL_ICON[p.type]||'🐾'}</span>`} ${petLabel(p)}
+      ${p.photo ? `<img class="pet-tab-thumb" src="${p.photo}">` : `<span class="pt-icon">${ANIMAL_ICON[p.type]||'🐾'}</span>`} ${petLabel(p)}${riskFlagBadgesHtml(p, true)}
     </div>
   `).join('') + `<div class="pet-tab pet-tab-add" id="addPetTab">+ Add pet</div>`;
   wrap.querySelectorAll('.pet-tab[data-pet]').forEach(el=>{
@@ -1804,6 +2462,7 @@ function petInfoHtml(p){
         </div>
         <div>
           <div class="section-title" style="margin:0;">${ANIMAL_ICON[p.type]||'🐾'} ${petLabel(p)}</div>
+          <div style="margin-top:4px;">${riskFlagBadgesHtml(p)}</div>
           <div style="display:flex;gap:8px;margin-top:6px;">
             <button class="btn btn-sm" id="petPhotoUploadBtn">${p.photo?'Change photo':'Add photo'}</button>
             ${p.photo ? `<button class="btn btn-sm btn-danger" id="petPhotoRemoveBtn">Remove</button>` : ''}
@@ -1843,18 +2502,34 @@ function petInfoHtml(p){
 /* =========================================================
    TODAY — check-in / check-out overview (Yesterday / Today / Tomorrow)
    ========================================================= */
+/* Each entry here is now a specific PET's own arrival/departure on `date` —
+   not just the stay's own dates — since pets sharing one room can join or
+   leave on different days. Pets (primary + any sharing partners) whose own
+   date matches are grouped into one card per distinct petId set that shares
+   the same actual date, so the common case (everyone on the same dates)
+   still shows as a single combined card exactly as before. */
 function collectStaysForDate(date){
   const checkins = [], checkouts = [];
   state.customers.forEach(cust=>{
     cust.pets.forEach(pet=>{
       pet.stays.forEach(stay=>{
         stay.pets.forEach(sp=>{
-          const spPet = findPetAcrossStay(cust, sp.petId) || pet;
-          if(stay.checkIn === date){
-            checkins.push({ cust, pet: spPet, stay, sp });
+          const memberIds = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+          const inGroup = [], outGroup = [];
+          memberIds.forEach(id=>{
+            const w = petDatesInStay(stay, sp, id);
+            if(w.checkIn === date) inGroup.push(id);
+            if(w.checkOut === date) outGroup.push(id);
+          });
+          if(inGroup.length){
+            const leadId = inGroup.includes(sp.petId) ? sp.petId : inGroup[0];
+            const spPet = findPetAcrossStay(cust, leadId) || pet;
+            checkins.push({ cust, pet: spPet, stay, sp, memberIds: inGroup });
           }
-          if(stay.checkOut === date){
-            checkouts.push({ cust, pet: spPet, stay, sp });
+          if(outGroup.length){
+            const leadId = outGroup.includes(sp.petId) ? sp.petId : outGroup[0];
+            const spPet = findPetAcrossStay(cust, leadId) || pet;
+            checkouts.push({ cust, pet: spPet, stay, sp, memberIds: outGroup });
           }
         });
       });
@@ -1887,7 +2562,7 @@ function renderTodayView(){
   main.querySelectorAll('[data-today-checkout]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
-      const [custId, stayId, petId] = btn.dataset.todayCheckout.split('|');
+      const [custId, stayId] = btn.dataset.todayCheckout.split('|');
       const cust = getCustomer(custId);
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
@@ -1897,21 +2572,21 @@ function renderTodayView(){
   main.querySelectorAll('[data-today-checkin]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
-      const [custId, stayId, petId] = btn.dataset.todayCheckin.split('|');
+      const [custId, stayId, memberIdsStr] = btn.dataset.todayCheckin.split('|');
       const cust = getCustomer(custId);
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
-      if(stay){ stay.checkedIn=true; renderTodayView(); scheduleSync(); toast('Checked in'); }
+      if(stay){ memberIdsStr.split(',').forEach(id=>setPetCheckedIn(stay, id, true)); renderTodayView(); scheduleSync(); toast('Checked in'); }
     });
   });
   main.querySelectorAll('[data-today-undo-checkin]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
-      const [custId, stayId, petId] = btn.dataset.todayUndoCheckin.split('|');
+      const [custId, stayId, memberIdsStr] = btn.dataset.todayUndoCheckin.split('|');
       const cust = getCustomer(custId);
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
-      if(stay){ stay.checkedIn=false; renderTodayView(); scheduleSync(); toast('Check-in undone'); }
+      if(stay){ memberIdsStr.split(',').forEach(id=>setPetCheckedIn(stay, id, false)); renderTodayView(); scheduleSync(); toast('Check-in undone'); }
     });
   });
 }
@@ -1927,12 +2602,12 @@ function todayDateSectionHtml(sec, checkins, checkouts){
       <div>
         <div class="today-col-head"><h2>🐾 Checking in</h2><span class="today-count">${checkins.length}</span></div>
         ${checkins.length===0 ? `<div class="today-empty">No check-ins.</div>` :
-          checkins.map(({cust,pet,stay,sp})=>todayCardHtml(cust,pet,stay,sp,'in',sec.allowCheckout)).join('')}
+          checkins.map(({cust,pet,stay,sp,memberIds})=>todayCardHtml(cust,pet,stay,sp,memberIds,'in',sec.allowCheckout)).join('')}
       </div>
       <div>
         <div class="today-col-head"><h2>🚪 Checking out</h2><span class="today-count">${checkouts.length}</span></div>
         ${checkouts.length===0 ? `<div class="today-empty">No check-outs.</div>` :
-          checkouts.map(({cust,pet,stay,sp})=>todayCardHtml(cust,pet,stay,sp,'out',sec.allowCheckout)).join('')}
+          checkouts.map(({cust,pet,stay,sp,memberIds})=>todayCardHtml(cust,pet,stay,sp,memberIds,'out',sec.allowCheckout)).join('')}
       </div>
     </div>
   </div>`;
@@ -1947,25 +2622,52 @@ function sharingPetLabels(cust, sp){
     .filter(r => r.pet)
     .map(({pet, cust:owner}) => owner && owner.id!==cust.id ? `${esc(pet.name)} (${esc(owner.name)})` : esc(pet.name));
 }
-function todayCardHtml(cust, pet, stay, sp, mode, allowCheckout){
+/* Same as sharingPetLabels but appends each pet's own dates when it has a
+   per-pet override different from the stay's own dates (e.g. "Rex (own dates:
+   14/08/26 → 18/08/26)") — used on the stay card so a staggered booking is
+   readable at a glance. */
+function sharingPetLabelsWithDates(cust, stay, sp){
+  return (sp.sharingWith||[])
+    .map(id => ({...findPetWithCustomer(id), id}))
+    .filter(r => r.pet)
+    .map(({pet, cust:owner, id}) => {
+      const base = owner && owner.id!==cust.id ? `${esc(pet.name)} (${esc(owner.name)})` : esc(pet.name);
+      const ov = sp.dates && sp.dates[id];
+      return ov ? `${base} — own dates: ${fmtDate(ov.checkIn)} → ${fmtDate(ov.checkOut)}` : base;
+    });
+}
+/* Labels for a specific set of petIds (used for a Today-grid group, which
+   may be a subset of the full "sharing with" list when some sharing
+   partners arrive/leave on a different date than the rest). */
+function idsToLabels(ids, primaryCustId){
+  return ids.map(id=>findPetWithCustomer(id)).filter(r=>r.pet)
+    .map(({pet, cust:owner}) => owner && owner.id!==primaryCustId ? `${esc(pet.name)} (${esc(owner.name)})` : esc(pet.name));
+}
+function todayCardHtml(cust, pet, stay, sp, memberIds, mode, allowCheckout){
   const key = `${cust.id}|${pet.id}`;
+  const ids = memberIds && memberIds.length ? memberIds : [pet.id];
+  const allCheckedIn = ids.every(id=>isPetCheckedIn(stay,id));
+  const anyCheckedIn = ids.some(id=>isPetCheckedIn(stay,id));
   const canCheckout = mode==='out' && stay.status==='Active' && allowCheckout;
-  const canCheckin = mode==='in' && !stay.checkedIn && allowCheckout;
-  const canUndoCheckin = mode==='in' && stay.checkedIn && allowCheckout;
-  const confirmed = (mode==='in' && stay.checkedIn) || (mode==='out' && stay.status==='Past');
-  const sharingNames = sharingPetLabels(cust, sp);
-  const petNameDisplay = sharingNames.length ? `${petLabel(pet)} &amp; ${sharingNames.join(' &amp; ')}` : petLabel(pet);
+  const canCheckin = mode==='in' && !allCheckedIn && allowCheckout;
+  const canUndoCheckin = mode==='in' && anyCheckedIn && allowCheckout;
+  const confirmed = (mode==='in' && allCheckedIn) || (mode==='out' && stay.status==='Past');
+  const otherLabels = idsToLabels(ids.filter(id=>id!==pet.id), cust.id);
+  const petNameDisplay = otherLabels.length ? `${petLabel(pet)} &amp; ${otherLabels.join(' &amp; ')}` : petLabel(pet);
+  const groupRiskFlags = ids.some(id=>((findPetById(id)||{}).riskFlags||[]).length>0);
+  const idsKey = ids.join(',');
   return `
   <div class="today-card ${confirmed?'today-card-confirmed':''}" data-today-jump="${key}">
     <div class="avatar" style="${avatarStyle(colorFor(cust.id))}">${initials(cust.name)}</div>
     <div class="today-card-main">
-      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&stay.checkedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
+      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${groupRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
       <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
+      ${mode==='out' ? `<div class="today-card-sub">${(cust.authorizedPickups&&cust.authorizedPickups.length) ? `✅ Authorized: ${cust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;">⚠️ No authorized pickup persons on file — verify with owner</span>`}</div>` : ''}
     </div>
     <div class="today-card-room">${esc(sp.room)||'No room'}</div>
-    ${canCheckin ? `<button class="btn btn-sm" data-today-checkin="${cust.id}|${stay.id}|${pet.id}">Check in</button>` : ''}
-    ${canUndoCheckin ? `<button class="btn btn-sm btn-ghost" data-today-undo-checkin="${cust.id}|${stay.id}|${pet.id}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
-    ${canCheckout ? `<button class="btn btn-sm" data-today-checkout="${cust.id}|${stay.id}|${pet.id}">Check out</button>` : ''}
+    ${canCheckin ? `<button class="btn btn-sm" data-today-checkin="${cust.id}|${stay.id}|${idsKey}">Check in</button>` : ''}
+    ${canUndoCheckin ? `<button class="btn btn-sm btn-ghost" data-today-undo-checkin="${cust.id}|${stay.id}|${idsKey}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
+    ${canCheckout ? `<button class="btn btn-sm" data-today-checkout="${cust.id}|${stay.id}">Check out</button>` : ''}
   </div>`;
 }
 
@@ -1988,30 +2690,44 @@ function petBoardingHtml(cust, pet){
 
 function stayCardHtml(cust, pet, stay){
   const isOpen = state.openStays[stay.id] ?? (stay.status==='Active');
-  const nights = nightsBetween(stay.checkIn, stay.checkOut);
+  // outer bounds: the full span the room is occupied across every stay-pet
+  // row (a sharing partner's own override can extend earlier/later than the
+  // stay's own checkIn/checkOut) — shown in the header instead of the bare
+  // stay dates so a staggered shared booking reads correctly at a glance.
+  const outerWindow = stay.pets.reduce((acc, spRow)=>{
+    const w = spRoomWindow(stay, spRow);
+    return {
+      checkIn: (!acc.checkIn || w.checkIn < acc.checkIn) ? w.checkIn : acc.checkIn,
+      checkOut: (!acc.checkOut || w.checkOut > acc.checkOut) ? w.checkOut : acc.checkOut,
+    };
+  }, { checkIn: null, checkOut: null });
+  const nights = nightsBetween(outerWindow.checkIn || stay.checkIn, outerWindow.checkOut || stay.checkOut);
   const mySlot = stay.pets.find(sp=>sp.petId===pet.id) || stay.pets[0];
   const cost = computeStayCost(stay);
   const ownerCust = findStayOwnerCustomer(stay.id) || cust;
   const isForeign = ownerCust.id !== cust.id;
   const stayPayments = (ownerCust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
   const billing = computeStayBilling(ownerCust, stay);
+  const nightsSplit = stayPaidNightsSplit(stay);
+  const myCheckedIn = isPetCheckedIn(stay, pet.id);
   return `
   <div class="stay-card">
     <div class="card-head ${isOpen?'open':''}" data-toggle-stay="${stay.id}">
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
-        <div class="card-head-title">${fmtDateWithDay(stay.checkIn)} → ${fmtDateWithDay(stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${stay.status==='Active'&&stay.checkedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
+        <div class="card-head-title">${fmtDateWithDay(outerWindow.checkIn || stay.checkIn)} → ${fmtDateWithDay(outerWindow.checkOut || stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${stay.status==='Active'&&myCheckedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
         <div class="card-head-sub">${nights} night${nights===1?'':'s'} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(mySlot.room):'—'}</div>
       </div>
       <div class="card-head-actions">
-        ${stay.status==='Active' && !stay.checkedIn ? `<button class="btn btn-sm" data-act="checkin-stay" data-stay="${stay.id}">Check in</button>` : ''}
-        ${stay.status==='Active' && stay.checkedIn ? `<button class="btn btn-sm btn-ghost" data-act="undo-checkin-stay" data-stay="${stay.id}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
+        ${stay.status==='Active' && !myCheckedIn ? `<button class="btn btn-sm" data-act="checkin-stay" data-stay="${stay.id}" data-pet="${pet.id}">Check in</button>` : ''}
+        ${stay.status==='Active' && myCheckedIn ? `<button class="btn btn-sm btn-ghost" data-act="undo-checkin-stay" data-stay="${stay.id}" data-pet="${pet.id}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
         ${stay.status==='Active' ? `<button class="btn btn-sm" data-act="checkout-stay" data-stay="${stay.id}">Check out</button>` : ''}
         <button class="btn btn-sm" data-act="edit-stay" data-stay="${stay.id}">Edit</button>
         <button class="btn btn-sm btn-danger" data-act="delete-stay" data-stay="${stay.id}">Delete</button>
       </div>
     </div>
     <div class="card-body ${isOpen?'':'closed'}">
+      ${stay.status==='Active' ? `<div style="margin-top:12px;font-size:12.5px;">${(ownerCust.authorizedPickups&&ownerCust.authorizedPickups.length) ? `✅ Authorized for pickup: ${ownerCust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;font-weight:600;">⚠️ No authorized pickup persons on file for ${esc(ownerCust.name)}</span>`}</div>` : ''}
       ${stay.notes ? `<div style="margin-top:12px;font-size:12.5px;color:var(--ink-soft);"><strong>Notes:</strong> ${esc(stay.notes)}</div>` : ''}
       ${stay.dropoff ? `<div data-edit-closed-appt="${stay.id}|dropoff" style="cursor:pointer;margin-top:12px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day drop-off: ${esc(stay.dropoff.time)} · ${esc(stay.dropoff.contactName)} (${esc(stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
       ${stay.pickup ? `<div data-edit-closed-appt="${stay.id}|pickup" style="cursor:pointer;margin-top:8px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day pick-up: ${esc(stay.pickup.time)} · ${esc(stay.pickup.contactName)} (${esc(stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
@@ -2019,11 +2735,14 @@ function stayCardHtml(cust, pet, stay){
         const spPet = findPetById(sp.petId);
         const editable = stay.status==='Active';
         const key = `${stay.id}:${sp.petId}`;
+        const myWindow = petDatesInStay(stay, sp, sp.petId);
+        const hasOwnDates = sp.dates && sp.dates[sp.petId];
         return `
         <div class="stay-pet-block">
-          <h4>${ANIMAL_ICON[spPet?.type]||'🐾'} ${petLabel(spPet)} ${spPet?.id===pet.id?'<span class="badge badge-active">this pet</span>':''}</h4>
+          <h4>${ANIMAL_ICON[spPet?.type]||'🐾'} ${petLabel(spPet)} ${spPet?.id===pet.id?'<span class="badge badge-active">this pet</span>':''}${riskFlagBadgesHtml(spPet)}</h4>
           <div class="kv-row"><span>Room</span><span>${esc(sp.room)||'Unassigned'}</span></div>
-          <div class="kv-row"><span>Sharing with</span><span>${sp.sharingWith.length ? sharingPetLabels(ownerCust, sp).join(', ') : 'Not sharing'}</span></div>
+          ${hasOwnDates ? `<div class="kv-row"><span>Dates</span><span>${fmtDateWithDay(myWindow.checkIn)} → ${fmtDateWithDay(myWindow.checkOut)}</span></div>` : ''}
+          <div class="kv-row"><span>Sharing with</span><span>${sp.sharingWith.length ? sharingPetLabelsWithDates(ownerCust, stay, sp).join(', ') : 'Not sharing'}</span></div>
           <div class="kv-row" style="align-items:stretch;">
             <span>Feeding</span>
             <span style="display:flex;font-size:15px;">${editable
@@ -2050,6 +2769,16 @@ function stayCardHtml(cust, pet, stay){
         </div>
         ${stay.status==='Active' ? chargeAddRowHtml(stay) : ''}
       </div>
+      <div class="charges-section" style="margin-top:14px;">
+        <span style="color:var(--ink-soft);font-weight:600;font-size:12.5px;">Nights paid</span>
+        <div style="margin-top:4px;font-size:12.5px;display:flex;align-items:center;flex-wrap:wrap;gap:8px;">
+          <span>${nightsSplit.paidThrough
+            ? `${nightsSplit.paidNights} of ${nightsSplit.totalNights} night${nightsSplit.totalNights===1?'':'s'} already paid (${fmtDate(stay.checkIn)} → ${fmtDate(nightsSplit.paidThrough)})${nightsSplit.unpaidNights>0?` · ${nightsSplit.unpaidNights} night${nightsSplit.unpaidNights===1?'':'s'} not yet paid (${fmtDate(nightsSplit.paidThrough)} → ${fmtDate(stay.checkOut)})`:''}`
+            : `Not marked yet — e.g. useful when a stay gets extended after the original nights were already paid`}</span>
+          ${stay.status==='Active' ? `<button type="button" class="btn btn-sm" data-edit-paid-through="${stay.id}">${nightsSplit.paidThrough?'Edit':'Mark nights paid'}</button>` : ''}
+          ${nightsSplit.paidThrough && stay.status==='Active' ? `<button type="button" class="btn btn-sm btn-ghost" data-clear-paid-through="${stay.id}">Clear</button>` : ''}
+        </div>
+      </div>
       <div class="payments-section" style="margin-top:14px;">
         <div class="payments-head" style="margin-bottom:6px;">
           <span class="payments-title" style="font-size:12.5px;">Payments for this stay</span>
@@ -2069,7 +2798,8 @@ function stayCardHtml(cust, pet, stay){
           `).join('')}
       </div>
       <div class="cost-box">
-        <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM${cost.surchargeTotal.toFixed(2)} additional-pet surcharge (${cost.extraCount} extra pet${cost.extraCount===1?'':'s'} sharing, ${nights} night${nights===1?'':'s'})`:''}${cost.chargesTotal>0?` · +RM${cost.chargesTotal.toFixed(2)} additional charges`:''}</div>
+        <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM${cost.surchargeTotal.toFixed(2)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM${cost.chargesTotal.toFixed(2)} additional charges${cost.paidChargesTotal>0?` (RM${cost.paidChargesTotal.toFixed(2)} of that already paid)`:''}`:''}</div>
+        ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${cost.paidChargesTotal.toFixed(2)} of the additional charges above is marked paid.</div>` : ''}
         <div class="cost-total">Estimated total: RM ${cost.total.toFixed(2)}</div>
         ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">Combined into one bill with ${billing.groupStayCount-1} other stay${billing.groupStayCount-1===1?'':'s'} — combined bill total RM ${billing.groupCost.toFixed(2)}</div>` : ''}
         <div class="cost-paid">Paid amount${billing.isMerged?' (combined bill)':''}: RM ${billing.paid.toFixed(2)}</div>
@@ -2119,13 +2849,19 @@ function chargeAddRowHtml(stay){
 function chargeRowHtml(stayId, c, editable){
   const qty = +c.qty || 1;
   const lineTotal = (+c.amount||0) * qty;
+  const paidBadge = editable
+    ? `<button type="button" class="btn btn-sm ${c.paid?'':'btn-ghost'}" data-charge-paid="${stayId}:${c.id}" title="${c.paid?'Already paid (e.g. settled on the spot) — tap to mark unpaid':'Not yet paid — tap to mark as already paid (e.g. settled on the spot)'}" style="${c.paid?'background:#DCF3E4;color:#1B7A43;border-color:#B7E3C6;':'background:#FBE4E2;color:#A23B2C;border-color:#EEB3AC;'}">${c.paid?'✓ Paid':'Unpaid'}</button>`
+    : `<span class="badge ${c.paid?'badge-active':'badge-past'}">${c.paid?'Paid':'Unpaid'}</span>`;
   return `<div class="charge-row">
     <span class="charge-cat-badge">${esc(c.category)}</span>
     <span class="charge-desc">${esc(c.description)||'—'}</span>
     ${editable
       ? `<span class="charge-qty-edit">Qty <input type="number" min="1" step="1" value="${qty}" data-charge-qty="${stayId}:${c.id}"></span>`
       : `<span class="charge-qty">× ${qty}</span>`}
-    <span class="charge-amount">RM ${(+c.amount||0).toFixed(2)} each${qty>1?` = RM ${lineTotal.toFixed(2)}`:''}</span>
+    ${editable
+      ? `<span class="charge-qty-edit">RM <input type="number" min="0" step="0.01" value="${(+c.amount||0).toFixed(2)}" data-charge-amount-edit="${stayId}:${c.id}" style="width:64px;"> each${qty>1?` = RM ${lineTotal.toFixed(2)}`:''}</span>`
+      : `<span class="charge-amount">RM ${(+c.amount||0).toFixed(2)} each${qty>1?` = RM ${lineTotal.toFixed(2)}`:''}</span>`}
+    ${paidBadge}
     ${editable ? `<button type="button" class="btn btn-sm btn-danger" data-charge-remove="${stayId}:${c.id}">✕</button>` : ''}
   </div>`;
 }
@@ -2196,7 +2932,11 @@ function allStaysForPet(cust, pet){
 function computeStayCost(stay){
   // group pets by room — includes pets added via "Sharing with" checkboxes too,
   // since they're also physically occupying the room even though they don't
-  // get their own stay.pets row.
+  // get their own stay.pets row. Each occupant carries its OWN checkIn/checkOut
+  // (its per-pet override if the stay-pet row set one, else the stay's own
+  // dates) so pets that join/leave a shared room on different dates are only
+  // charged — and only trigger the sharing surcharge — for the nights they're
+  // actually there.
   const byRoom = {};
   const seenPerRoom = {};
   stay.pets.forEach(sp => {
@@ -2204,28 +2944,36 @@ function computeStayCost(stay){
     if(!byRoom[room]){ byRoom[room] = []; seenPerRoom[room] = new Set(); }
     if(!seenPerRoom[room].has(sp.petId)){
       seenPerRoom[room].add(sp.petId);
-      byRoom[room].push({ petId: sp.petId });
+      byRoom[room].push({ petId: sp.petId, ...petDatesInStay(stay, sp, sp.petId) });
     }
     (sp.sharingWith||[]).forEach(sharedId=>{
       if(!seenPerRoom[room].has(sharedId)){
         seenPerRoom[room].add(sharedId);
-        byRoom[room].push({ petId: sharedId });
+        byRoom[room].push({ petId: sharedId, ...petDatesInStay(stay, sp, sharedId) });
       }
     });
   });
   let total = 0, holidayUsed=false, extraCount=0, surchargeTotal=0;
-  const nights = nightsBetween(stay.checkIn, stay.checkOut);
+  const surchargeByPet = {}; // petId -> { nights, amount } — how many nights THAT pet actually paid the sharing surcharge for, not the whole stay's night count
   Object.entries(byRoom).forEach(([roomId, occupants])=>{
     const room = roomTypeFor(roomId);
     if(!room){ return; }
-    // determine rate: Dog Deluxe uses boarding size of the pet(s) to pick S/M vs L/XL/XXL
-    for(let n=0;n<nights;n++){
-      const dateStr = addDays(stay.checkIn, n);
+    const roomCheckIn = occupants.map(o=>o.checkIn).sort()[0];
+    const roomCheckOut = occupants.map(o=>o.checkOut).sort().slice(-1)[0];
+    const roomNights = nightsBetween(roomCheckIn, roomCheckOut);
+    let maxConcurrent = 1;
+    for(let n=0;n<roomNights;n++){
+      const dateStr = addDays(roomCheckIn, n);
+      // only the occupants actually present this specific night
+      const presentToday = occupants.filter(o => dateStr >= o.checkIn && dateStr < o.checkOut);
+      if(presentToday.length===0) continue;
+      maxConcurrent = Math.max(maxConcurrent, presentToday.length);
       const holiday = isHoliday(dateStr);
       if(holiday) holidayUsed = true;
+      // determine rate: Dog Deluxe uses boarding size of the pet(s) present that night to pick S/M vs L/XL/XXL
       let rate;
       if(room.type==='Dog Deluxe (Bottom)' || room.type==='Dog Deluxe (Upper)'){
-        const anyLarge = occupants.some(o=>{
+        const anyLarge = presentToday.some(o=>{
           const p = findPetById(o.petId);
           return p && ['L','XL','XXL'].includes(p.boardingSize);
         });
@@ -2242,23 +2990,27 @@ function computeStayCost(stay){
           ? standardRate * (1 - Math.min(stay.customRate,100)/100)
           : stay.customRate;
       }
-      total += nightRate;
-      if(occupants.length>1){
-        // every pet after the first sharing this room pays a per-night surcharge, based on its own size
-        occupants.slice(1).forEach(o=>{
+      total += nightRate; // room charged once per occupied night, regardless of how many pets are in it that night
+      if(presentToday.length>1){
+        // every pet after the first present that night pays a per-night surcharge, based on its own size
+        presentToday.slice(1).forEach(o=>{
           const p = findPetById(o.petId);
           const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
           const amt = isLarge ? state.surchargeLXL : state.surchargeSM;
           total += amt;
           surchargeTotal += amt;
+          if(!surchargeByPet[o.petId]) surchargeByPet[o.petId] = { nights:0, amount:0 };
+          surchargeByPet[o.petId].nights++;
+          surchargeByPet[o.petId].amount += amt;
         });
       }
     }
-    if(occupants.length>1) extraCount = Math.max(extraCount, occupants.length-1);
+    if(maxConcurrent>1) extraCount = Math.max(extraCount, maxConcurrent-1);
   });
   const chargesTotal = (stay.charges||[]).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
+  const paidChargesTotal = (stay.charges||[]).filter(c=>c.paid).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
   total += chargesTotal;
-  return { total, holidayUsed, extraCount, surchargeTotal, chargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0 };
+  return { total, holidayUsed, extraCount, surchargeTotal, surchargeByPet, chargesTotal, paidChargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0 };
 }
 
 /* A payment can now be linked to more than one stay at once — a "combined
@@ -2270,6 +3022,41 @@ function computeStayCost(stay){
    balance reflects the combined bill rather than double-counting or
    under-counting a shared payment. `balance` is positive when money is still
    owed, negative when the customer has overpaid. */
+/* The Paid/Unpaid marker on a charge is a LABEL only — it does not affect
+   the balance here. A charge marked "paid" is assumed to already be folded
+   into a recorded Payment/deposit for this stay (that's how it got paid),
+   so subtracting it again on top of the Payments total would double-deduct
+   it. `paidChargesTotal` is still returned for display (so staff can see
+   how much of the additional charges is already settled) but isn't
+   subtracted from `balance`. */
+/* Splits a stay's own [checkIn, checkOut) into a "paid so far" chunk and a
+   "not yet paid" chunk based on stay.paidThrough — e.g. originally booked
+   14→16 Aug and paid in full, then extended to 14→18 Aug: paidThrough stays
+   at 16, so this reports 2 nights paid (14,15) and 2 nights not yet paid
+   (16,17). Purely for display — see the note on `paidThrough` above. */
+function stayPaidNightsSplit(stay){
+  const totalNights = nightsBetween(stay.checkIn, stay.checkOut);
+  if(!stay.paidThrough || stay.paidThrough <= stay.checkIn){
+    return { totalNights, paidNights: 0, unpaidNights: totalNights, paidThrough: null };
+  }
+  const cappedThrough = stay.paidThrough > stay.checkOut ? stay.checkOut : stay.paidThrough;
+  const paidNights = nightsBetween(stay.checkIn, cappedThrough);
+  return { totalNights, paidNights, unpaidNights: totalNights - paidNights, paidThrough: cappedThrough };
+}
+/* Turns computeStayCost's per-pet surcharge breakdown into the "(...)" note
+   shown next to the additional-pet surcharge line — each extra pet's OWN
+   actual night count, not the whole stay's, since a sharing pet with its own
+   shorter date range only pays (and should only show) surcharge nights for
+   the nights it was actually there. */
+function surchargePetLabel(surchargeByPet){
+  const entries = Object.entries(surchargeByPet||{});
+  if(entries.length===0) return '';
+  return entries.map(([petId, info])=>{
+    const p = findPetById(petId);
+    const name = p ? esc(p.name) : 'extra pet';
+    return `${name} sharing, ${info.nights} night${info.nights===1?'':'s'}`;
+  }).join(' · ');
+}
 function computeStayBilling(cust, stay){
   const cost = computeStayCost(stay);
   const stayPayments = (cust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
@@ -2278,10 +3065,12 @@ function computeStayBilling(cust, stay){
   const isMerged = groupStayIds.size > 1;
   if(!isMerged){
     const paid = stayPayments.reduce((s,p)=>s+(+p.amount||0),0);
-    return { paid, balance: cost.total - paid, isMerged:false, groupCost:cost.total, groupStayCount:1 };
+    return { paid, balance: cost.total - paid, isMerged:false, groupCost:cost.total, groupStayCount:1, paidChargesTotal: cost.paidChargesTotal };
   }
   const groupStays = Array.from(groupStayIds).map(id => id===stay.id ? stay : findStayById(id)).filter(Boolean);
-  const groupCost = groupStays.reduce((s,st)=>s+computeStayCost(st).total,0);
+  const groupCosts = groupStays.map(st=>computeStayCost(st));
+  const groupCost = groupCosts.reduce((s,c)=>s+c.total,0);
+  const groupPaidCharges = groupCosts.reduce((s,c)=>s+c.paidChargesTotal,0);
   const seenPayIds = new Set();
   let groupPaid = 0;
   (cust.payments||[]).forEach(p=>{
@@ -2290,7 +3079,7 @@ function computeStayBilling(cust, stay){
       groupPaid += (+p.amount||0);
     }
   });
-  return { paid: groupPaid, balance: groupCost - groupPaid, isMerged:true, groupCost, groupStayCount: groupStays.length };
+  return { paid: groupPaid, balance: groupCost - groupPaid, isMerged:true, groupCost, groupStayCount: groupStays.length, paidChargesTotal: groupPaidCharges };
 }
 
 function isHoliday(dateStr){
@@ -2323,9 +3112,11 @@ function isRoomAvailable(roomId, checkIn, checkOut, excludeStayId){
     for(const p of c.pets){
       for(const s of p.stays){
         if(s.id === excludeStayId) continue;
-        const overlaps = checkIn < s.checkOut && s.checkIn < checkOut;
-        if(!overlaps) continue;
-        if(s.pets.some(sp => sp.room === roomId)) return false;
+        for(const sp of s.pets){
+          if(sp.room !== roomId) continue;
+          const w = spRoomWindow(s, sp);
+          if(checkIn < w.checkOut && w.checkIn < checkOut) return false;
+        }
       }
     }
   }
@@ -2529,14 +3320,14 @@ function wireSubContentEvents(cust, pet){
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       const s = findStayById(el.dataset.stay);
-      if(s){ s.checkedIn=true; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked in'); }
+      if(s){ setPetCheckedIn(s, el.dataset.pet, true); scheduleSync(); renderPetSubContent(cust, pet); toast('Checked in'); }
     });
   });
   root.querySelectorAll('[data-act="undo-checkin-stay"]').forEach(el=>{
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       const s = findStayById(el.dataset.stay);
-      if(s){ s.checkedIn=false; scheduleSync(); renderPetSubContent(cust, pet); toast('Check-in undone'); }
+      if(s){ setPetCheckedIn(s, el.dataset.pet, false); scheduleSync(); renderPetSubContent(cust, pet); toast('Check-in undone'); }
     });
   });
   root.querySelectorAll('[data-act="checkout-stay"]').forEach(el=>{
@@ -2552,6 +3343,20 @@ function wireSubContentEvents(cust, pet){
       const [stayId, kind] = el.dataset.editClosedAppt.split('|');
       const s = findStayById(stayId);
       if(s) openClosedApptEditModal(s, kind, ()=>renderPetSubContent(cust, pet));
+    });
+  });
+  root.querySelectorAll('[data-edit-paid-through]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const s = findStayById(el.dataset.editPaidThrough);
+      if(s) openPaidThroughModal(s, ()=>renderPetSubContent(cust, pet));
+    });
+  });
+  root.querySelectorAll('[data-clear-paid-through]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const s = findStayById(el.dataset.clearPaidThrough);
+      if(s){ s.paidThrough = null; scheduleSync(); renderPetSubContent(cust, pet); toast('Cleared'); }
     });
   });
 
@@ -2618,7 +3423,7 @@ function wireSubContentEvents(cust, pet){
         const opts = groomChargeOptionsFor(selectedPet);
         const opt = opts.find(o=>o.key===ui.item) || opts[0];
         if(!opt){ toast('No grooming option available for this pet'); return; }
-        stay.charges.push({ id: uid('charge'), category:'Grooming', description: opt.label, amount: opt.amount, qty });
+        stay.charges.push({ id: uid('charge'), category:'Grooming', description: opt.label, amount: opt.amount, qty, paid:false });
         renderPetSubContent(cust, pet);
         toast('Charge added');
         return;
@@ -2629,7 +3434,7 @@ function wireSubContentEvents(cust, pet){
       const amount = +amountEl.value;
       if(!description){ toast('Please describe the item/charge'); return; }
       if(!amount || amount<=0){ toast('Please enter a valid amount'); return; }
-      stay.charges.push({ id: uid('charge'), category: cat, description, amount, qty });
+      stay.charges.push({ id: uid('charge'), category: cat, description, amount, qty, paid:false });
       renderPetSubContent(cust, pet);
       toast('Charge added');
     });
@@ -2643,9 +3448,39 @@ function wireSubContentEvents(cust, pet){
       if(!charge) return;
       const qty = +input.value;
       if(!qty || qty<1){ toast('Quantity must be at least 1'); input.value = charge.qty; return; }
+      const oldQty = charge.qty;
       charge.qty = qty;
+      logChange('Charge', {stayId, chargeId}, charge.description||charge.category, 'qty', 'Quantity', oldQty, qty);
       renderPetSubContent(cust, pet);
       toast('Quantity updated');
+    });
+  });
+  root.querySelectorAll('[data-charge-amount-edit]').forEach(input=>{
+    input.addEventListener('change', ()=>{
+      const [stayId, chargeId] = input.dataset.chargeAmountEdit.split(':');
+      const stay = findStayById(stayId);
+      if(!stay) return;
+      const charge = stay.charges.find(c=>c.id===chargeId);
+      if(!charge) return;
+      const amount = +input.value;
+      if(!(amount>=0)){ toast('Please enter a valid amount'); input.value = (+charge.amount||0).toFixed(2); return; }
+      const oldAmount = charge.amount;
+      charge.amount = amount;
+      logChange('Charge', {stayId, chargeId}, charge.description||charge.category, 'amount', 'Price (RM each)', oldAmount, amount);
+      renderPetSubContent(cust, pet);
+      toast('Price updated');
+    });
+  });
+  root.querySelectorAll('[data-charge-paid]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const [stayId, chargeId] = btn.dataset.chargePaid.split(':');
+      const stay = findStayById(stayId);
+      if(!stay) return;
+      const charge = stay.charges.find(c=>c.id===chargeId);
+      if(!charge) return;
+      charge.paid = !charge.paid;
+      renderPetSubContent(cust, pet);
+      toast(charge.paid ? 'Marked as already paid' : 'Marked as not yet paid');
     });
   });
   root.querySelectorAll('[data-charge-remove]').forEach(btn=>{
@@ -3064,13 +3899,54 @@ function openPaymentModal(cust, existing, presetStayId){
       receiptNo: type==='Full payment' ? document.getElementById('pay_receipt').value.trim() : '',
       stayIds: Array.from(document.querySelectorAll('#pay_stayChecks input[data-pay-stay-check]:checked')).map(cb=>cb.value),
     };
-    if(existing){ Object.assign(existing, data); }
+    if(existing){
+      logFieldChanges('Payment', {custId: cust.id, paymentId: existing.id}, `${type} · ${cust.name}`, existing, data, ['amount','type','date'], {amount:'Amount (RM)', type:'Payment type', date:'Date'});
+      Object.assign(existing, data);
+    }
     else{ cust.payments.push({ id:uid('pay'), ...data }); }
     closeModal(); renderCustomersMain(); toast(existing?'Payment updated':'Payment added');
   });
 }
 
 /* ---- Membership points modal (Add / Deduct, with receipt tracking) ---- */
+/* ---- Authorized pickup persons (per customer) — verified against ID at
+   checkout instead of relying on staff judgement/memory. ---- */
+function openPickupModal(cust, existing){
+  const a = existing || { id:'', name:'', phone:'', note:'' };
+  openModal(`
+    <div class="modal-head"><h3>${existing?'Edit':'Add'} authorized pickup person</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="form-grid c3">
+        <div class="field"><label>Name</label><input id="pu_name" value="${esc(a.name)}"></div>
+        <div class="field"><label>Phone</label><input id="pu_phone" value="${esc(a.phone)}"></div>
+        <div class="field span3"><label>Note <span style="font-weight:400;color:var(--ink-soft);">(e.g. relationship, ID type)</span></label><input id="pu_note" value="${esc(a.note)}" placeholder="e.g. Sister, verify with IC"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      ${existing ? `<button class="btn btn-danger" id="delBtn" style="margin-right:auto;">Remove</button>` : ''}
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  if(existing){
+    document.getElementById('delBtn').addEventListener('click', ()=>{
+      cust.authorizedPickups = (cust.authorizedPickups||[]).filter(x=>x.id!==existing.id);
+      closeModal(); renderCustomersMain(); toast('Removed');
+    });
+  }
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const name = document.getElementById('pu_name').value.trim();
+    const phone = document.getElementById('pu_phone').value.trim();
+    if(!name || !phone){ toast('Please fill in name and phone'); return; }
+    const data = { name, phone, note: document.getElementById('pu_note').value.trim() };
+    if(!Array.isArray(cust.authorizedPickups)) cust.authorizedPickups = [];
+    if(existing){ Object.assign(existing, data); }
+    else{ cust.authorizedPickups.push({ id: uid('pickup'), ...data }); }
+    closeModal(); renderCustomersMain(); scheduleSync(); toast(existing?'Updated':'Added');
+  });
+}
+
 function openPointsModal(cust, existing){
   const p = existing || { id:'', type:'Add', amount:'', date: todayStr(), receiptNo:'', note:'' };
   const currentBalance = pointsBalance(cust);
@@ -3250,7 +4126,8 @@ async function checkSignedAgreements(){
 
 /* ---- Pet modal ---- */
 function openPetModal(cust, existing){
-  const p = existing || {id:'', name:'', breed:'', colour:'', type:'Dog', gender:'Male', dob:'', boardingSize:'S', groomingSize:'S', spayed:'Yes', lastVax:'', lastTick:'', medical:'', personality:'', special:''};
+  const p = existing || {id:'', name:'', breed:'', colour:'', type:'Dog', gender:'Male', dob:'', boardingSize:'S', groomingSize:'S', spayed:'Yes', lastVax:'', lastTick:'', medical:'', personality:'', special:'', riskFlags:[]};
+  const workingRiskFlags = new Set(p.riskFlags||[]);
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit pet':'Add pet'}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
@@ -3279,6 +4156,10 @@ function openPetModal(cust, existing){
         </div>
         <div class="field"><label>Last vaccination date</label>${dateOverlayHtml('p_vax', p.lastVax||'')}</div>
         <div class="field span2"><label>Last tick treatment date</label>${dateOverlayHtml('p_tick', p.lastTick||'')}</div>
+        <div class="field span2">
+          <label>Risk flags <span style="font-weight:500;color:var(--ink-soft);">(shown as a prominent badge everywhere staff see this pet)</span></label>
+          <div class="checks" id="p_riskflags_chips">${RISK_FLAGS.map(f=>`<label class="check-pill" style="cursor:pointer;"><input type="checkbox" value="${esc(f)}" data-riskflag ${workingRiskFlags.has(f)?'checked':''} style="margin-right:4px;">${esc(f)}</label>`).join('')}</div>
+        </div>
         <div class="field span2"><label>Medical condition (if any)</label><textarea id="p_medical">${esc(p.medical)}</textarea></div>
         <div class="field span2"><label>Personality</label><textarea id="p_pers">${esc(p.personality)}</textarea></div>
         <div class="field span2"><label>Special requests (if any)</label><textarea id="p_special">${esc(p.special)}</textarea></div>
@@ -3300,6 +4181,7 @@ function openPetModal(cust, existing){
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const name = document.getElementById('p_name').value.trim();
     if(!name){ toast('Pet name is required'); return; }
+    const riskFlags = Array.from(document.querySelectorAll('[data-riskflag]:checked')).map(el=>el.value);
     const data = {
       name, type:document.getElementById('p_type').value, breed:document.getElementById('p_breed').value,
       colour:document.getElementById('p_colour').value, gender:document.getElementById('p_gender').value,
@@ -3308,9 +4190,12 @@ function openPetModal(cust, existing){
       groomingSize:document.getElementById('p_gsize').value, spayed:document.getElementById('p_spayed').value,
       lastVax:document.getElementById('p_vax').value, lastTick:document.getElementById('p_tick').value,
       medical:document.getElementById('p_medical').value, personality:document.getElementById('p_pers').value,
-      special:document.getElementById('p_special').value,
+      special:document.getElementById('p_special').value, riskFlags,
     };
-    if(existing){ Object.assign(existing, data); }
+    if(existing){
+      logFieldChanges('Pet', {petId: existing.id}, existing.name, existing, data, ['medical','personality','special'], {medical:'Medical condition', personality:'Personality', special:'Special requests'});
+      Object.assign(existing, data);
+    }
     else{ const np = {...data, id:uid('pet'), photo:null, stays:[], groomingHistory:[]}; cust.pets.push(np); state.selectedPetId = np.id; }
     closeModal(); renderCustomersMain(); toast(existing?'Pet updated':'Pet added');
   });
@@ -3320,6 +4205,36 @@ function openPetModal(cust, existing){
 /* ---- Quick edit for a closed-day drop-off/pick-up appointment, without
    reopening the full stay modal. `onSaved` lets each caller decide how to
    refresh its own view afterward (pet page vs. boarding calendar). ---- */
+function openPaidThroughModal(stay, onSaved){
+  const nightsSplit = stayPaidNightsSplit(stay);
+  openModal(`
+    <div class="modal-head"><h3>Mark nights paid</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">Useful when a stay gets extended after the original nights were already paid for — set the date up to which the customer has already paid (their original check-out date, for example). This is a status label only; it doesn't change the outstanding balance, which is still tracked via Payments.</div>
+      <div class="form-grid c3">
+        <div class="field"><label>Nights paid through</label><div class="date-overlay-wrap"><input type="date" id="pt_through" min="${stay.checkIn}" max="${stay.checkOut}" value="${nightsSplit.paidThrough || stay.checkOut}"><span class="date-overlay-label" id="pt_through_wd">${fmtDateSlashDay(nightsSplit.paidThrough || stay.checkOut)}</span></div></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save</button>
+    </div>
+  `);
+  document.getElementById('pt_through').addEventListener('change', (e)=>{
+    document.getElementById('pt_through_wd').textContent = fmtDateSlashDay(e.target.value);
+  });
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const through = document.getElementById('pt_through').value;
+    if(!through || through < stay.checkIn || through > stay.checkOut){ toast('Please pick a date within the stay'); return; }
+    stay.paidThrough = through;
+    closeModal();
+    scheduleSync();
+    toast('Nights paid updated');
+    if(onSaved) onSaved();
+  });
+}
+
 function openClosedApptEditModal(stay, kind, onSaved){
   const isDropoff = kind==='dropoff';
   const current = stay[kind] || {time:'', contactName:'', contactPhone:''};
@@ -3353,8 +4268,8 @@ function openClosedApptEditModal(stay, kind, onSaved){
 
 function openStayModal(cust, primaryPet, existing){
   const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: addDays(todayStr(),2), status:'Active', notes:'',
-    pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[] }] };
-  let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings]}));
+    pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[], dates:{} }] };
+  let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings], dates:{...(sp.dates||{})}}));
   const rows = workingPets.map((sp,idx)=> stayPetRowHtml(cust, sp, idx)).join('');
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>    <div class="modal-body">
@@ -3438,7 +4353,7 @@ function openStayModal(cust, primaryPet, existing){
   document.getElementById('addStayPetBtn').addEventListener('click', ()=>{
     const otherPets = allPetsExcept(cust, workingPets.map(w=>w.petId));
     if(otherPets.length===0){ toast('No other pets on this customer to add'); return; }
-    workingPets.push({ petId: otherPets[0].id, room:'', sharingWith:[], feeding:'', belongings:[] });
+    workingPets.push({ petId: otherPets[0].id, room:'', sharingWith:[], feeding:'', belongings:[], dates:{} });
     refreshStayRows();
   });
 
@@ -3464,7 +4379,9 @@ function openStayModal(cust, primaryPet, existing){
       ta.addEventListener('input', ()=>{ workingPets[+ta.dataset.stayrowFeeding].feeding = ta.value; });
     });
     workingPets.forEach((sp,idx)=>{
-      wireSharingPicker(`srow_share_${idx}`, sp.sharingWith, () => workingPets[idx].petId);
+      if(!sp.dates) sp.dates = {};
+      wireSharingPicker(`srow_share_${idx}`, sp.sharingWith, () => workingPets[idx].petId, sp.dates,
+        () => ({ checkIn: document.getElementById('s_in').value, checkOut: document.getElementById('s_out').value }));
     });
     document.querySelectorAll('[data-add-belonging]').forEach(btn=>{
       btn.addEventListener('click', ()=>{
@@ -3517,6 +4434,10 @@ function openStayModal(cust, primaryPet, existing){
     const rooms = ROOM_INVENTORY.filter(r => r.animal === pet.type);
     const checkIn = document.getElementById('s_in')?.value || s.checkIn;
     const checkOut = document.getElementById('s_out')?.value || s.checkOut;
+    // this row's own occupied window — the union of this pet's + its sharing
+    // partners' dates (their per-pet overrides if set, else the stay's own
+    // dates above) — used for room-availability checks, not the bare stay window.
+    const rowWindow = spRoomWindow({checkIn, checkOut}, sp);
     return `
     <div style="border:1px solid var(--line-soft);border-radius:8px;padding:12px;margin-bottom:10px;background:var(--panel-2);">
       <div class="repeat-row">
@@ -3529,15 +4450,16 @@ function openStayModal(cust, primaryPet, existing){
           <select data-stayrow-room="${idx}">
             <option value="">— select room —</option>
             ${rooms.map(r=>{
-              const occupied = r.id !== sp.room && !isRoomAvailable(r.id, checkIn, checkOut, existing?.id);
+              const occupied = r.id !== sp.room && !isRoomAvailable(r.id, rowWindow.checkIn, rowWindow.checkOut, existing?.id);
               return `<option value="${r.id}" ${r.id===sp.room?'selected':''} ${occupied?'disabled':''}>${r.id} · ${r.type}${occupied?' — occupied':''}</option>`;
             }).join('')}
           </select>
-          ${sp.room && !isRoomAvailable(sp.room, checkIn, checkOut, existing?.id) ? `<div style="color:var(--danger);font-size:11.5px;font-weight:600;margin-top:4px;">⚠ ${esc(sp.room)} is booked by another stay for these dates — please pick a different room.</div>` : ''}
+          ${sp.room && !isRoomAvailable(sp.room, rowWindow.checkIn, rowWindow.checkOut, existing?.id) ? `<div style="color:var(--danger);font-size:11.5px;font-weight:600;margin-top:4px;">⚠ ${esc(sp.room)} is booked by another stay for these dates — please pick a different room.</div>` : ''}
         </div>
         ${workingPets.length>1 ? `<button type="button" class="mini-remove" data-stayrow-remove="${idx}">✕</button>` : ''}
       </div>
-      ${sharingPickerHtml(`srow_share_${idx}`, sp.sharingWith)}
+      ${riskFlagBadgesHtml(pet) ? `<div style="margin-bottom:8px;">${riskFlagBadgesHtml(pet)}</div>` : ''}
+      ${sharingPickerHtml(`srow_share_${idx}`, sp.sharingWith, null, sp.dates)}
       <div class="field" style="margin-bottom:8px;">
         <label>Feeding instructions (this stay)</label>
         <textarea data-stayrow-feeding="${idx}">${esc(sp.feeding)}</textarea>
@@ -3578,7 +4500,16 @@ function openStayModal(cust, primaryPet, existing){
       toast('Check-out falls on a closed day — please fill in the pick-up time and contact details');
       return;
     }
-    const conflictRoom = workingPets.find(w => !isRoomAvailable(w.room, checkIn, checkOut, existing?.id));
+    for(const w of workingPets){
+      for(const [petId, d] of Object.entries(w.dates||{})){
+        if(!d.checkIn || !d.checkOut || d.checkOut < d.checkIn){
+          const { pet: badPet } = findPetWithCustomer(petId);
+          toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates in the sharing section aren't valid`);
+          return;
+        }
+      }
+    }
+    const conflictRoom = workingPets.find(w => { const rw = spRoomWindow({checkIn, checkOut}, w); return !isRoomAvailable(w.room, rw.checkIn, rw.checkOut, existing?.id); });
     if(conflictRoom){ toast(`${conflictRoom.room} is already booked for these dates — please choose a different room`); return; }
     for(const w of workingPets){
       const wPet = findPetAcrossStay(cust, w.petId);
@@ -3591,16 +4522,45 @@ function openStayModal(cust, primaryPet, existing){
       pickup: outClosed ? {...workingPickup} : null,
     };
     const doSave = ()=>{
-      let freeResult = { assignedCount:0, assignedList:[] };
-      if(existing){ Object.assign(existing, payload); }
+      let freeResult = { assignedCount:0, movedCount:0, assignedList:[] };
+      if(existing){
+        // Snapshot each pet's window as it stood BEFORE this edit (used to
+        // widen the search for this stay's own FBG appointments below) —
+        // must be read before Object.assign overwrites checkIn/checkOut/pets.
+        const oldWindowsByPetId = {};
+        (existing.pets||[]).forEach(w=>{
+          [w.petId, ...(w.sharingWith||[])].filter(Boolean).forEach(id=>{
+            oldWindowsByPetId[id] = petDatesInStay(existing, w, id);
+          });
+        });
+        logFieldChanges('Stay', {stayId: existing.id}, primaryPet.name, existing, payload,
+          ['checkIn','checkOut','customRate','notes'],
+          {checkIn:'Check-in date', checkOut:'Check-out date', customRate:'Special rate', notes:'Notes'});
+        Object.assign(existing, payload);
+        // Re-check FBG entitlement after an edit — e.g. checkout pushed later
+        // and the stay now crosses another 7-night threshold. Reconciles
+        // rather than blindly adding: appointments already "Done & Informed"
+        // or "Picked up" are left untouched; any other existing FBG for this
+        // stay gets moved to the newly-correct date instead of leaving it
+        // stranded next to a fresh duplicate; only creates new ones once no
+        // reusable appointment is left.
+        if(existing.status === 'Active'){
+          const petWindows = existing.pets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(existing, w, id) })));
+          freeResult = reconcileFreeGroomings(cust, existing, petWindows, oldWindowsByPetId);
+        }
+      }
       else{
-        primaryPet.stays.push({ id:uid('stay'), charges:[], ...payload });
-        freeResult = assignFreeGroomings(cust, checkIn, checkOut, workingPets.flatMap(w=>[w.petId, ...(w.sharingWith||[])]));
+        const newStay = { id:uid('stay'), charges:[], ...payload };
+        primaryPet.stays.push(newStay);
+        const petWindows = workingPets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(newStay, w, id) })));
+        freeResult = assignFreeGroomings(cust, petWindows);
       }
       closeModal(); renderPetSubContent(cust, primaryPet);
       if(freeResult.assignedCount > 0){
-        toast(`Stay created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
+        toast(`Stay ${existing?'updated':'created'} — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
         openFreeGroomingSummaryModal(freeResult.assignedList);
+      } else if(freeResult.movedCount > 0){
+        toast(`Stay updated — ${freeResult.movedCount} free grooming${freeResult.movedCount===1?'':'s'} rescheduled to match`);
       } else {
         toast(existing ? 'Stay updated' : 'Stay created');
       }
@@ -3941,17 +4901,19 @@ function computeFreeGroomingDates(checkIn, checkOut){
 }
 /* Preferred bay/time on a given date, falling back gracefully if taken:
    preferred bay at the preferred time -> preferred bay at any time -> any
-   open bay/time at all. Keeps the free grooming off a real booking's slot. */
-function findFreeGroomSlot(date, prefTime, prefBay){
+   open bay/time at all. Keeps the free grooming off a real booking's slot.
+   `excludeId` lets a slot search ignore one specific grooming record (used
+   when moving an existing FBG appointment to a new date/time). */
+function findFreeGroomSlot(date, prefTime, prefBay, excludeId){
   const time0 = prefTime || TIME_SLOTS[0];
   const bay0 = prefBay || BAYS[0];
-  if(!findGroomConflict(date, time0, bay0, null)) return { time: time0, bay: bay0 };
+  if(!findGroomConflict(date, time0, bay0, excludeId)) return { time: time0, bay: bay0 };
   for(const time of TIME_SLOTS){
-    if(!findGroomConflict(date, time, bay0, null)) return { time, bay: bay0 };
+    if(!findGroomConflict(date, time, bay0, excludeId)) return { time, bay: bay0 };
   }
   for(const time of TIME_SLOTS){
     for(const bay of BAYS){
-      if(!findGroomConflict(date, time, bay, null)) return { time, bay };
+      if(!findGroomConflict(date, time, bay, excludeId)) return { time, bay };
     }
   }
   return null;
@@ -3967,16 +4929,26 @@ function findFreeGroomSlot(date, prefTime, prefBay){
    check-out day defaults to 10am at Bay 3 (falling back to another slot only
    if that one's already taken). Returns the count assigned plus the list of
    records created, so the caller can show them for a quick review/edit. */
-function assignFreeGroomings(cust, checkIn, checkOut, petIds){
+/* `petWindows` is an array of {petId, checkIn, checkOut} — each pet's OWN
+   actual dates (its per-pet override if the stay-pet row set one, else the
+   stay's own dates), so a pet sharing a room but arriving/leaving on a
+   different date only earns FBGs for the nights it's actually boarding.
+   Idempotent — skips any date that already has an auto-assigned FBG
+   ("(Boarding)") for that pet, so it's safe to call again after a stay's
+   dates are edited (e.g. check-out pushed later, crossing another 7-night
+   threshold) without duplicating groomings already booked. */
+function assignFreeGroomings(cust, petWindows){
   let assignedCount = 0;
   const assignedList = [];
-  const uniqueIds = [...new Set(petIds)];
-  uniqueIds.forEach(petId=>{
+  const seen = new Set();
+  petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId)).forEach(({petId, checkIn, checkOut})=>{
     const { pet, cust: petCust } = findPetWithCustomer(petId);
     if(!pet || pet.type !== 'Dog') return;
     const owner = petCust || cust;
     const dates = computeFreeGroomingDates(checkIn, checkOut);
     dates.forEach((date, idx)=>{
+      const alreadyHas = (pet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
+      if(alreadyHas) return;
       const isCheckoutDay = idx === dates.length - 1;
       const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
       if(!slot) return;
@@ -3993,6 +4965,66 @@ function assignFreeGroomings(cust, checkIn, checkOut, petIds){
     });
   });
   return { assignedCount, assignedList };
+}
+/* Used when SAVING AN EDIT to an existing stay (not on first creation) —
+   reconciles this pet's FBG appointments against its newly entitled dates
+   instead of just adding on top. `oldWindowsByPetId` is each pet's window
+   *before* this edit (keyed by petId), used only to widen the search for
+   "this stay's own FBG appointments" so a shortened or shifted window still
+   finds them (a pet's stays don't normally overlap, so this is a safe scope
+   without needing a stored stay id).
+   Any appointment already at status "Done & Informed" or "Picked up" is
+   left completely untouched and its date still counts as fulfilling that
+   slot. Any other existing FBG appointment for this stay ("Not arrived" /
+   "In progress") gets REUSED — moved to the correct new date/time/bay
+   instead of leaving it stranded and creating a near-duplicate next to it.
+   Only creates a brand-new record once there are no more reusable ones left. */
+function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
+  let assignedCount = 0, movedCount = 0;
+  const assignedList = [];
+  const seen = new Set();
+  petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId)).forEach(({petId, checkIn, checkOut})=>{
+    const { pet, cust: petCust } = findPetWithCustomer(petId);
+    if(!pet || pet.type !== 'Dog') return;
+    const owner = petCust || cust;
+    const newDates = computeFreeGroomingDates(checkIn, checkOut);
+    const oldWindow = (oldWindowsByPetId && oldWindowsByPetId[petId]) || { checkIn, checkOut };
+    const scopeStart = oldWindow.checkIn < checkIn ? oldWindow.checkIn : checkIn;
+    const scopeEnd = oldWindow.checkOut > checkOut ? oldWindow.checkOut : checkOut;
+    const linked = (pet.groomingHistory||[]).filter(g =>
+      (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date >= scopeStart && g.date <= scopeEnd);
+    const lockedDates = new Set(linked.filter(g => g.status==='Done & Informed' || g.status==='Picked up').map(g=>g.date));
+    const movablePool = linked.filter(g => g.status!=='Done & Informed' && g.status!=='Picked up');
+    const neededDates = newDates.filter(d => !lockedDates.has(d));
+    neededDates.forEach((date, idx)=>{
+      const exactIdx = movablePool.findIndex(g=>g.date===date);
+      if(exactIdx>-1){ movablePool.splice(exactIdx,1); return; } // already right where it should be
+      const isCheckoutDay = idx === neededDates.length - 1;
+      if(movablePool.length){
+        const g = movablePool.shift();
+        const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', g.id);
+        if(slot){ g.date = date; g.time = slot.time; g.bay = slot.bay; movedCount++; }
+        return;
+      }
+      const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', null);
+      if(!slot) return;
+      const record = {
+        id: uid('groom'), date, time: slot.time, bay: slot.bay,
+        apptTypes: ['FBG'], sizeCode: pet.groomingSize || '', cutCode:'', details:'',
+        addons: [], photos: [], status:'Not arrived',
+        notes: '(Boarding)',
+        customerId: owner.id, petId: pet.id,
+      };
+      pet.groomingHistory.push(record);
+      assignedList.push({ cust: owner, pet, record });
+      assignedCount++;
+    });
+    // Any leftover movablePool entries (more not-done FBGs than the stay now
+    // needs, e.g. it was shortened) are left in place rather than auto-deleted
+    // — staff can remove them via the usual grooming-history delete if truly
+    // no longer wanted.
+  });
+  return { assignedCount, movedCount, assignedList };
 }
 /* Shown right after a stay is created if any free groomings were earned —
    lets staff jump straight into editing any of them, one at a time, and land
@@ -4045,6 +5077,9 @@ function bayOptionsHtml(date, time, selectedBay, excludeId){
 document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
 document.getElementById('cancellationsBtn').addEventListener('click', openCancellationsModal);
+document.getElementById('changeLogBtn').addEventListener('click', openChangeLogModal);
+document.getElementById('reportsBtn').addEventListener('click', ()=>openReportsModal());
+document.getElementById('remindersBtn').addEventListener('click', ()=>openRemindersModal());
 function openPoliciesModal(){
   openModal(`
     <div class="modal-head"><h3>Boarding policies</h3><button class="modal-close">✕</button></div>
@@ -4233,26 +5268,22 @@ function cellOccupants(roomId, dateStr){
       pet.stays.forEach(stay=>{
         stay.pets.forEach(sp=>{
           if(sp.room !== roomId) return;
-          if(dateStr < stay.checkIn || dateStr > stay.checkOut) return;
-          let kind = 'staying';
-          if(dateStr === stay.checkIn && dateStr === stay.checkOut) kind = 'both';
-          else if(dateStr === stay.checkIn) kind = 'checkin';
-          else if(dateStr === stay.checkOut) kind = 'checkout';
-          const spPet = findPetAcrossStay(cust, sp.petId) || pet;
-          if(!seenPetIds.has(spPet.id)){
-            seenPetIds.add(spPet.id);
-            out.push({ cust, pet: spPet, stay, kind });
-          }
-          // Pets added via "Sharing with" checkboxes don't get their own stay.pets
-          // entry — they're only referenced here. Surface them on the calendar too.
-          // They may belong to a different customer than the one who booked the
-          // room, so look them up globally rather than assuming this `cust`.
-          (sp.sharingWith||[]).forEach(sharedId=>{
-            if(seenPetIds.has(sharedId)) return;
-            const { pet: sharedPet, cust: sharedCust } = findPetWithCustomer(sharedId);
-            if(!sharedPet) return;
-            seenPetIds.add(sharedId);
-            out.push({ cust: sharedCust || cust, pet: sharedPet, stay, kind });
+          const memberIds = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+          memberIds.forEach(id=>{
+            if(seenPetIds.has(id)) return;
+            const w = petDatesInStay(stay, sp, id);
+            if(dateStr < w.checkIn || dateStr > w.checkOut) return;
+            let kind = 'staying';
+            if(dateStr === w.checkIn && dateStr === w.checkOut) kind = 'both';
+            else if(dateStr === w.checkIn) kind = 'checkin';
+            else if(dateStr === w.checkOut) kind = 'checkout';
+            // id may be the row's own petId (look up via findPetAcrossStay so a
+            // shared stay resolves to the real owner) or a sharing partner's id
+            // (look up globally, since they can belong to a different customer).
+            const resolved = id===sp.petId ? { pet: findPetAcrossStay(cust, id) || pet, cust } : findPetWithCustomer(id);
+            if(!resolved.pet) return;
+            seenPetIds.add(id);
+            out.push({ cust: resolved.cust || cust, pet: resolved.pet, stay, kind });
           });
         });
       });
@@ -4514,6 +5545,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   const initialCheckIn = prefDate || todayStr();
   const initialCheckOut = addDays(initialCheckIn, 2);
   const cbSharingIds = [];
+  const cbSharingDates = {};
   openModal(`
     <div class="modal-head"><h3>New boarding booking</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
@@ -4527,7 +5559,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
         <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="cb_in" value="${initialCheckIn}"><span class="date-overlay-label" id="cb_in_day"></span></div></div>
         <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="cb_out" value="${initialCheckOut}"><span class="date-overlay-label" id="cb_out_day"></span></div></div>
         <div class="field"><label>Room assignment</label><select id="cb_room"></select></div>
-        ${sharingPickerHtml('cb_share', cbSharingIds, 'field span3')}
+        ${sharingPickerHtml('cb_share', cbSharingIds, 'field span3', cbSharingDates)}
         <div class="field span3"><label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('cb_rate', null, 'flat')}</div>
         <div class="field span3"><label>Feeding instructions</label><textarea id="cb_feeding"></textarea></div>
       </div>
@@ -4538,7 +5570,8 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       <button class="btn btn-primary" id="saveBtn">Create booking</button>
     </div>
   `, {wide:true});
-  wireSharingPicker('cb_share', cbSharingIds, () => document.getElementById('cb_pet')?.value || null);
+  wireSharingPicker('cb_share', cbSharingIds, () => document.getElementById('cb_pet')?.value || null, cbSharingDates,
+    () => ({ checkIn: document.getElementById('cb_in').value, checkOut: document.getElementById('cb_out').value }));
 
   let cbWorkingDropoff = {time:'09:00', contactName:'', contactPhone:''};
   let cbWorkingPickup = {time:'17:00', contactName:'', contactPhone:''};
@@ -4593,8 +5626,9 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     if(!pet){ roomSel.innerHTML = '<option value="">— pick a pet first —</option>'; return; }
     const rooms = ROOM_INVENTORY.filter(r => r.animal === pet.type);
     const cur = roomSel.value;
+    const rowWindow = spRoomWindow({checkIn, checkOut}, { petId: pet.id, sharingWith: cbSharingIds, dates: cbSharingDates });
     roomSel.innerHTML = `<option value="">— select room —</option>` + rooms.map(r=>{
-      const occupied = !isRoomAvailable(r.id, checkIn, checkOut, null);
+      const occupied = !isRoomAvailable(r.id, rowWindow.checkIn, rowWindow.checkOut, null);
       const shouldSelect = cur ? r.id===cur : r.id===prefRoomId;
       return `<option value="${r.id}" ${shouldSelect?'selected':''} ${occupied?'disabled':''}>${r.id} · ${r.type}${occupied?' — occupied':''}</option>`;
     }).join('');
@@ -4659,17 +5693,28 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     }
     const room = document.getElementById('cb_room').value;
     if(!room){ toast('Please select a room'); return; }
-    if(!isRoomAvailable(room, checkIn, checkOut, null)){ toast(`${room} is already booked for these dates`); return; }
+    for(const [petId, d] of Object.entries(cbSharingDates)){
+      if(!d.checkIn || !d.checkOut || d.checkOut < d.checkIn){
+        const { pet: badPet } = findPetWithCustomer(petId);
+        toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates in the sharing section aren't valid`);
+        return;
+      }
+    }
+    const stayPet = { petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[], dates: cbSharingDates };
+    const rowWindow = spRoomWindow({checkIn, checkOut}, stayPet);
+    if(!isRoomAvailable(room, rowWindow.checkIn, rowWindow.checkOut, null)){ toast(`${room} is already booked for these dates`); return; }
     if(!confirmIfNearbyStay(pet, checkIn, null)) return;
     const { customRate, customRateMode } = readCustomRate('cb_rate');
     const doSave = ()=>{
-      pet.stays.push({
+      const newStay = {
         id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, charges:[],
-        pets: [{ petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[] }],
+        pets: [stayPet],
         dropoff: inClosed ? {...cbWorkingDropoff} : null,
         pickup: outClosed ? {...cbWorkingPickup} : null,
-      });
-      const freeResult = assignFreeGroomings(cust, checkIn, checkOut, [pet.id, ...cbSharingIds]);
+      };
+      pet.stays.push(newStay);
+      const petWindows = [pet.id, ...cbSharingIds].map(id=>({ petId:id, ...petDatesInStay(newStay, stayPet, id) }));
+      const freeResult = assignFreeGroomings(cust, petWindows);
       closeModal();
       state.calendarMonth = checkIn.slice(0,7);
       renderBoardingCalendar();
