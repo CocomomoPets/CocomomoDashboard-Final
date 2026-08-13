@@ -2538,6 +2538,22 @@ function collectStaysForDate(date){
   return { checkins, checkouts };
 }
 
+/* All grooming appointments (any pet, any customer) scheduled on `date`,
+   sorted by time — mirrors collectStaysForDate but for grooming so the
+   Today grid can show a third "Grooming" column alongside check-ins/outs. */
+function collectGroomingForDate(date){
+  const list = [];
+  state.customers.forEach(cust=>{
+    cust.pets.forEach(pet=>{
+      (pet.groomingHistory||[]).forEach(g=>{
+        if(g.date === date) list.push({ cust, pet, g });
+      });
+    });
+  });
+  list.sort((a,b)=> (a.g.time||'').localeCompare(b.g.time||''));
+  return list;
+}
+
 function renderTodayView(){
   const main = document.getElementById('mainArea');
   const today = todayStr();
@@ -2548,7 +2564,8 @@ function renderTodayView(){
   ];
   main.innerHTML = sections.map(sec=>{
     const { checkins, checkouts } = collectStaysForDate(sec.date);
-    return todayDateSectionHtml(sec, checkins, checkouts);
+    const grooms = collectGroomingForDate(sec.date);
+    return todayDateSectionHtml(sec, checkins, checkouts, grooms);
   }).join('');
 
   main.querySelectorAll('[data-today-jump]').forEach(el=>{
@@ -2557,6 +2574,24 @@ function renderTodayView(){
       const [custId, petId] = el.dataset.todayJump.split('|');
       state.activeTab='customers'; state.selectedCustomerId=custId; state.selectedPetId=petId; _subTab='boarding';
       render();
+    });
+  });
+  main.querySelectorAll('[data-today-groom-jump]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      if(e.target.closest('[data-today-groom-status]')) return;
+      const [custId, petId] = el.dataset.todayGroomJump.split('|');
+      state.activeTab='customers'; state.selectedCustomerId=custId; state.selectedPetId=petId; _subTab='grooming';
+      render();
+    });
+  });
+  main.querySelectorAll('[data-today-groom-status]').forEach(sel=>{
+    sel.addEventListener('click', (e)=> e.stopPropagation());
+    sel.addEventListener('change', ()=>{
+      const [custId, petId, groomId] = sel.dataset.todayGroomStatus.split('|');
+      const cust = getCustomer(custId);
+      const pet = cust && cust.pets.find(p=>p.id===petId);
+      const g = pet && (pet.groomingHistory||[]).find(g=>g.id===groomId);
+      if(g){ g.status = sel.value; scheduleSync(); toast(`Status set to "${g.status}"`); }
     });
   });
   main.querySelectorAll('[data-today-checkout]').forEach(btn=>{
@@ -2591,7 +2626,7 @@ function renderTodayView(){
   });
 }
 
-function todayDateSectionHtml(sec, checkins, checkouts){
+function todayDateSectionHtml(sec, checkins, checkouts, grooms){
   return `
   <div class="today-date-section ${sec.primary?'primary':'muted'}">
     <div class="today-date-heading">
@@ -2609,7 +2644,29 @@ function todayDateSectionHtml(sec, checkins, checkouts){
         ${checkouts.length===0 ? `<div class="today-empty">No check-outs.</div>` :
           checkouts.map(({cust,pet,stay,sp,memberIds})=>todayCardHtml(cust,pet,stay,sp,memberIds,'out',sec.allowCheckout)).join('')}
       </div>
+      <div>
+        <div class="today-col-head"><h2>✂️ Grooming</h2><span class="today-count">${grooms.length}</span></div>
+        ${grooms.length===0 ? `<div class="today-empty">No grooming appointments.</div>` :
+          grooms.map(({cust,pet,g})=>todayGroomCardHtml(cust,pet,g)).join('')}
+      </div>
     </div>
+  </div>`;
+}
+
+function todayGroomCardHtml(cust, pet, g){
+  const key = `${cust.id}|${pet.id}`;
+  const gStatus = g.status || 'Not arrived';
+  const hasRiskFlags = ((pet.riskFlags)||[]).length>0;
+  const confirmed = gStatus==='Done & informed' || gStatus==='Picked up';
+  return `
+  <div class="today-card ${confirmed?'today-card-confirmed':''}" data-today-groom-jump="${key}">
+    <div class="avatar" style="${avatarStyle(colorFor(cust.id))}">${initials(cust.name)}</div>
+    <div class="today-card-main">
+      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petLabel(pet)}${hasRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
+      <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
+      <div class="today-card-sub">${g.time||'—'} · ${esc(g.bay)||'No bay'} · ${esc((g.apptTypes||[]).join(', '))||'—'}</div>
+    </div>
+    <select data-today-groom-status="${cust.id}|${pet.id}|${g.id}" style="padding:5px 7px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${GROOM_STATUSES.map(s=>`<option ${s===gStatus?'selected':''}>${esc(s)}</option>`).join('')}</select>
   </div>`;
 }
 
