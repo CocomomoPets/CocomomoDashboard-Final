@@ -340,6 +340,7 @@
   th.cal-holiday-col{ background:var(--amber-tint) !important; color:#8A5A22; }
   td.cal-free.cal-holiday-col{ background:var(--amber-tint); }
   td.cal-free.cal-holiday-col:hover{ background:#F5DFB8; }
+  .cal-staffleave-mark{ display:block; font-size:10px; font-weight:700; color:#A23B2C; margin-top:1px; cursor:help; }
   .cal-holiday-badge{ position:absolute; top:3px; right:4px; width:7px; height:7px; border-radius:50%; background:var(--amber); box-shadow:0 0 0 1.5px rgba(255,255,255,.9); }
   .colour-swatch-row{ display:flex; flex-wrap:wrap; gap:7px; }
   .colour-swatch{ width:26px; height:26px; border-radius:7px; border:2px solid transparent; cursor:pointer; padding:0; }
@@ -509,6 +510,7 @@
     <button class="btn" id="reportsBtn" title="View monthly revenue, occupancy, and grooming report">Reports</button>
     <button class="btn" id="cancellationsBtn" title="View the log of cancelled grooming appointments and boarding stays">Cancellations</button>
     <button class="btn" id="changeLogBtn" title="Recent edits to prices, dates, and notes — with undo">Change log</button>
+    <button class="btn" id="staffBtn" title="Manage staff and their leave dates — shown on the Today grid, Boarding calendar, and Grooming availability">Staff</button>
     <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
   </div>
 
@@ -717,7 +719,23 @@ function hydrateStateFromRemote(remote, opts){
   state.closedDates = remote.closedDates ?? state.closedDates;
   state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
   state.cancellations = remote.cancellations ?? state.cancellations;
+  state.changeLog = remote.changeLog ?? state.changeLog;
+  state.staff = remote.staff ?? state.staff;
   state.policyText = remote.policyText ?? state.policyText;
+  // One-time repair (13 Aug 2026): deleting a stay used to leave any payment
+  // linked to it still tagged with that stayId, which no longer resolved to
+  // anything — so the payment showed up nowhere (not on a stay, not in
+  // general payments) even though the money was still counted in the
+  // customer's total. Strip any such dangling stayId so the payment falls
+  // back to "general" and is usable again.
+  let orphanedPaymentsFixed = 0;
+  state.customers.forEach(c=>{
+    (c.payments||[]).forEach(p=>{
+      if(!p.stayIds || !p.stayIds.length) return;
+      const live = p.stayIds.filter(id=>findStayById(id));
+      if(live.length !== p.stayIds.length){ p.stayIds = live; orphanedPaymentsFixed++; }
+    });
+  });
   if(typeof remote.LARGE_normal === 'number') LARGE.normal = remote.LARGE_normal;
   if(typeof remote.LARGE_holiday === 'number') LARGE.holiday = remote.LARGE_holiday;
   if(resetSelection){
@@ -732,7 +750,7 @@ function hydrateStateFromRemote(remote, opts){
   }
   document.getElementById('shopName').value = state.shopName;
   _lastSyncedJSON = JSON.stringify(remote);
-  if(fbgNotesFixed>0 || fbgSharingBackfilled>0) scheduleSync();
+  if(fbgNotesFixed>0 || fbgSharingBackfilled>0 || orphanedPaymentsFixed>0) scheduleSync();
 }
 async function loadFromCloud(){
   if(!cloudEnabled){ setSyncStatus('off','Cloud sync not set up'); return; }
@@ -775,6 +793,8 @@ function snapshotForCloud(){
     shopName: state.shopName, customers: state.customers, rates: state.rates,
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     cancellations: state.cancellations,
+    changeLog: state.changeLog,
+    staff: state.staff,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
   };
@@ -897,6 +917,7 @@ let state = {
   closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
   cancellations: [], // log of deleted grooming appointments & boarding stays — {id, type:'Grooming'|'Boarding', reason, note, cancelledAt, customerName, petName, summary}
   changeLog: [], // log of edits to stay dates/rates, charges, payments, pet notes — {id, ts, entityType, ref, entityLabel, field, fieldLabel, oldValue, newValue, undone}
+  staff: [], // {id, name, leaves:[{id, start, end, note}]} — leave shown on Today grid, Boarding calendar, and Grooming availability
   selectedCustomerId: null,
   selectedPetId: null,
   activeTab: 'customers',
@@ -1280,6 +1301,21 @@ function openCancelReasonModal(title, onConfirm){
     const note = document.getElementById('cancelReasonNote').value.trim();
     closeModal();
     onConfirm(reason, note);
+  });
+}
+/* Detaches any payments linked to a stay being deleted, instead of leaving
+   them orphaned (still tagged with a stayId that no longer exists, so they
+   never appeared in either that stay's card or the customer's general-
+   payments list — effectively invisible and unusable). The payment record
+   itself, amount and all, is kept: it just drops back to "general" (or stays
+   linked to any other stay it was also split across) so it still counts
+   toward the customer's balance and can be applied to a future stay. */
+function unlinkPaymentsFromStay(cust, stayId){
+  if(!cust) return;
+  (cust.payments||[]).forEach(p=>{
+    if(p.stayIds && p.stayIds.includes(stayId)){
+      p.stayIds = p.stayIds.filter(id=>id!==stayId);
+    }
   });
 }
 /* Records one cancelled grooming appointment or boarding stay into the
@@ -2558,8 +2594,8 @@ function renderTodayView(){
   const main = document.getElementById('mainArea');
   const today = todayStr();
   const sections = [
-    { key:'yesterday', label:'Yesterday', date: addDays(today,-1), primary:false, allowCheckout:true },
     { key:'today', label:'Today', date: today, primary:true, allowCheckout:true },
+    { key:'yesterday', label:'Yesterday', date: addDays(today,-1), primary:false, allowCheckout:true },
     { key:'tomorrow', label:'Tomorrow', date: addDays(today,1), primary:false, allowCheckout:false },
   ];
   main.innerHTML = sections.map(sec=>{
@@ -2633,7 +2669,13 @@ function todayDateSectionHtml(sec, checkins, checkouts, grooms){
       <span class="today-date-label">${sec.label}</span>
       <span class="today-date-sub">${fmtDateLong(sec.date)}</span>
     </div>
+    ${groomLeaveBannerHtml(sec.date, grooms)}
     <div class="today-grid">
+      <div>
+        <div class="today-col-head"><h2>✂️ Grooming</h2><span class="today-count">${grooms.length}</span></div>
+        ${grooms.length===0 ? `<div class="today-empty">No grooming appointments.</div>` :
+          grooms.map(({cust,pet,g})=>todayGroomCardHtml(cust,pet,g)).join('')}
+      </div>
       <div>
         <div class="today-col-head"><h2>🐾 Checking in</h2><span class="today-count">${checkins.length}</span></div>
         ${checkins.length===0 ? `<div class="today-empty">No check-ins.</div>` :
@@ -2643,11 +2685,6 @@ function todayDateSectionHtml(sec, checkins, checkouts, grooms){
         <div class="today-col-head"><h2>🚪 Checking out</h2><span class="today-count">${checkouts.length}</span></div>
         ${checkouts.length===0 ? `<div class="today-empty">No check-outs.</div>` :
           checkouts.map(({cust,pet,stay,sp,memberIds})=>todayCardHtml(cust,pet,stay,sp,memberIds,'out',sec.allowCheckout)).join('')}
-      </div>
-      <div>
-        <div class="today-col-head"><h2>✂️ Grooming</h2><span class="today-count">${grooms.length}</span></div>
-        ${grooms.length===0 ? `<div class="today-empty">No grooming appointments.</div>` :
-          grooms.map(({cust,pet,g})=>todayGroomCardHtml(cust,pet,g)).join('')}
       </div>
     </div>
   </div>`;
@@ -3159,6 +3196,19 @@ function isClosedDate(dateStr){
   return !!closedDateFor(dateStr);
 }
 
+/* Staff on leave for a given date — returns the matching staff members
+   (each with the specific leave entry that covers this date), used by the
+   Today grid, Boarding calendar, and Grooming availability grid so leave is
+   visible wherever staff are scheduling work. */
+function staffOnLeaveFor(dateStr){
+  const out = [];
+  (state.staff||[]).forEach(s=>{
+    const leave = (s.leaves||[]).find(l => dateStr >= l.start && dateStr <= l.end);
+    if(leave) out.push({ staff: s, leave });
+  });
+  return out;
+}
+
 /* Is `roomId` free for the [checkIn, checkOut) window? Checks every stay across
    every customer, skipping the stay being edited (excludeStayId) so a room already
    assigned within that same stay doesn't flag itself. Two ranges overlap when
@@ -3336,6 +3386,7 @@ function wireSubContentEvents(cust, pet){
         // customer so it's removed cleanly regardless of whose page (this
         // customer's own, or a sharing partner's) it's being deleted from.
         ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==stayId); });
+        unlinkPaymentsFromStay(ownerCust, stayId);
         logCancellation('Boarding', reason, note, ownerCust, pet, summary);
         scheduleSync();
         renderPetSubContent(cust, pet); toast('Stay deleted');
@@ -5135,6 +5186,7 @@ document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
 document.getElementById('cancellationsBtn').addEventListener('click', openCancellationsModal);
 document.getElementById('changeLogBtn').addEventListener('click', openChangeLogModal);
+document.getElementById('staffBtn').addEventListener('click', openStaffModal);
 document.getElementById('reportsBtn').addEventListener('click', ()=>openReportsModal());
 document.getElementById('remindersBtn').addEventListener('click', ()=>openRemindersModal());
 function openPoliciesModal(){
@@ -5157,6 +5209,110 @@ function openPoliciesModal(){
     closeModal(); toast('Boarding policies updated'); scheduleSync();
   });
 }
+/* Staff & leave management (13 Aug 2026): a simple staff list, each with
+   zero or more leave date ranges. Leave shown wherever staff schedule work
+   — Today grid, Boarding calendar, Grooming availability — via
+   staffOnLeaveFor()/groomLeaveBannerHtml() above. DOM is synced into
+   workingStaff before any add/remove so in-progress typing isn't lost when
+   a row is added or removed (mirrors the holiday/closed-day pattern above,
+   but safer against losing unsaved edits). */
+function openStaffModal(){
+  let workingStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
+
+  function leaveRowHtml(staffId, l){
+    return `<div class="holiday-row" data-lrow="${l.id}" data-lstaff="${staffId}">
+      <div class="date-overlay-wrap"><input type="date" id="l_start_${l.id}" value="${l.start}" data-l-start><span class="date-overlay-label" id="l_start_${l.id}_wd">${l.start?fmtDateSlashDay(l.start):''}</span></div>
+      <span style="color:var(--ink-soft);">to</span>
+      <div class="date-overlay-wrap"><input type="date" id="l_end_${l.id}" value="${l.end}" data-l-end><span class="date-overlay-label" id="l_end_${l.id}_wd">${l.end?fmtDateSlashDay(l.end):''}</span></div>
+      <input placeholder="Note (optional)" value="${esc(l.note||'')}" data-l-note style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+      <button type="button" class="mini-remove" data-l-remove="${l.id}">✕</button>
+    </div>`;
+  }
+  function staffRowHtml(s){
+    return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px;" data-srow="${s.id}">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <input placeholder="Staff name" value="${esc(s.name)}" data-s-name style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+        <button type="button" class="mini-remove" data-s-remove="${s.id}">✕</button>
+      </div>
+      <div style="padding-left:4px;">
+        <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px;">Leave dates</div>
+        <div id="leaveRows_${s.id}">${(s.leaves||[]).map(l=>leaveRowHtml(s.id,l)).join('')}</div>
+        <button type="button" class="add-line" data-add-leave="${s.id}">+ Add leave</button>
+      </div>
+    </div>`;
+  }
+  openModal(`
+    <div class="modal-head"><h3>Staff</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <fieldset>
+        <legend>Staff &amp; leave <span style="font-weight:400;color:var(--ink-soft);">— leave shown on the Today grid, Boarding calendar, and Grooming availability</span></legend>
+        <div id="staffRows">${workingStaff.map(staffRowHtml).join('')}</div>
+        <button class="add-line" id="addStaffBtn">+ Add staff member</button>
+      </fieldset>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Save</button>
+    </div>
+  `, {wide:true});
+
+  function syncStaffFromDom(){
+    document.querySelectorAll('#staffRows [data-srow]').forEach(row=>{
+      const s = workingStaff.find(x=>x.id===row.dataset.srow);
+      if(!s) return;
+      s.name = row.querySelector('[data-s-name]').value;
+      row.querySelectorAll('[data-lrow]').forEach(lrow=>{
+        const l = s.leaves.find(x=>x.id===lrow.dataset.lrow);
+        if(!l) return;
+        l.start = lrow.querySelector('[data-l-start]').value;
+        l.end = lrow.querySelector('[data-l-end]').value;
+        l.note = lrow.querySelector('[data-l-note]').value;
+      });
+    });
+  }
+  function refreshStaff(){
+    document.getElementById('staffRows').innerHTML = workingStaff.map(staffRowHtml).join('');
+    wireStaffEvents();
+  }
+  function wireStaffEvents(){
+    document.querySelectorAll('[data-s-remove]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{ syncStaffFromDom(); workingStaff = workingStaff.filter(s=>s.id!==btn.dataset.sRemove); refreshStaff(); });
+    });
+    document.querySelectorAll('[data-add-leave]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        syncStaffFromDom();
+        const s = workingStaff.find(x=>x.id===btn.dataset.addLeave);
+        if(s) s.leaves.push({ id: uid('leave'), start: todayStr(), end: todayStr(), note:'' });
+        refreshStaff();
+      });
+    });
+    document.querySelectorAll('[data-l-remove]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        syncStaffFromDom();
+        const staffId = btn.closest('[data-lrow]').dataset.lstaff;
+        const s = workingStaff.find(x=>x.id===staffId);
+        if(s) s.leaves = s.leaves.filter(l=>l.id!==btn.dataset.lRemove);
+        refreshStaff();
+      });
+    });
+    workingStaff.forEach(s=>(s.leaves||[]).forEach(l=>{ wireDateOverlay('l_start_'+l.id); wireDateOverlay('l_end_'+l.id); }));
+  }
+  document.getElementById('addStaffBtn').addEventListener('click', ()=>{
+    syncStaffFromDom();
+    workingStaff.push({ id: uid('staff'), name:'', leaves:[] });
+    refreshStaff();
+  });
+  wireStaffEvents();
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    syncStaffFromDom();
+    state.staff = workingStaff
+      .filter(s=>s.name && s.name.trim())
+      .map(s=>({ ...s, leaves: s.leaves.filter(l=>l.start && l.end) }));
+    closeModal(); render(); scheduleSync(); toast('Staff saved');
+  });
+}
+
 function openRatesModal(){
   openModal(`
     <div class="modal-head"><h3>Rates &amp; holidays</h3><button class="modal-close">✕</button></div>
@@ -5378,6 +5534,7 @@ function renderBoardingCalendar(){
         <span class="legend-chip">Split colour = same-day turnover (O. = out, I. = in)</span>
         <span class="legend-chip">Numbered = same owner's other pets, different room</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--amber-tint);border:1px solid #F0D2AC;"></span>Holiday rate period</span>
+        <span class="legend-chip">🚫 = staff on leave that day (hover for names)</span>
       </div>
     </div>
     <div style="margin-bottom:10px;font-family:var(--font-display);font-size:24px;font-weight:600;">${monthLabel}</div>
@@ -5388,8 +5545,9 @@ function renderBoardingCalendar(){
             <th class="cal-room-head">Room</th>
             ${days.map(d=>{
               const hol = holidayFor(d.dateStr);
+              const onLeave = staffOnLeaveFor(d.dateStr);
               const cls = [d.dateStr===today?'cal-today-col':'', hol?'cal-holiday-col':''].filter(Boolean).join(' ');
-              return `<th class="${cls}" ${hol?`title="${esc(hol.name)}"`:''}>${d.dayNum}<span class="cal-wd">${d.weekday}</span></th>`;
+              return `<th class="${cls}" ${hol?`title="${esc(hol.name)}"`:''}>${d.dayNum}<span class="cal-wd">${d.weekday}</span>${onLeave.length?`<span class="cal-staffleave-mark" title="On leave: ${esc(onLeave.map(o=>o.staff.name).join(', '))}">🚫 ${onLeave.length} out</span>`:''}</th>`;
             }).join('')}
           </tr>
         </thead>
@@ -5562,6 +5720,7 @@ function openCalendarCellModal(roomId, dateStr){
           // A shared stay is only physically stored on one pet's array — filter
           // every pet on the real owning customer so it's removed cleanly.
           ownerCust.pets.forEach(p=>{ p.stays = p.stays.filter(s=>s.id!==stayId); });
+          unlinkPaymentsFromStay(ownerCust, stayId);
         }
         logCancellation('Boarding', reason, note, ownerCust, ownerPet, summary);
         closeModal();
@@ -5788,6 +5947,23 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   });
 }
 
+/* Banner shown above the Grooming availability grid: who's on leave that
+   day, and — since staff have to actually be present to groom — an extra
+   warning if appointments are already booked but every staff member is on
+   leave (nobody would be there to do them). Just a note if leave doesn't
+   conflict with anything booked. */
+function groomLeaveBannerHtml(date, apptsForDay){
+  const onLeave = staffOnLeaveFor(date);
+  if(!onLeave.length) return '';
+  const totalStaff = (state.staff||[]).length;
+  const allOnLeave = totalStaff>0 && onLeave.length>=totalStaff;
+  const namesStr = onLeave.map(o=>esc(o.staff.name)).join(', ');
+  if(allOnLeave && apptsForDay.length>0){
+    return `<div style="background:var(--danger-tint,#FBE4E2);border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:12px;">⚠️ ${apptsForDay.length} appointment${apptsForDay.length===1?'':'s'} booked today, but everyone (${namesStr}) is on leave — nobody's scheduled to be here.</div>`;
+  }
+  return `<div style="background:var(--amber-tint);border:1px solid #F0D2AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#8A5A22;margin-bottom:12px;">🚫 On leave today: ${namesStr}</div>`;
+}
+
 function renderGroomingAvailability(){
   const main = document.getElementById('mainArea');
   const date = state.groomingDate;
@@ -5825,6 +6001,7 @@ function renderGroomingAvailability(){
     </div>
     <div style="margin-bottom:10px;font-family:var(--font-display);font-size:24px;font-weight:600;">${fmtDateLong(date)}</div>
     ${closed ? `<div style="background:var(--danger-tint,#FBE4E2);border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:12px;">🚫 Shop closed${closed.name?` — ${esc(closed.name)}`:''}. No grooming appointments are taken today.</div>` : ''}
+    ${groomLeaveBannerHtml(date, apptsForDay)}
     <div class="grid-wrap">
       <table class="avail-grid">
         <thead>
