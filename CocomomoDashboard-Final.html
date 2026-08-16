@@ -2595,14 +2595,20 @@ function renderTodayView(){
   const today = todayStr();
   const sections = [
     { key:'today', label:'Today', date: today, primary:true, allowCheckout:true },
-    { key:'yesterday', label:'Yesterday', date: addDays(today,-1), primary:false, allowCheckout:true },
     { key:'tomorrow', label:'Tomorrow', date: addDays(today,1), primary:false, allowCheckout:false },
+    { key:'yesterday', label:'Yesterday', date: addDays(today,-1), primary:false, allowCheckout:true },
   ];
-  main.innerHTML = sections.map(sec=>{
+  main.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:flex-end;margin-bottom:14px;">
+      <button class="btn btn-primary" id="todayAddCustomerBtn">+ Add customer</button>
+    </div>
+  ` + sections.map(sec=>{
     const { checkins, checkouts } = collectStaysForDate(sec.date);
     const grooms = collectGroomingForDate(sec.date);
     return todayDateSectionHtml(sec, checkins, checkouts, grooms);
   }).join('');
+
+  document.getElementById('todayAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
 
   main.querySelectorAll('[data-today-jump]').forEach(el=>{
     el.addEventListener('click', (e)=>{
@@ -3863,6 +3869,16 @@ function openModal(html, {wide=false}={}){
 }
 function closeModal(){ document.getElementById('modalRoot').innerHTML=''; }
 
+/* Used by the "+ Add customer" button on the Today grid, Boarding calendar,
+   and Grooming availability toolbars — switches over to the Customers tab
+   first (so the customer/pet is created and immediately visible/editable
+   there, pets included) rather than opening the modal in place. */
+function goToCustomersAndAddNew(){
+  state.activeTab = 'customers';
+  render();
+  openCustomerModal(null);
+}
+
 /* ---- Customer modal ---- */
 function openCustomerModal(existing){
   const c = existing || {id:'', name:'', icPassport:'', phone:'', gender:'Female', dob:'', emergencyName:'', emergencyPhone:'', customerTypes:[], pets:[]};
@@ -4374,7 +4390,8 @@ function openClosedApptEditModal(stay, kind, onSaved){
   });
 }
 
-function openStayModal(cust, primaryPet, existing){
+function openStayModal(cust, primaryPet, existing, afterSave){
+  const onSaved = afterSave || (()=>renderPetSubContent(cust, primaryPet));
   const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: addDays(todayStr(),2), status:'Active', notes:'',
     pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[], dates:{} }] };
   let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings], dates:{...(sp.dates||{})}}));
@@ -4663,7 +4680,7 @@ function openStayModal(cust, primaryPet, existing){
         const petWindows = workingPets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(newStay, w, id) })));
         freeResult = assignFreeGroomings(cust, petWindows);
       }
-      closeModal(); renderPetSubContent(cust, primaryPet);
+      closeModal(); onSaved();
       if(freeResult.assignedCount > 0){
         toast(`Stay ${existing?'updated':'created'} — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
         openFreeGroomingSummaryModal(freeResult.assignedList);
@@ -5086,7 +5103,11 @@ function assignFreeGroomings(cust, petWindows){
    slot. Any other existing FBG appointment for this stay ("Not arrived" /
    "In progress") gets REUSED — moved to the correct new date/time/bay
    instead of leaving it stranded and creating a near-duplicate next to it.
-   Only creates a brand-new record once there are no more reusable ones left. */
+   Only creates a brand-new record once there are no more reusable ones left.
+   Past dates (before today) are always left alone too, on top of the status
+   check — a slot that's already come and gone doesn't get moved, reused, or
+   backfilled even if it's still "Not arrived"; only today's and future slots
+   are reconciled. */
 function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
   let assignedCount = 0, movedCount = 0;
   const assignedList = [];
@@ -5101,9 +5122,14 @@ function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
     const scopeEnd = oldWindow.checkOut > checkOut ? oldWindow.checkOut : checkOut;
     const linked = (pet.groomingHistory||[]).filter(g =>
       (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date >= scopeStart && g.date <= scopeEnd);
-    const lockedDates = new Set(linked.filter(g => g.status==='Done & Informed' || g.status==='Picked up').map(g=>g.date));
-    const movablePool = linked.filter(g => g.status!=='Done & Informed' && g.status!=='Picked up');
-    const neededDates = newDates.filter(d => !lockedDates.has(d));
+    // Past dates (before today) are never touched, regardless of status —
+    // only today's and future FBG slots get reconciled. This also means a
+    // needed date that's already in the past is simply skipped rather than
+    // backfilled, since a missed/past slot "doesn't need adjusting".
+    const today = todayStr();
+    const lockedDates = new Set(linked.filter(g => g.status==='Done & Informed' || g.status==='Picked up' || g.date < today).map(g=>g.date));
+    const movablePool = linked.filter(g => g.status!=='Done & Informed' && g.status!=='Picked up' && g.date >= today);
+    const neededDates = newDates.filter(d => !lockedDates.has(d) && d >= today);
     neededDates.forEach((date, idx)=>{
       const exactIdx = movablePool.findIndex(g=>g.date===date);
       if(exactIdx>-1){ movablePool.splice(exactIdx,1); return; } // already right where it should be
@@ -5528,6 +5554,7 @@ function renderBoardingCalendar(){
       </div>
       <button class="btn" id="calThisMonthBtn" type="button">This month</button>
       <button class="btn btn-amber" id="calNewBookingBtn" type="button">+ New booking</button>
+      <button class="btn btn-primary" id="calAddCustomerBtn" type="button">+ Add customer</button>
       <div class="legend-row">
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>Free</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--teal);"></span>Booked — colour = owner</span>
@@ -5574,6 +5601,7 @@ function renderBoardingCalendar(){
   document.getElementById('calNextMonth').addEventListener('click', ()=>{ state.calendarMonth = shiftMonth(state.calendarMonth,1); renderBoardingCalendar(); });
   document.getElementById('calThisMonthBtn').addEventListener('click', ()=>{ state.calendarMonth = todayStr().slice(0,7); renderBoardingCalendar(); });
   document.getElementById('calNewBookingBtn').addEventListener('click', ()=>openCalendarNewBookingModal(null, null));
+  document.getElementById('calAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
 
   main.querySelectorAll('[data-cal-cell]').forEach(el=>{
     el.addEventListener('click', ()=>{
@@ -5663,7 +5691,7 @@ function openCalendarCellModal(roomId, dateStr){
           const showDropoff = closed && (o.kind==='checkin'||o.kind==='both') && o.stay.dropoff;
           const showPickup = closed && (o.kind==='checkout'||o.kind==='both') && o.stay.pickup;
           return `
-        <div class="today-card" data-cal-jump="${o.cust.id}|${o.pet.id}" style="cursor:pointer;">
+        <div class="today-card" data-cal-edit-stay="${o.stay.id}" style="cursor:pointer;">
           <div class="avatar" style="${avatarStyle(calendarColorFor(o.cust.id))}">${initials(o.cust.name)}</div>
           <div class="today-card-main">
             <div class="today-card-pet">${label}${ANIMAL_ICON[o.pet.type]||'🐾'} ${petLabel(o.pet)}
@@ -5675,6 +5703,7 @@ function openCalendarCellModal(roomId, dateStr){
             <div class="today-card-sub">${esc(o.cust.name)} · ${esc(o.cust.phone)} · ${fmtDate(o.stay.checkIn)} → ${fmtDate(o.stay.checkOut)}</div>
             ${showDropoff ? `<div data-cal-edit-closed-appt="${o.stay.id}|dropoff|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Drop-off: ${esc(o.stay.dropoff.time)} · ${esc(o.stay.dropoff.contactName)} (${esc(o.stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
             ${showPickup ? `<div data-cal-edit-closed-appt="${o.stay.id}|pickup|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Pick-up: ${esc(o.stay.pickup.time)} · ${esc(o.stay.pickup.contactName)} (${esc(o.stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
+            <div data-cal-view-pet="${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;text-decoration:underline;color:var(--ink-soft);">View pet's page →</div>
           </div>
           <button class="btn btn-sm btn-danger" data-cal-delete-stay="${o.stay.id}" title="Delete this stay">Delete</button>
         </div>`;
@@ -5698,9 +5727,26 @@ function openCalendarCellModal(roomId, dateStr){
     </div>
   `);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.querySelectorAll('[data-cal-jump]').forEach(el=>{
-    el.addEventListener('click', ()=>{
-      const [custId, petId] = el.dataset.calJump.split('|');
+  document.querySelectorAll('[data-cal-edit-stay]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      if(e.target.closest('[data-cal-edit-closed-appt]') || e.target.closest('[data-cal-view-pet]') || e.target.closest('[data-cal-delete-stay]')) return;
+      const stayId = el.dataset.calEditStay;
+      const st = findStayById(stayId);
+      if(!st) return;
+      const ownerCust = findStayOwnerCustomer(stayId);
+      const ownerPet = ownerCust ? getPet(ownerCust, st.pets[0]?.petId) : null;
+      if(!ownerCust || !ownerPet) return;
+      closeModal();
+      // Editing from the calendar stays on the calendar — after saving,
+      // reopen this same cell's day-detail modal instead of navigating to
+      // the pet's page (which the "View pet's page" link below does instead).
+      openStayModal(ownerCust, ownerPet, st, ()=>{ renderBoardingCalendar(); openCalendarCellModal(roomId, dateStr); });
+    });
+  });
+  document.querySelectorAll('[data-cal-view-pet]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [custId, petId] = el.dataset.calViewPet.split('|');
       closeModal();
       state.activeTab='customers'; state.selectedCustomerId=custId; state.selectedPetId=petId; _subTab='boarding';
       render();
@@ -5985,6 +6031,7 @@ function renderGroomingAvailability(){
       </div>
       <button class="btn" id="todayBtn">Today</button>
       <button class="btn btn-amber" id="bookApptBtn" ${closed?'disabled title="Shop is closed on this date"':''}>+ Book appointment</button>
+      <button class="btn btn-primary" id="groomAddCustomerBtn" type="button">+ Add customer</button>
       <div class="legend-row">
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>${totalSlots-booked} available</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--teal);"></span>${booked} booked</span>
@@ -6033,6 +6080,7 @@ function renderGroomingAvailability(){
   document.getElementById('nextDay').addEventListener('click', ()=>{ state.groomingDate = addDays(state.groomingDate,1); renderGroomingAvailability(); });
   document.getElementById('todayBtn').addEventListener('click', ()=>{ state.groomingDate = todayStr(); renderGroomingAvailability(); });
   document.getElementById('bookApptBtn').addEventListener('click', ()=>openFullBookingModal(null, null));
+  document.getElementById('groomAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
 
   document.querySelectorAll('.slot-free').forEach(el=>{
     el.addEventListener('click', ()=>{
