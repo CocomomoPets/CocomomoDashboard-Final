@@ -781,12 +781,11 @@ async function loadFromCloud(){
       // (the very last blob save that still had it); every save from now on
       // no longer writes customers into the blob at all.
       await migrateCustomersPetsFromBlobIfNeeded(data.data.customers);
-      // Same blob source again for stays (18 Aug 2026 migration Phase 4) — see the
-      // comment on migrateStaysFromBlobIfNeeded for why it must read the blob
-      // directly rather than the just-migrated pets rows. Must run before
-      // loadCustomersPetsFromTables() so the stays table is seeded before it's read.
-      await migrateStaysFromBlobIfNeeded(data.data.customers);
-      await loadCustomersPetsFromTables();
+      // Stays migration (18 Aug 2026 migration Phase 4) happens inside
+      // loadCustomersPetsFromTables() now, once petRows is fetched there — see
+      // the comment on migrateStaysFromBlobIfNeeded for why. data.data.customers
+      // is still passed through as a fallback source for a from-scratch restore.
+      await loadCustomersPetsFromTables(data.data.customers);
       // Re-apply the same "pick a sensible selected customer/pet" step
       // hydrateStateFromRemote() already did — needed again since
       // state.customers just got replaced with the tables-loaded copy.
@@ -5548,12 +5547,16 @@ async function migrateCustomersPetsFromBlobIfNeeded(blobCustomers){
    resets `_customersBaseline` to match, so the next save only sends
    whatever changes from here. Pet `stays` come from loadStaysGroupedByPet()
    (its own table as of migration Phase 4) rather than the pets row's own
-   (now-frozen) `stays` column. */
-async function loadCustomersPetsFromTables(){
+   (now-frozen) `stays` column — but that column is still where
+   migrateStaysFromBlobIfNeeded seeds the stays table FROM, the first time this
+   runs after Phase 4 ships; `blobCustomers` (data.data.customers) is passed
+   through only as its fallback source, see the comment there. */
+async function loadCustomersPetsFromTables(blobCustomers){
   const { data: custRows, error: e1 } = await sb.from('customers').select('*').order('created_at');
   if(e1){ console.error('Customers load failed:', e1); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
   const { data: petRows, error: e2 } = await sb.from('pets').select('*').order('created_at');
   if(e2){ console.error('Pets load failed:', e2); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  await migrateStaysFromBlobIfNeeded(petRows, blobCustomers);
   const staysByPet = await loadStaysGroupedByPet();
   state.customers = (custRows||[]).map(c=>normalizeCustomer({
     id: c.id, name: c.name, icPassport: c.ic_passport, phone: c.phone, gender: c.gender, dob: c.dob,
@@ -5619,25 +5622,48 @@ async function syncCustomersAndPetsToTables(baseline, current){
     }
   }
 }
-/* One-time, safe-to-run-repeatedly: if the stays table is still empty, copies
-   stay data over from `blobCustomers` — the SAME blob source
-   migrateCustomersPetsFromBlobIfNeeded reads (data.data.customers, the last blob
-   save that still had customers/pets embedded), NOT from the pets table's own
-   `stays` column. This matters for disaster recovery: restoring onto a brand-new
-   Supabase project inserts fresh `pets` rows via mapPetRow, which no longer writes
-   `stays` — reading from those freshly-inserted rows would silently migrate zero
-   boarding history. Reading straight from the blob is correct whether this is the
-   already-migrated live project (where the blob is stale but customers/pets migration
-   already ran) or a from-scratch restore. Never overwrites existing table data. */
-async function migrateStaysFromBlobIfNeeded(blobCustomers){
-  if(!blobCustomers || !blobCustomers.length) return;
-  const { count, error } = await sb.from('stays').select('*', {count:'exact', head:true});
+/* One-time-per-PET, safe-to-run-repeatedly: backfills the stays table from TWO
+   possible sources, in priority order:
+   1. `petRows` — the pets table's own (now-frozen) `stays` column. This is the
+      correct source on an already-Phase-3-migrated live project, where the
+      top-level blob's `customers` field has been empty/stale ever since Phase 3
+      shipped (snapshotForCloud() stopped including customers, and every save
+      fully overwrites that blob column). An EARLIER version of this function
+      only read the blob and missed this entirely — on a live project that had
+      already been through Phase 3 for a while, the blob source was empty, so
+      the "migration" silently inserted nothing and every pet's stays appeared
+      to vanish from the dashboard (the underlying pets.stays data was untouched
+      the whole time — just no longer being read). Fixed 18 Aug 2026.
+   2. `blobCustomers` (data.data.customers) — used only as a fallback for pets
+      that had nothing in `petRows` above. Covers restoring onto a brand-new
+      Supabase project: migrateCustomersPetsFromBlobIfNeeded just inserted fresh
+      `pets` rows via mapPetRow (which no longer writes `stays`), so `petRows`
+      would show nothing there even though the backup file being restored has
+      the real stays embedded on data.data.customers.
+   Checked PER PET (which pet ids already have at least one row in `stays`), not
+   as a single "is the whole table empty" gate — a real new stay added for one
+   pet during the window between Phase 4 shipping and this backfill actually
+   running must not block backfilling every OTHER pet's history; it only skips
+   backfilling that one already-touched pet. Never overwrites a pet that
+   already has rows. */
+async function migrateStaysFromBlobIfNeeded(petRows, blobCustomers){
+  const { data: existingRows, error } = await sb.from('stays').select('pet_id');
   if(error){ console.error('Stays migration check failed:', error); return; }
-  if(count > 0) return; // already migrated — never overwrite
+  const petsAlreadyMigrated = new Set((existingRows||[]).map(r=>r.pet_id));
   const stayRows = [];
-  blobCustomers.forEach(c=>(c.pets||[]).forEach(p=>(p.stays||[]).forEach(s=>{
-    if(s && s.id) stayRows.push(mapStayRow(p.id, normalizeStay(s)));
-  })));
+  const petIdsWithStays = new Set();
+  (petRows||[]).forEach(p=>{
+    if(petsAlreadyMigrated.has(p.id)) return; // this pet already has real rows — never touch
+    (p.stays||[]).forEach(s=>{
+      if(!s || !s.id) return;
+      petIdsWithStays.add(p.id);
+      stayRows.push(mapStayRow(p.id, normalizeStay(s)));
+    });
+  });
+  (blobCustomers||[]).forEach(c=>(c.pets||[]).forEach(p=>{
+    if(petsAlreadyMigrated.has(p.id) || petIdsWithStays.has(p.id)) return;
+    (p.stays||[]).forEach(s=>{ if(s && s.id) stayRows.push(mapStayRow(p.id, normalizeStay(s))); });
+  }));
   if(!stayRows.length) return;
   const { error: insErr } = await sb.from('stays').insert(stayRows);
   if(insErr){ console.error('Stays migration insert failed:', insErr); toast('Stay migration failed — see console. Old data is untouched.'); }
