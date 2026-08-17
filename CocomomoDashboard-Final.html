@@ -800,25 +800,59 @@ function snapshotForCloud(){
   };
 }
 
+/* Auto-retry delays for a failed/timed-out save, in ms — before this (17
+   Aug 2026), a single failed save just sat there showing "Save failed" until
+   someone noticed and tapped it; on a flaky connection that meant frequent
+   manual retries. Now a save gets these 3 automatic attempts (with a hard
+   10s timeout per attempt, since free-tier Supabase's shared compute can
+   occasionally hang rather than error quickly) before finally surfacing an
+   error for a human to look at. */
+const SAVE_RETRY_DELAYS_MS = [2000, 5000, 10000];
+let _saveInFlight = false;
+
 async function saveToCloudNow(){
   if(!cloudEnabled) return;
+  if(_saveInFlight){
+    // Another save is already mid-retry — don't stack a parallel one, just
+    // let this newer snapshot get picked up shortly after the current one
+    // finishes (it'll differ from _lastSyncedJSON so it won't be skipped).
+    clearTimeout(_syncTimer);
+    _syncTimer = setTimeout(saveToCloudNow, 1000);
+    return;
+  }
   const snap = snapshotForCloud();
   const json = JSON.stringify(snap);
   if(json === _lastSyncedJSON) { setSyncStatus('ok','Synced'); return; }
-  setSyncStatus('saving','Saving…');
+  _saveInFlight = true;
   try{
-    const { error } = await sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() });
-    if(error) throw error;
+    await attemptSaveWithRetry(snap, json, 0);
+  } finally {
+    _saveInFlight = false;
+  }
+}
+
+async function attemptSaveWithRetry(snap, json, attempt){
+  setSyncStatus('saving', attempt===0 ? 'Saving…' : `Saving… (retry ${attempt}/${SAVE_RETRY_DELAYS_MS.length})`);
+  const result = await withTimeout(
+    sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() }),
+    10000, 'timeout'
+  );
+  const error = result === 'timeout' ? { message: 'Connection timed out' } : result.error;
+  if(!error){
     _lastSyncedJSON = json;
     _lastSyncError = null;
     setSyncStatus('ok','Synced');
-  } catch(err){
-    const msg = describeSupabaseError(err);
-    console.error('Supabase save failed:', msg, err);
-    _lastSyncError = msg;
-    setSyncStatus('error','Save failed — tap for details');
-    toast('Save failed: ' + msg);
+    return;
   }
+  if(attempt < SAVE_RETRY_DELAYS_MS.length){
+    await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
+    return attemptSaveWithRetry(snap, json, attempt+1);
+  }
+  const msg = describeSupabaseError(error);
+  console.error('Supabase save failed after retries:', msg, error);
+  _lastSyncError = msg;
+  setSyncStatus('error','Save failed — tap for details');
+  toast('Save failed: ' + msg);
 }
 
 /* Live co-editing (Realtime auto-refresh + "someone's editing this" badges)
@@ -871,6 +905,18 @@ document.addEventListener('visibilitychange', async ()=>{
   setSyncStatus('saving','Reconnecting…');
   const loggedIn = await ensureLogin();
   if(loggedIn) await loadFromCloud();
+});
+
+/* Retries make a failed save more likely to eventually succeed on its own,
+   but they also mean a failure can take longer to resolve — so warn before
+   closing/refreshing the tab while a save hasn't gone through yet, rather
+   than let someone close it mid-retry and lose an edit that only ever
+   existed in this tab. */
+window.addEventListener('beforeunload', (e)=>{
+  if(!cloudEnabled) return;
+  const el = document.getElementById('syncStatus');
+  const unsynced = el && (el.classList.contains('sync-saving') || el.classList.contains('sync-error'));
+  if(unsynced){ e.preventDefault(); e.returnValue = ''; }
 });
 
 /* =========================================================
