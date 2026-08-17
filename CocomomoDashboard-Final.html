@@ -576,6 +576,8 @@ if (cloudEnabled) {
 }
 let _syncTimer = null;
 let _lastSyncedJSON = null;
+let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
+let _customersBaseline = []; // last-known state of state.customers as reflected in the customers/pets tables — used to diff on save
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -658,7 +660,7 @@ function hydrateStateFromRemote(remote, opts){
   opts = opts || {};
   const resetSelection = opts.resetSelection !== false;
   state.shopName = remote.shopName ?? state.shopName;
-  state.customers = (remote.customers ?? state.customers).map(normalizeCustomer);
+  state.customers = (remote.customers ?? state.customers).map(normalizeCustomer); // fallback only — loadFromCloud() overrides this with the authoritative copy from the customers/pets tables right after calling this function (17 Aug 2026 migration); blob value only matters if that table load fails, or for very old un-migrated backups
   // One-time cleanup: auto-created FBG grooming records used to carry a long
   // explanatory blurb in their notes — now they should just say "(Boarding)".
   // Idempotent, so safe to check on every load; only pushes a sync if it
@@ -772,6 +774,17 @@ async function loadFromCloud(){
       // check, then load the authoritative copy from the tables themselves.
       await migrateStaffFromBlobIfNeeded(data.data.staff);
       await loadStaffFromTables();
+      // Same pattern for customers/pets (18 Aug 2026 migration) — reads
+      // data.data.customers here ONE more time only as the migration source
+      // (the very last blob save that still had it); every save from now on
+      // no longer writes customers into the blob at all.
+      await migrateCustomersPetsFromBlobIfNeeded(data.data.customers);
+      await loadCustomersPetsFromTables();
+      // Re-apply the same "pick a sensible selected customer/pet" step
+      // hydrateStateFromRemote() already did — needed again since
+      // state.customers just got replaced with the tables-loaded copy.
+      state.selectedCustomerId = state.customers[0]?.id || null;
+      state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
       setSyncStatus('ok','Synced');
     } else {
       // nothing saved yet — push current (seed) state as the first save
@@ -795,7 +808,7 @@ async function loadFromCloud(){
 
 function snapshotForCloud(){
   return {
-    shopName: state.shopName, customers: state.customers, rates: state.rates,
+    shopName: state.shopName, rates: state.rates,
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     cancellations: state.cancellations,
     changeLog: state.changeLog,
@@ -827,37 +840,59 @@ async function saveToCloudNow(){
   }
   const snap = snapshotForCloud();
   const json = JSON.stringify(snap);
-  if(json === _lastSyncedJSON) { setSyncStatus('ok','Synced'); return; }
+  const custJson = JSON.stringify(state.customers);
+  const blobChanged = json !== _lastSyncedJSON;
+  // 18 Aug 2026 migration: customers/pets no longer part of the blob above —
+  // tracked separately here and synced to their own tables (see
+  // syncCustomersAndPetsToTables), so a pet edit only rewrites that pet's
+  // row, not the whole customer list.
+  const custChanged = custJson !== _lastSyncedCustomersJSON;
+  if(!blobChanged && !custChanged) { setSyncStatus('ok','Synced'); return; }
   _saveInFlight = true;
   try{
-    await attemptSaveWithRetry(snap, json, 0);
+    await attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, 0);
   } finally {
     _saveInFlight = false;
   }
 }
 
-async function attemptSaveWithRetry(snap, json, attempt){
+async function attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, attempt){
   setSyncStatus('saving', attempt===0 ? 'Saving…' : `Saving… (retry ${attempt}/${SAVE_RETRY_DELAYS_MS.length})`);
-  const result = await withTimeout(
-    sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() }),
-    10000, 'timeout'
-  );
-  const error = result === 'timeout' ? { message: 'Connection timed out' } : result.error;
-  if(!error){
-    _lastSyncedJSON = json;
+  try{
+    // Customers/pets first, then the (now smaller) blob — order doesn't
+    // matter for correctness, just needs to be consistent for the retry
+    // path below, which safely re-does BOTH on failure (syncCustomersAnd-
+    // PetsToTables uses upsert()/delete(), both idempotent, so redoing an
+    // already-succeeded part on retry is harmless, not a duplicate-error risk).
+    if(custChanged){
+      await syncCustomersAndPetsToTables(_customersBaseline, state.customers);
+    }
+    if(blobChanged){
+      const result = await withTimeout(
+        sb.from(SUPABASE_TABLE).upsert({ id: WORKSPACE_ID, data: snap, updated_at: new Date().toISOString() }),
+        10000, 'timeout'
+      );
+      if(result === 'timeout') throw new Error('Connection timed out');
+      if(result.error) throw result.error;
+    }
+    if(blobChanged) _lastSyncedJSON = json;
+    if(custChanged){
+      _lastSyncedCustomersJSON = custJson;
+      _customersBaseline = state.customers.map(c=>({...c, pets:(c.pets||[]).map(p=>({...p}))}));
+    }
     _lastSyncError = null;
     setSyncStatus('ok','Synced');
-    return;
+  } catch(error){
+    if(attempt < SAVE_RETRY_DELAYS_MS.length){
+      await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
+      return attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, attempt+1);
+    }
+    const msg = describeSupabaseError(error);
+    console.error('Supabase save failed after retries:', msg, error);
+    _lastSyncError = msg;
+    setSyncStatus('error','Save failed — tap for details');
+    toast('Save failed: ' + msg);
   }
-  if(attempt < SAVE_RETRY_DELAYS_MS.length){
-    await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
-    return attemptSaveWithRetry(snap, json, attempt+1);
-  }
-  const msg = describeSupabaseError(error);
-  console.error('Supabase save failed after retries:', msg, error);
-  _lastSyncError = msg;
-  setSyncStatus('error','Save failed — tap for details');
-  toast('Save failed: ' + msg);
 }
 
 /* Live co-editing (Realtime auto-refresh + "someone's editing this" badges)
@@ -5380,6 +5415,133 @@ async function syncStaffToTables(original, working){
     }
   }
 }
+/* Customers & Pets — migrated to real Postgres tables (18 Aug 2026,
+   migration Phase 2, second area). Unlike Staff, this data is touched by
+   dozens of places throughout the app (bookings, payments, grooming,
+   check-in/out, etc.) — rather than rewrite every one of those individually,
+   they're left exactly as-is (still mutating state.customers in memory and
+   calling scheduleSync() same as before). Instead, the SAVE side is what
+   changed: scheduleSync()/saveToCloudNow() now also diffs state.customers
+   against `_customersBaseline` (the last-known synced copy) and writes only
+   the customer/pet rows that actually changed to these tables, alongside
+   the (now smaller) blob save for everything else. `stays` and
+   `groomingHistory` stay embedded as jsonb columns on each pet row for
+   now — deferred to their own later phases — so a stay/grooming edit still
+   rewrites its pet's whole row, but only that one pet's row, not the whole
+   dataset. Requires `customers` and `pets` tables to exist with TEXT
+   (not uuid) primary keys — see phase2-customers-pets-tables-LIVE.sql —
+   ids must be preserved exactly, since things like a shared room's
+   "sharing with" list reference another pet's id directly. */
+
+function mapCustomerRow(c){
+  return {
+    id: c.id, name: c.name || '', ic_passport: c.icPassport || null, phone: c.phone || null,
+    gender: c.gender || null, dob: c.dob || null, emergency_name: c.emergencyName || null,
+    emergency_phone: c.emergencyPhone || null, customer_types: c.customerTypes || [],
+    points_history: c.pointsHistory || [], authorized_pickups: c.authorizedPickups || [],
+    agreement: c.agreement || null, agreement_token: c.agreementToken || null,
+    color_override: c.colorOverride || null, payments: c.payments || [],
+  };
+}
+function mapPetRow(p, customerId){
+  return {
+    id: p.id, customer_id: customerId, name: p.name || '', type: p.type || null, breed: p.breed || null,
+    colour: p.colour || null, gender: p.gender || null, dob: p.dob || null,
+    boarding_size: p.boardingSize || null, grooming_size: p.groomingSize || null, spayed: p.spayed || null,
+    last_vax: p.lastVax || null, last_tick: p.lastTick || null, medical: p.medical || null,
+    personality: p.personality || null, special: p.special || null, risk_flags: p.riskFlags || [],
+    photo: p.photo || null, stays: p.stays || [], grooming_history: p.groomingHistory || [],
+  };
+}
+/* One-time, safe-to-run-repeatedly: if the customers table is still empty
+   and the old blob had customer data, copies it over in two batch inserts
+   (all customers, then all pets) rather than one request per record, since
+   there can be 100+ of each. Never overwrites existing table data. */
+async function migrateCustomersPetsFromBlobIfNeeded(blobCustomers){
+  if(!blobCustomers || !blobCustomers.length) return;
+  const { count, error } = await sb.from('customers').select('*', {count:'exact', head:true});
+  if(error){ console.error('Customers migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  const custRows = blobCustomers.map(mapCustomerRow);
+  const { error: custErr } = await sb.from('customers').insert(custRows);
+  if(custErr){ console.error('Customers migration insert failed:', custErr); toast('Customer migration failed — see console. Old data is untouched.'); return; }
+  const petRows = [];
+  blobCustomers.forEach(c=>(c.pets||[]).forEach(p=>petRows.push(mapPetRow(p, c.id))));
+  if(petRows.length){
+    const { error: petErr } = await sb.from('pets').insert(petRows);
+    if(petErr){ console.error('Pets migration insert failed:', petErr); toast('Pet migration failed — see console. Old data is untouched.'); }
+  }
+}
+/* Loads state.customers from the tables, joined client-side into the same
+   nested shape (customer -> pets[]) the rest of the app already expects,
+   then normalizes it through the usual normalizeCustomer/normalizePet
+   defaults — so nothing else in the app needs to know this changed. Also
+   resets `_customersBaseline` to match, so the next save only sends
+   whatever changes from here. */
+async function loadCustomersPetsFromTables(){
+  const { data: custRows, error: e1 } = await sb.from('customers').select('*').order('created_at');
+  if(e1){ console.error('Customers load failed:', e1); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
+  const { data: petRows, error: e2 } = await sb.from('pets').select('*').order('created_at');
+  if(e2){ console.error('Pets load failed:', e2); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  state.customers = (custRows||[]).map(c=>normalizeCustomer({
+    id: c.id, name: c.name, icPassport: c.ic_passport, phone: c.phone, gender: c.gender, dob: c.dob,
+    emergencyName: c.emergency_name, emergencyPhone: c.emergency_phone,
+    customerTypes: c.customer_types || [], pointsHistory: c.points_history || [],
+    authorizedPickups: c.authorized_pickups || [], agreement: c.agreement || null,
+    agreementToken: c.agreement_token || null, colorOverride: c.color_override || null,
+    payments: c.payments || [],
+    pets: (petRows||[]).filter(p=>p.customer_id===c.id).map(p=>({
+      id: p.id, name: p.name, type: p.type, breed: p.breed, colour: p.colour, gender: p.gender, dob: p.dob,
+      boardingSize: p.boarding_size, groomingSize: p.grooming_size, spayed: p.spayed,
+      lastVax: p.last_vax, lastTick: p.last_tick, medical: p.medical, personality: p.personality, special: p.special,
+      riskFlags: p.risk_flags || [], photo: p.photo || null,
+      stays: p.stays || [], groomingHistory: p.grooming_history || [],
+    })),
+  }));
+  _customersBaseline = state.customers.map(c=>({...c, pets:(c.pets||[]).map(p=>({...p}))}));
+  _lastSyncedCustomersJSON = JSON.stringify(state.customers);
+}
+/* Diffs `baseline` against `current` and writes only the customer/pet rows
+   that actually changed (deep-compared via the same row-mapping functions
+   used everywhere else here) — insert/update both go through upsert() on
+   the text primary key, which also makes this safe to blindly retry on
+   failure without risking a duplicate-key error on the parts that already
+   succeeded. Deletes are separate since upsert can't express "remove". */
+async function syncCustomersAndPetsToTables(baseline, current){
+  const baseById = new Map(baseline.map(c=>[c.id, c]));
+  const curIds = new Set(current.map(c=>c.id));
+  for(const c of baseline){
+    if(!curIds.has(c.id)){
+      const { error } = await sb.from('customers').delete().eq('id', c.id); // cascades to pets
+      if(error) throw error;
+    }
+  }
+  for(const c of current){
+    const old = baseById.get(c.id);
+    const custRow = mapCustomerRow(c);
+    if(!old || JSON.stringify(mapCustomerRow(old)) !== JSON.stringify(custRow)){
+      const { error } = await sb.from('customers').upsert(custRow);
+      if(error) throw error;
+    }
+    const oldPets = old ? (old.pets||[]) : [];
+    const oldPetById = new Map(oldPets.map(p=>[p.id, p]));
+    const curPetIds = new Set((c.pets||[]).map(p=>p.id));
+    for(const p of oldPets){
+      if(!curPetIds.has(p.id)){
+        const { error } = await sb.from('pets').delete().eq('id', p.id);
+        if(error) throw error;
+      }
+    }
+    for(const p of (c.pets||[])){
+      const op = oldPetById.get(p.id);
+      const petRow = mapPetRow(p, c.id);
+      if(!op || JSON.stringify(mapPetRow(op, c.id)) !== JSON.stringify(petRow)){
+        const { error } = await sb.from('pets').upsert(petRow);
+        if(error) throw error;
+      }
+    }
+  }
+}
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
    — Today grid, Boarding calendar, Grooming availability — via
@@ -6469,7 +6631,11 @@ document.getElementById('custSearch').addEventListener('input', renderSidebarOrH
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
 document.getElementById('backupBtn').addEventListener('click', ()=>{
-  const snapshot = snapshotForCloud();
+  // Customers/pets moved out of snapshotForCloud() (18 Aug 2026 migration) —
+  // it's no longer part of what's pushed to the blob table, since it lives
+  // in its own tables now. A backup file still needs to be a COMPLETE,
+  // standalone snapshot for disaster recovery, so it's added back in here.
+  const snapshot = { ...snapshotForCloud(), customers: state.customers };
   const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
