@@ -14,12 +14,8 @@
 -- CocomomoDashboard-Final.html — uploading the dashboard first means every save
 -- fails until the table exists, not just stay-related saves.
 --
--- RLS: copy whatever policy shape your existing `staff` / `customers` / `pets`
--- tables already use in the Supabase dashboard — this file can't see your project,
--- so the policy below is a best-guess placeholder matching a typical single-workspace
--- setup where the app's anon key needs full read/write. Replace it with your real
--- policy (or delete these two lines and set it up identically to the other tables
--- via the dashboard) before running against live.
+-- RLS: matches the real policy on `customers`/`pets`, confirmed against live via
+-- pg_policies (see the policy block below) — not a guess.
 
 -- Preflight: stays.pet_id below is a `text` foreign key into pets(id), matching
 -- live's `pets` table (pet IDs are referenced elsewhere — e.g. a shared room's
@@ -71,10 +67,11 @@ create table if not exists stays (
 
 create index if not exists stays_pet_id_idx on stays(pet_id);
 
--- Placeholder RLS — verify against your other tables' actual policy before running
--- on live. If your other tables don't use RLS at all (relying solely on the anon
--- key being unguessable), skip these two lines to match.
+-- RLS — confirmed 18 Aug 2026 via pg_policies against live: `customers` and
+-- `pets` each carry one ALL-command policy, qual/with_check both `true`, scoped
+-- to the {authenticated} role (not anon) — named "Authenticated users can do
+-- everything on <table>". Matched exactly here rather than guessed.
 alter table stays enable row level security;
-drop policy if exists "allow anon full access" on stays;
-create policy "allow anon full access" on stays
-  for all using (true) with check (true);
+drop policy if exists "Authenticated users can do everything on stays" on stays;
+create policy "Authenticated users can do everything on stays" on stays
+  for all to authenticated using (true) with check (true);

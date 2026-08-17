@@ -8,9 +8,11 @@
 -- dashboard" project — its pets.id was uuid instead of text).
 --
 -- Run this on the TEST project only. It DROPS and recreates customers/pets there
--- (fine — test data only). RLS is not included here; check what policy live's
--- customers/pets tables actually use (see the RLS follow-up) and apply the same
--- to the test project separately.
+-- (fine — test data only). RLS below matches live exactly, confirmed via
+-- pg_policies: one ALL-command policy per table, qual/with_check both `true`,
+-- scoped to the {authenticated} role (not anon) — so the dashboard's Supabase
+-- client must have an actual signed-in session for reads/writes to pass, not
+-- just the anon key on its own.
 
 drop table if exists pets;
 drop table if exists customers;
@@ -57,3 +59,13 @@ create table pets (
   grooming_history jsonb not null default '[]'::jsonb,
   created_at timestamptz not null default now()
 );
+
+alter table customers enable row level security;
+drop policy if exists "Authenticated users can do everything on customers" on customers;
+create policy "Authenticated users can do everything on customers" on customers
+  for all to authenticated using (true) with check (true);
+
+alter table pets enable row level security;
+drop policy if exists "Authenticated users can do everything on pets" on pets;
+create policy "Authenticated users can do everything on pets" on pets
+  for all to authenticated using (true) with check (true);
