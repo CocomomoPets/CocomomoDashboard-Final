@@ -21,6 +21,34 @@
 -- policy (or delete these two lines and set it up identically to the other tables
 -- via the dashboard) before running against live.
 
+-- Preflight: stays.pet_id below is a `text` foreign key into pets(id), matching
+-- live's `pets` table (pet IDs are referenced elsewhere — e.g. a shared room's
+-- "sharing with" list points at another pet's id directly — so they were
+-- preserved as exact TEXT rather than replaced with auto-generated uuids, see
+-- phase2-customers-pets-tables-LIVE.sql). If this project's `pets` table was
+-- instead built with a `uuid` id (e.g. an older/uncorrected script run on a test
+-- project), the CREATE TABLE below would fail on the FK with a confusing
+-- "incompatible types: text and uuid" error. Catch that here with a clear
+-- message instead: rebuild `pets`/`customers` on THIS project using the exact
+-- same script that created them on live (on live, saved as "Create Customers &
+-- Pets Tables (Text IDs)") before re-running this file.
+do $$
+declare
+  pet_id_type text;
+begin
+  select data_type into pet_id_type
+  from information_schema.columns
+  where table_schema = 'public' and table_name = 'pets' and column_name = 'id';
+
+  if pet_id_type is null then
+    raise exception 'Preflight check failed: no "pets" table (or no "id" column) found on this project. Run the Customers & Pets migration script here first — the one saved as "Create Customers & Pets Tables (Text IDs)" on the live project — before running this file.';
+  end if;
+
+  if pet_id_type <> 'text' then
+    raise exception 'Preflight check failed: pets.id on this project is type "%", not "text". stays.pet_id must match pets.id exactly. Rebuild pets/customers on this project using the same script that created them on live ("Create Customers & Pets Tables (Text IDs)") — do not just change the column type here, since existing pet IDs may already be wrong-typed/regenerated.', pet_id_type;
+  end if;
+end $$;
+
 create table if not exists stays (
   id text primary key,
   pet_id text not null references pets(id) on delete cascade,
