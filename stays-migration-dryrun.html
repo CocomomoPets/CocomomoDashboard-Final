@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cocomomo — Stays migration dry-run</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:820px;margin:32px auto;padding:0 16px;color:#222;line-height:1.5;}
+  h1{font-size:20px;} h2{font-size:16px;margin-top:28px;}
+  .warn{background:#fff4e5;border:1px solid #f0b429;border-radius:8px;padding:12px 14px;margin:16px 0;}
+  .box{border:1px solid #ddd;border-radius:8px;padding:14px 16px;margin:14px 0;}
+  label{display:block;font-weight:600;font-size:13px;margin-bottom:4px;}
+  input[type=text],input[type=password]{width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:14px;box-sizing:border-box;margin-bottom:10px;}
+  button{background:#2563eb;color:#fff;border:none;border-radius:6px;padding:9px 16px;font-size:14px;cursor:pointer;}
+  button:disabled{background:#93b4f0;cursor:not-allowed;}
+  button.secondary{background:#e5e7eb;color:#111;}
+  pre{background:#f6f6f6;border-radius:6px;padding:10px 12px;font-size:12px;overflow:auto;max-height:320px;white-space:pre-wrap;}
+  .ok{color:#0a7a2f;font-weight:600;} .bad{color:#c0392b;font-weight:600;}
+  .row{display:flex;gap:20px;flex-wrap:wrap;}
+  .stat{background:#f6f6f6;border-radius:8px;padding:10px 14px;min-width:140px;}
+  .stat b{display:block;font-size:22px;}
+</style>
+</head>
+<body>
+  <h1>Cocomomo Dashboard — Stays migration dry-run</h1>
+  <p>Validates and rehearses the Phase 4 stays migration (pain point #18) against a
+  <b>real downloaded backup file</b> and a <b>throwaway/test Supabase project</b> —
+  mirrors how the Staff and Customers/Pets phases were rehearsed before touching
+  live. This page never touches your live dashboard or live Supabase project; it
+  only reads whatever backup file you pick and writes to whatever Supabase
+  URL/key you paste in below.</p>
+
+  <div class="warn">
+    <b>Do not paste your LIVE Supabase project's URL/anon key here.</b> Use a
+    second/free Supabase project created just for this test, same as the previous
+    migration phases. This tool will refuse to run if the target <code>stays</code>
+    table already has any rows — same "never overwrite" safety the real migration
+    uses — but that only protects against re-running, not against pointing this at
+    production by mistake.
+  </div>
+
+  <div class="box">
+    <label for="backupFile">1. Backup JSON file (from the dashboard's "Download backup" button)</label>
+    <input type="file" id="backupFile" accept="application/json">
+
+    <label for="sbUrl" style="margin-top:14px;">2. Test Supabase project URL</label>
+    <input type="text" id="sbUrl" placeholder="https://xxxxxxxx.supabase.co">
+    <label for="sbKey">Test Supabase anon key</label>
+    <input type="password" id="sbKey" placeholder="eyJhbGciOi...">
+
+    <button id="validateBtn" disabled>3. Validate backup file</button>
+    <button id="runBtn" class="secondary" disabled>4. Run dry-run migration against test project</button>
+  </div>
+
+  <div id="results"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+let backupData = null;
+let flatStays = null; // [{petId, stay}] after validation
+
+document.getElementById('backupFile').addEventListener('change', async (e)=>{
+  const file = e.target.files[0];
+  document.getElementById('validateBtn').disabled = true;
+  document.getElementById('runBtn').disabled = true;
+  if(!file) return;
+  try{
+    backupData = JSON.parse(await file.text());
+    document.getElementById('validateBtn').disabled = false;
+  } catch(err){
+    renderResults(`<p class="bad">Could not parse that file as JSON: ${escapeHtml(String(err))}</p>`);
+  }
+});
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function renderResults(html){ document.getElementById('results').innerHTML = html; }
+
+/* Flattens backup.customers[].pets[].stays into [{petId, stay}], the same shape
+   flattenStaysForSync() produces in the live dashboard. */
+function flattenBackupStays(customers){
+  const out = [];
+  (customers||[]).forEach(c=>(c.pets||[]).forEach(p=>(p.stays||[]).forEach(s=>{
+    if(s) out.push({ petId: p.id, stay: s });
+  })));
+  return out;
+}
+
+/* Mirrors mapStayRow() in CocomomoDashboard-Final.html — keep these two in sync
+   if the stays schema ever changes. */
+function mapStayRow(petId, s){
+  return {
+    id: s.id, pet_id: petId, check_in: s.checkIn, check_out: s.checkOut, status: s.status || 'Active',
+    checked_in: !!s.checkedIn, checked_in_pets: s.checkedInPets || [], notes: s.notes || '',
+    custom_rate: (s.customRate === '' || s.customRate == null) ? null : +s.customRate,
+    custom_rate_mode: s.customRateMode === 'percent' ? 'percent' : 'flat',
+    charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
+    paid_through: s.paidThrough || null,
+    reminders_sent: s.remindersSent || { checkin: [], checkout: [] },
+  };
+}
+
+document.getElementById('validateBtn').addEventListener('click', ()=>{
+  const customers = backupData.customers || [];
+  const allPetIds = new Set(customers.flatMap(c=>(c.pets||[]).map(p=>p.id)));
+  const flat = flattenBackupStays(customers);
+
+  const idCounts = new Map();
+  flat.forEach(({stay})=> idCounts.set(stay.id, (idCounts.get(stay.id)||0) + 1));
+  const duplicateIds = [...idCounts.entries()].filter(([,n])=>n>1).map(([id])=>id);
+
+  const missingId = flat.filter(({stay})=>!stay || !stay.id);
+  const orphanPet = flat.filter(({petId})=>!allPetIds.has(petId));
+  const badDates = flat.filter(({stay})=>{
+    if(!stay.checkIn || !stay.checkOut) return true;
+    const ci = new Date(stay.checkIn), co = new Date(stay.checkOut);
+    if(isNaN(ci) || isNaN(co)) return true;
+    return co < ci;
+  });
+
+  const problems = [];
+  if(missingId.length) problems.push(`${missingId.length} stay(s) missing an id`);
+  if(duplicateIds.length) problems.push(`${duplicateIds.length} duplicate stay id(s): ${duplicateIds.slice(0,10).join(', ')}${duplicateIds.length>10?'…':''}`);
+  if(orphanPet.length) problems.push(`${orphanPet.length} stay(s) whose petId doesn't match any pet in this same backup file`);
+  if(badDates.length) problems.push(`${badDates.length} stay(s) with missing/invalid/out-of-order check-in or check-out dates`);
+
+  // Only carry forward stays that pass every check — a real migration run
+  // would still want to know about the rest, but this dry-run tool refuses to
+  // insert anything it can't validate cleanly.
+  const badIds = new Set([...missingId, ...orphanPet, ...badDates].map(x=>x.stay && x.stay.id));
+  flatStays = flat.filter(({stay})=> stay && stay.id && !badIds.has(stay.id) && !duplicateIds.includes(stay.id));
+
+  const sample = flatStays.slice(0,3).map(({petId,stay})=>mapStayRow(petId, stay));
+
+  renderResults(`
+    <h2>Validation result</h2>
+    <div class="row">
+      <div class="stat"><b>${flat.length}</b>total stays found</div>
+      <div class="stat"><b>${flatStays.length}</b>pass validation</div>
+      <div class="stat"><b>${flat.length - flatStays.length}</b>flagged, excluded</div>
+    </div>
+    ${problems.length ? `<p class="bad">Issues found:</p><ul>${problems.map(p=>`<li>${escapeHtml(p)}</li>`).join('')}</ul>` : '<p class="ok">No issues found.</p>'}
+    <h2>Sample of mapped rows (first 3, as they'd be inserted)</h2>
+    <pre>${escapeHtml(JSON.stringify(sample, null, 2))}</pre>
+  `);
+
+  document.getElementById('runBtn').disabled = flatStays.length === 0;
+});
+
+document.getElementById('runBtn').addEventListener('click', async ()=>{
+  const url = document.getElementById('sbUrl').value.trim();
+  const key = document.getElementById('sbKey').value.trim();
+  if(!url || !key){ alert('Fill in the test Supabase project URL and anon key first.'); return; }
+  if(!flatStays || !flatStays.length){ alert('Run validation first.'); return; }
+
+  const runBtn = document.getElementById('runBtn');
+  runBtn.disabled = true; runBtn.textContent = 'Running…';
+  const sb = window.supabase.createClient(url, key);
+
+  try{
+    const { count, error: countErr } = await sb.from('stays').select('*', {count:'exact', head:true});
+    if(countErr){
+      renderResults(`<p class="bad">Could not read the "stays" table on that project — has phase4-stays-table-LIVE.sql been run there yet? Error: ${escapeHtml(countErr.message||String(countErr))}</p>`);
+      return;
+    }
+    if(count > 0){
+      renderResults(`<p class="bad">Refusing to run — the "stays" table on that project already has ${count} row(s). This tool never overwrites, same as the real migration. Point it at an empty test project, or skip this step if you've already run the dry-run once.</p>`);
+      return;
+    }
+    const rows = flatStays.map(({petId, stay})=>mapStayRow(petId, stay));
+    const { error: insErr } = await sb.from('stays').insert(rows);
+    if(insErr){
+      renderResults(`<p class="bad">Insert failed: ${escapeHtml(insErr.message||String(insErr))}</p><p>Nothing else was attempted — fix the underlying issue (e.g. the "pets" table on that test project needs to already have matching rows for every pet_id) and try again.</p>`);
+      return;
+    }
+    const { count: finalCount, error: finalErr } = await sb.from('stays').select('*', {count:'exact', head:true});
+    renderResults(`
+      <h2 class="ok">Dry-run migration complete</h2>
+      <p>${rows.length}/${rows.length} stays inserted into the test project's "stays" table.</p>
+      <p>Row count now on that table: ${finalErr ? 'unknown (count check failed)' : finalCount}.</p>
+      <p>Next: open the dashboard pointed at this same test project and confirm stays show up correctly, can be edited, and save/delete without errors — before running phase4-stays-table-LIVE.sql and the matching dashboard update against live.</p>
+    `);
+  } catch(err){
+    renderResults(`<p class="bad">Unexpected error: ${escapeHtml(String(err))}</p>`);
+  } finally {
+    runBtn.disabled = false; runBtn.textContent = '4. Run dry-run migration against test project';
+  }
+});
+</script>
+</body>
+</html>
