@@ -878,7 +878,14 @@ async function attemptSaveWithRetry(snap, json, custJson, blobChanged, custChang
     if(blobChanged) _lastSyncedJSON = json;
     if(custChanged){
       _lastSyncedCustomersJSON = custJson;
-      _customersBaseline = state.customers.map(c=>({...c, pets:(c.pets||[]).map(p=>({...p}))}));
+      // Must be a true DEEP clone — a shallow one (spreading each customer/
+      // pet but leaving nested arrays like stays/payments as the same
+      // in-memory reference) meant a later in-place push (e.g. pet.stays.
+      // push(...)) silently mutated this "baseline" too, so the next diff
+      // always saw zero difference and skipped saving the new stay/payment
+      // entirely — found 18 Aug 2026 when a booking/payment edit showed
+      // "Synced" but wasn't actually in the database after a refresh.
+      _customersBaseline = JSON.parse(custJson);
     }
     _lastSyncError = null;
     setSyncStatus('ok','Synced');
@@ -5498,8 +5505,11 @@ async function loadCustomersPetsFromTables(){
       stays: p.stays || [], groomingHistory: p.grooming_history || [],
     })),
   }));
-  _customersBaseline = state.customers.map(c=>({...c, pets:(c.pets||[]).map(p=>({...p}))}));
+  // Deep clone (see the matching fix/comment in attemptSaveWithRetry above) —
+  // shallow would let a later in-place mutation of e.g. pet.stays silently
+  // "update" this baseline too, breaking the next save's diff.
   _lastSyncedCustomersJSON = JSON.stringify(state.customers);
+  _customersBaseline = JSON.parse(_lastSyncedCustomersJSON);
 }
 /* Diffs `baseline` against `current` and writes only the customer/pet rows
    that actually changed (deep-compared via the same row-mapping functions
