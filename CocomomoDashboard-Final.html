@@ -720,7 +720,7 @@ function hydrateStateFromRemote(remote, opts){
   state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
   state.cancellations = remote.cancellations ?? state.cancellations;
   state.changeLog = remote.changeLog ?? state.changeLog;
-  state.staff = remote.staff ?? state.staff;
+  state.staff = remote.staff ?? state.staff; // fallback only — loadFromCloud() overrides this with the authoritative copy from the staff/staff_leaves tables right after calling this function; blob value only matters if that table load fails
   state.policyText = remote.policyText ?? state.policyText;
   // One-time repair (13 Aug 2026): deleting a stay used to leave any payment
   // linked to it still tagged with that stayId, which no longer resolved to
@@ -767,6 +767,11 @@ async function loadFromCloud(){
     if(error) throw error;
     if(data && data.data){
       hydrateStateFromRemote(data.data, {resetSelection:true});
+      // Staff & leave now lives in real tables (see migrateStaffFromBlobIfNeeded/
+      // loadStaffFromTables above) rather than the blob — one-time-safe migration
+      // check, then load the authoritative copy from the tables themselves.
+      await migrateStaffFromBlobIfNeeded(data.data.staff);
+      await loadStaffFromTables();
       setSyncStatus('ok','Synced');
     } else {
       // nothing saved yet — push current (seed) state as the first save
@@ -5281,6 +5286,100 @@ function openPoliciesModal(){
     closeModal(); toast('Boarding policies updated'); scheduleSync();
   });
 }
+/* Staff & leave — migrated to real Postgres tables (17 Aug 2026, migration
+   Phase 2, first area) instead of living inside the single JSON blob. This
+   proves the "real tables, row-level saves" pattern end-to-end before the
+   rest of the app (customers/stays/grooming/etc.) gets the same treatment.
+   Requires `staff` and `staff_leaves` tables to exist (see
+   phase1-staff-tables.sql) — run that SQL against THIS (live) project
+   before this code can work. Old blob's `staff` field is still WRITTEN as
+   a redundant backup (snapshotForCloud) but no longer READ from — the
+   tables are now the single source of truth. */
+
+/* One-time, safe-to-run-repeatedly: if the staff table is still empty and
+   the old blob had staff data, copies it over. Never overwrites existing
+   table data, so it can't clobber anything once the tables are the real
+   source of truth. */
+async function migrateStaffFromBlobIfNeeded(blobStaff){
+  if(!blobStaff || !blobStaff.length) return;
+  const { count, error } = await sb.from('staff').select('*', {count:'exact', head:true});
+  if(error){ console.error('Staff migration check failed:', error); return; }
+  if(count > 0) return; // tables already have real data — never overwrite
+  for(const s of blobStaff){
+    if(!s.name || !s.name.trim()) continue;
+    const { data, error: insErr } = await sb.from('staff').insert({ name: s.name }).select().single();
+    if(insErr){ console.error('Staff migration insert failed:', insErr); continue; }
+    for(const l of (s.leaves||[])){
+      if(!l.start || !l.end) continue;
+      const { error: leaveErr } = await sb.from('staff_leaves').insert({ staff_id: data.id, start_date: l.start, end_date: l.end, note: l.note||'' });
+      if(leaveErr) console.error('Staff-leave migration insert failed:', leaveErr);
+    }
+  }
+}
+/* Loads state.staff from the real tables, joined client-side into the same
+   {id, name, leaves:[{id,start,end,note}]} shape the rest of the app
+   (staffOnLeaveFor, the Staff modal, etc.) already expects — so nothing
+   else in the app needs to change. */
+async function loadStaffFromTables(){
+  const { data: staffRows, error: e1 } = await sb.from('staff').select('*').order('created_at');
+  if(e1){ console.error('Staff load failed:', e1); toast('Staff data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
+  const { data: leaveRows, error: e2 } = await sb.from('staff_leaves').select('*').order('start_date');
+  if(e2){ console.error('Staff leaves load failed:', e2); toast('Staff leave data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  state.staff = (staffRows||[]).map(s=>({
+    id: s.id, name: s.name,
+    leaves: (leaveRows||[]).filter(l=>l.staff_id===s.id).map(l=>({ id:l.id, start:l.start_date, end:l.end_date, note:l.note||'' })),
+  }));
+}
+/* Diffs `original` (staff as loaded from the tables when the modal opened)
+   against `working` (staff after the user's edits) and writes only the
+   rows that actually changed — inserts for new staff/leaves, updates for
+   edited ones, deletes for removed ones — rather than rewriting everything.
+   This is the actual thing being proven: a save here costs proportionally
+   to what changed, not to the size of the whole dataset. */
+async function syncStaffToTables(original, working){
+  const origById = new Map(original.map(s=>[s.id, s]));
+  const workIds = new Set(working.map(s=>s.id));
+  for(const s of original){
+    if(!workIds.has(s.id)){
+      const { error } = await sb.from('staff').delete().eq('id', s.id); // cascades to staff_leaves
+      if(error) throw error;
+    }
+  }
+  for(const s of working){
+    const isNewStaff = !origById.has(s.id);
+    let realId = s.id;
+    if(isNewStaff){
+      const { data, error } = await sb.from('staff').insert({ name: s.name }).select().single();
+      if(error) throw error;
+      realId = data.id;
+    } else if(origById.get(s.id).name !== s.name){
+      const { error } = await sb.from('staff').update({ name: s.name }).eq('id', s.id);
+      if(error) throw error;
+    }
+    const origLeaves = isNewStaff ? [] : (origById.get(s.id).leaves||[]);
+    const origLeaveById = new Map(origLeaves.map(l=>[l.id, l]));
+    const workLeaveIds = new Set((s.leaves||[]).map(l=>l.id));
+    for(const l of origLeaves){
+      if(!workLeaveIds.has(l.id)){
+        const { error } = await sb.from('staff_leaves').delete().eq('id', l.id);
+        if(error) throw error;
+      }
+    }
+    for(const l of (s.leaves||[])){
+      const isNewLeave = !origLeaveById.has(l.id);
+      if(isNewLeave){
+        const { error } = await sb.from('staff_leaves').insert({ staff_id: realId, start_date: l.start, end_date: l.end, note: l.note||'' });
+        if(error) throw error;
+      } else {
+        const ol = origLeaveById.get(l.id);
+        if(ol.start!==l.start || ol.end!==l.end || (ol.note||'')!==(l.note||'')){
+          const { error } = await sb.from('staff_leaves').update({ start_date:l.start, end_date:l.end, note:l.note||'' }).eq('id', l.id);
+          if(error) throw error;
+        }
+      }
+    }
+  }
+}
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
    — Today grid, Boarding calendar, Grooming availability — via
@@ -5289,6 +5388,7 @@ function openPoliciesModal(){
    a row is added or removed (mirrors the holiday/closed-day pattern above,
    but safer against losing unsaved edits). */
 function openStaffModal(){
+  const originalStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
   let workingStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
 
   function leaveRowHtml(staffId, l){
@@ -5376,12 +5476,26 @@ function openStaffModal(){
   });
   wireStaffEvents();
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
     syncStaffFromDom();
-    state.staff = workingStaff
+    const cleaned = workingStaff
       .filter(s=>s.name && s.name.trim())
       .map(s=>({ ...s, leaves: s.leaves.filter(l=>l.start && l.end) }));
-    closeModal(); render(); scheduleSync(); toast('Staff saved');
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    setSyncStatus('saving','Saving…');
+    try{
+      await syncStaffToTables(originalStaff, cleaned);
+      await loadStaffFromTables();
+      setSyncStatus('ok','Synced');
+      closeModal(); render(); toast('Staff saved');
+    } catch(err){
+      const msg = describeSupabaseError(err);
+      console.error('Staff save failed:', msg, err);
+      setSyncStatus('error','Save failed — tap for details');
+      toast('Staff save failed: ' + msg);
+      saveBtn.disabled = false; saveBtn.textContent = 'Save';
+    }
   });
 }
 
