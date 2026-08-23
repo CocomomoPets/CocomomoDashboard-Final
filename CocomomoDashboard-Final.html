@@ -582,6 +582,8 @@ let _lastSyncedStaysJSON = null; // 18 Aug 2026 migration — stays tracked sepa
 let _staysBaseline = []; // last-known flattened stays list as reflected in the stays table
 let _lastSyncedGroomsJSON = null; // 23 Aug 2026 migration — grooming tracked separately too, see syncGroomsToTables()
 let _groomsBaseline = []; // last-known flattened grooming list as reflected in the grooming_appointments table
+let _lastSyncedPaymentsJSON = null; // 23 Aug 2026 migration — payments tracked separately too, see syncPaymentsToTables()
+let _paymentsBaseline = []; // last-known flattened payments list as reflected in the payments table
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -795,6 +797,11 @@ async function loadFromCloud(){
       // then load the authoritative copy from the table.
       await migrateGroomsFromPetsColumnIfNeeded(state.customers);
       await loadGroomsFromTables();
+      // Payments (23 Aug 2026, Phase 6) — same ordering reasoning as
+      // stays/grooming: migrate from whatever's still embedded in
+      // state.customers first, then load the authoritative copy.
+      await migratePaymentsFromCustomersColumnIfNeeded(state.customers);
+      await loadPaymentsFromTables();
       // Re-apply the same "pick a sensible selected customer/pet" step
       // hydrateStateFromRemote() already did — needed again since
       // state.customers just got replaced with the tables-loaded copy.
@@ -860,6 +867,8 @@ async function saveToCloudNow(){
   const staysJson = JSON.stringify(staysFlat);
   const groomsFlat = flattenAllGrooms(state.customers);
   const groomsJson = JSON.stringify(groomsFlat);
+  const paymentsFlat = flattenAllPayments(state.customers);
+  const paymentsJson = JSON.stringify(paymentsFlat);
 
   // One "unit" per synced entity — each independently tracks whether it
   // changed, how to sync it, and how to commit its new baseline once synced.
@@ -877,6 +886,9 @@ async function saveToCloudNow(){
     { changed: groomsJson !== _lastSyncedGroomsJSON,
       run: ()=>syncGroomsToTables(_groomsBaseline, groomsFlat),
       commit: ()=>{ _lastSyncedGroomsJSON = groomsJson; _groomsBaseline = JSON.parse(groomsJson); } },
+    { changed: paymentsJson !== _lastSyncedPaymentsJSON,
+      run: ()=>syncPaymentsToTables(_paymentsBaseline, paymentsFlat),
+      commit: ()=>{ _lastSyncedPaymentsJSON = paymentsJson; _paymentsBaseline = JSON.parse(paymentsJson); } },
     { changed: json !== _lastSyncedJSON,
       run: async ()=>{
         const result = await withTimeout(
@@ -5474,7 +5486,10 @@ function mapCustomerRow(c){
     emergency_phone: c.emergencyPhone || null, customer_types: c.customerTypes || [],
     points_history: c.pointsHistory || [], authorized_pickups: c.authorizedPickups || [],
     agreement: c.agreement || null, agreement_token: c.agreementToken || null,
-    color_override: c.colorOverride || null, payments: c.payments || [],
+    // payments now has its own table (23 Aug 2026, Phase 6) — always send
+    // empty here so this column stops carrying duplicate/stale data, same
+    // reasoning as stays/grooming_history on the pets table.
+    color_override: c.colorOverride || null, payments: [],
   };
 }
 function mapPetRow(p, customerId){
@@ -5775,6 +5790,87 @@ async function syncGroomsToTables(baseline, current){
     const oldRow = old ? mapGroomRow(old.groom, old.petId, old.customerId) : null;
     if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
       const { error } = await sb.from('grooming_appointments').upsert(row);
+      if(error) throw error;
+    }
+  }
+}
+/* Payments — migrated to a real Postgres table (23 Aug 2026, migration
+   Phase 6). Same "shared save funnel" pattern as everything before it:
+   every place that reads/writes a customer's `.payments` array (payment
+   modals, balance calculations, "General payments", the unlink-on-stay-
+   delete fix from 13 Aug) is left completely untouched. Charges are NOT
+   part of this phase — they stay embedded in each stay's own `charges`
+   jsonb column permanently, not deferred (see phase6-payments-table-LIVE.sql
+   for why). Requires the `payments` table with a TEXT primary key, same
+   reasoning as everywhere else: the change log can reference a payment
+   by id. */
+
+function mapPaymentRow(pmt, customerId){
+  return {
+    id: pmt.id, customer_id: customerId, type: pmt.type || 'Deposit',
+    amount: +pmt.amount || 0, date: pmt.date, receipt_no: pmt.receiptNo || null,
+    stay_ids: pmt.stayIds || [],
+  };
+}
+/* Every payment across every customer, flattened to one list —
+   [{pmt, customerId}, ...] — same reasoning as flattenAllStays/Grooms. */
+function flattenAllPayments(customers){
+  const out = [];
+  customers.forEach(c=>(c.payments||[]).forEach(pmt=>{ out.push({ pmt, customerId: c.id }); }));
+  return out;
+}
+/* One-time, safe-to-run-repeatedly: same pattern as the migrations before
+   it — if the table's still empty and state.customers has payments still
+   embedded (from the old customers.payments jsonb column), copies them
+   into the new table in one batch insert. Must run AFTER
+   loadCustomersPetsFromTables() and BEFORE loadPaymentsFromTables(). */
+async function migratePaymentsFromCustomersColumnIfNeeded(customers){
+  const { count, error } = await sb.from('payments').select('*', {count:'exact', head:true});
+  if(error){ console.error('Payments migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  const flat = flattenAllPayments(customers);
+  if(!flat.length) return;
+  const rows = flat.map(({pmt, customerId})=>mapPaymentRow(pmt, customerId));
+  const { error: insErr } = await sb.from('payments').insert(rows);
+  if(insErr){ console.error('Payments migration insert failed:', insErr); toast('Payments migration failed — see console. Old data is untouched.'); }
+}
+/* Loads every payment from the table and attaches it back onto the right
+   customer's `.payments` array (matched by customer_id), normalizing each
+   through normalizePayment. Also resets `_paymentsBaseline`. */
+async function loadPaymentsFromTables(){
+  const { data: rows, error } = await sb.from('payments').select('*').order('created_at');
+  if(error){ console.error('Payments load failed:', error); toast('Payment data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  const byCust = {};
+  (rows||[]).forEach(p=>{
+    const pmt = normalizePayment({
+      id: p.id, type: p.type, amount: p.amount, date: p.date,
+      receiptNo: p.receipt_no || '', stayIds: p.stay_ids || [],
+    });
+    (byCust[p.customer_id] = byCust[p.customer_id] || []).push(pmt);
+  });
+  state.customers.forEach(c=>{ c.payments = byCust[c.id] || []; });
+  const flatNow = flattenAllPayments(state.customers);
+  _lastSyncedPaymentsJSON = JSON.stringify(flatNow);
+  _paymentsBaseline = JSON.parse(_lastSyncedPaymentsJSON);
+}
+/* Diffs `baseline` against `current` (both flattened lists) and writes
+   only the payments that actually changed. Same upsert/delete pattern as
+   everywhere else — safe to blindly retry. */
+async function syncPaymentsToTables(baseline, current){
+  const baseById = new Map(baseline.map(x=>[x.pmt.id, x]));
+  const curIds = new Set(current.map(x=>x.pmt.id));
+  for(const {pmt} of baseline){
+    if(!curIds.has(pmt.id)){
+      const { error } = await sb.from('payments').delete().eq('id', pmt.id);
+      if(error) throw error;
+    }
+  }
+  for(const {pmt, customerId} of current){
+    const old = baseById.get(pmt.id);
+    const row = mapPaymentRow(pmt, customerId);
+    const oldRow = old ? mapPaymentRow(old.pmt, old.customerId) : null;
+    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { error } = await sb.from('payments').upsert(row);
       if(error) throw error;
     }
   }
