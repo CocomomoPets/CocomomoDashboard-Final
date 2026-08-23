@@ -5744,6 +5744,11 @@ async function loadGroomsFromTables(){
       sizeCode: g.size_code || '', cutCode: g.cut_code || '', details: g.details || '',
       addons: g.addons || [], photos: g.photos || [], notes: g.notes || '', status: g.status,
       groomColor: g.groom_color || null, reminderSent: !!g.reminder_sent,
+      // The rest of the app looks these up directly off the appointment
+      // object (e.g. the grooming grid's cust/pet lookup) rather than only
+      // relying on which pet's array it's nested in — omitting them here
+      // is what caused names to go missing on the grid after this migration.
+      customerId: g.customer_id, petId: g.pet_id,
     });
     (byPet[g.pet_id] = byPet[g.pet_id] || []).push(groom);
   });
