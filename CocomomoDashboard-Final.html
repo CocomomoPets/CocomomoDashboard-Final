@@ -578,6 +578,8 @@ let _syncTimer = null;
 let _lastSyncedJSON = null;
 let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
 let _customersBaseline = []; // last-known state of state.customers as reflected in the customers/pets tables — used to diff on save
+let _lastSyncedStaysJSON = null; // 18 Aug 2026 migration — stays tracked separately too, see syncStaysToTables()
+let _staysBaseline = []; // last-known flattened stays list as reflected in the stays table
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -780,6 +782,12 @@ async function loadFromCloud(){
       // no longer writes customers into the blob at all.
       await migrateCustomersPetsFromBlobIfNeeded(data.data.customers);
       await loadCustomersPetsFromTables();
+      // Stays (18 Aug 2026, Phase 4) — must run AFTER loadCustomersPetsFromTables
+      // (needs state.customers populated with pets to migrate FROM, since the
+      // migration source is whatever's still embedded in each pet's old
+      // stays field) and BEFORE anything else reads pet.stays.
+      await migrateStaysFromPetsColumnIfNeeded(state.customers);
+      await loadStaysFromTables();
       // Re-apply the same "pick a sensible selected customer/pet" step
       // hydrateStateFromRemote() already did — needed again since
       // state.customers just got replaced with the tables-loaded copy.
@@ -847,25 +855,33 @@ async function saveToCloudNow(){
   // syncCustomersAndPetsToTables), so a pet edit only rewrites that pet's
   // row, not the whole customer list.
   const custChanged = custJson !== _lastSyncedCustomersJSON;
-  if(!blobChanged && !custChanged) { setSyncStatus('ok','Synced'); return; }
+  // Same idea for stays (18 Aug 2026, Phase 4) — flattened out of every
+  // pet and tracked/synced separately too (see syncStaysToTables).
+  const staysFlat = flattenAllStays(state.customers);
+  const staysJson = JSON.stringify(staysFlat);
+  const staysChanged = staysJson !== _lastSyncedStaysJSON;
+  if(!blobChanged && !custChanged && !staysChanged) { setSyncStatus('ok','Synced'); return; }
   _saveInFlight = true;
   try{
-    await attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, 0);
+    await attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, staysFlat, staysJson, staysChanged, 0);
   } finally {
     _saveInFlight = false;
   }
 }
 
-async function attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, attempt){
+async function attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, staysFlat, staysJson, staysChanged, attempt){
   setSyncStatus('saving', attempt===0 ? 'Saving…' : `Saving… (retry ${attempt}/${SAVE_RETRY_DELAYS_MS.length})`);
   try{
-    // Customers/pets first, then the (now smaller) blob — order doesn't
-    // matter for correctness, just needs to be consistent for the retry
-    // path below, which safely re-does BOTH on failure (syncCustomersAnd-
-    // PetsToTables uses upsert()/delete(), both idempotent, so redoing an
-    // already-succeeded part on retry is harmless, not a duplicate-error risk).
+    // Customers/pets, then stays, then the (now smaller) blob — order
+    // doesn't matter for correctness, just needs to be consistent for the
+    // retry path below, which safely re-does ALL THREE on failure (every
+    // sync function here uses upsert()/delete(), both idempotent, so
+    // redoing an already-succeeded part on retry is harmless).
     if(custChanged){
       await syncCustomersAndPetsToTables(_customersBaseline, state.customers);
+    }
+    if(staysChanged){
+      await syncStaysToTables(_staysBaseline, staysFlat);
     }
     if(blobChanged){
       const result = await withTimeout(
@@ -887,12 +903,16 @@ async function attemptSaveWithRetry(snap, json, custJson, blobChanged, custChang
       // "Synced" but wasn't actually in the database after a refresh.
       _customersBaseline = JSON.parse(custJson);
     }
+    if(staysChanged){
+      _lastSyncedStaysJSON = staysJson;
+      _staysBaseline = JSON.parse(staysJson); // deep clone, same reasoning as above
+    }
     _lastSyncError = null;
     setSyncStatus('ok','Synced');
   } catch(error){
     if(attempt < SAVE_RETRY_DELAYS_MS.length){
       await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
-      return attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, attempt+1);
+      return attemptSaveWithRetry(snap, json, custJson, blobChanged, custChanged, staysFlat, staysJson, staysChanged, attempt+1);
     }
     const msg = describeSupabaseError(error);
     console.error('Supabase save failed after retries:', msg, error);
@@ -5457,7 +5477,11 @@ function mapPetRow(p, customerId){
     boarding_size: p.boardingSize || null, grooming_size: p.groomingSize || null, spayed: p.spayed || null,
     last_vax: p.lastVax || null, last_tick: p.lastTick || null, medical: p.medical || null,
     personality: p.personality || null, special: p.special || null, risk_flags: p.riskFlags || [],
-    photo: p.photo || null, stays: p.stays || [], grooming_history: p.groomingHistory || [],
+    // stays now has its own table (18 Aug 2026, Phase 4) — always send empty
+    // here so this column stops carrying duplicate/stale data going forward,
+    // and so a stays-only edit doesn't spuriously look like a pet-row change
+    // (both the old and new mapped row always show stays: [] either way).
+    photo: p.photo || null, stays: [], grooming_history: p.groomingHistory || [],
   };
 }
 /* One-time, safe-to-run-repeatedly: if the customers table is still empty
@@ -5549,6 +5573,108 @@ async function syncCustomersAndPetsToTables(baseline, current){
         const { error } = await sb.from('pets').upsert(petRow);
         if(error) throw error;
       }
+    }
+  }
+}
+/* Stays — migrated to a real Postgres table (18 Aug 2026, migration Phase
+   4). Same "shared save funnel" approach as Customers/Pets: every one of
+   the dozens of places that read/write a pet's `.stays` array (the
+   boarding calendar, Today grid, check-in/out, FBG logic, cancellations...)
+   is left completely untouched — they keep mutating state.customers in
+   memory exactly as before. Only the save/load side changed. Stays are
+   flattened out of every pet into one list for diffing/syncing, keyed by
+   the stay's own id; `primaryPetId` is whichever pet's `.stays` array a
+   stay physically lives in (unchanged concept from before — the "owner"
+   pet), `customerId` is that pet's owner, both stored as real columns for
+   quick lookups later even though the in-memory shape doesn't use them
+   directly. Requires the `stays` table — see phase4-stays-table-LIVE.sql —
+   with a TEXT primary key (not uuid), same reasoning as customers/pets:
+   a payment's `stayIds` list and the change log both reference a stay's id
+   directly, so ids must be preserved exactly during migration. */
+
+function mapStayRow(s, primaryPetId, customerId){
+  return {
+    id: s.id, primary_pet_id: primaryPetId, customer_id: customerId,
+    check_in: s.checkIn, check_out: s.checkOut, status: s.status || 'Active',
+    checked_in: !!s.checkedIn, checked_in_pets: s.checkedInPets || [],
+    notes: s.notes || null, custom_rate: (s.customRate === '' || s.customRate == null) ? null : +s.customRate,
+    custom_rate_mode: s.customRateMode || 'flat', charges: s.charges || [], pets: s.pets || [],
+    dropoff: s.dropoff || null, pickup: s.pickup || null, paid_through: s.paidThrough || null,
+    reminders_sent: s.remindersSent || {checkin:[],checkout:[]},
+  };
+}
+/* Every stay across every pet, flattened to one list — [{stay, primaryPetId,
+   customerId}, ...] — for diffing/syncing as a single unit rather than
+   walking the nested customer->pet->stays structure every time. */
+function flattenAllStays(customers){
+  const out = [];
+  customers.forEach(c=>(c.pets||[]).forEach(p=>(p.stays||[]).forEach(stay=>{
+    out.push({ stay, primaryPetId: p.id, customerId: c.id });
+  })));
+  return out;
+}
+/* One-time, safe-to-run-repeatedly: if the stays table is still empty and
+   the just-loaded state.customers has stays embedded in any pet (from the
+   old pets.stays jsonb column, the last generation of the Customers/Pets
+   migration), copies them into the new table in one batch insert. Must run
+   AFTER loadCustomersPetsFromTables() (needs state.customers populated)
+   but BEFORE loadStaysFromTables() (which would otherwise overwrite the
+   embedded copy with an empty table read before migration has a chance to
+   see it). Never overwrites existing table data. */
+async function migrateStaysFromPetsColumnIfNeeded(customers){
+  const { count, error } = await sb.from('stays').select('*', {count:'exact', head:true});
+  if(error){ console.error('Stays migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  const flat = flattenAllStays(customers);
+  if(!flat.length) return;
+  const rows = flat.map(({stay, primaryPetId, customerId})=>mapStayRow(stay, primaryPetId, customerId));
+  const { error: insErr } = await sb.from('stays').insert(rows);
+  if(insErr){ console.error('Stays migration insert failed:', insErr); toast('Stays migration failed — see console. Old data is untouched.'); }
+}
+/* Loads every stay from the table and attaches it back onto the right
+   pet's `.stays` array (matched by primary_pet_id) — overwrites whatever
+   was there (either the old embedded copy, or nothing) with the
+   authoritative table copy, then normalizes each through normalizeStay so
+   nothing else in the app needs to know this changed. Also resets
+   `_staysBaseline` to match. */
+async function loadStaysFromTables(){
+  const { data: stayRows, error } = await sb.from('stays').select('*').order('created_at');
+  if(error){ console.error('Stays load failed:', error); toast('Stay/booking data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  const stayById = {};
+  (stayRows||[]).forEach(s=>{
+    const stay = normalizeStay({
+      id: s.id, checkIn: s.check_in, checkOut: s.check_out, status: s.status,
+      checkedIn: s.checked_in, checkedInPets: s.checked_in_pets || [],
+      notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
+      charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
+      paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+    });
+    (stayById[s.primary_pet_id] = stayById[s.primary_pet_id] || []).push(stay);
+  });
+  state.customers.forEach(c=>c.pets.forEach(p=>{ p.stays = stayById[p.id] || []; }));
+  const flatNow = flattenAllStays(state.customers);
+  _lastSyncedStaysJSON = JSON.stringify(flatNow);
+  _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
+}
+/* Diffs `baseline` against `current` (both flattened lists) and writes
+   only the stays that actually changed — upsert for new/changed, delete
+   for removed. upsert() makes this safe to blindly retry on failure. */
+async function syncStaysToTables(baseline, current){
+  const baseById = new Map(baseline.map(x=>[x.stay.id, x]));
+  const curIds = new Set(current.map(x=>x.stay.id));
+  for(const {stay} of baseline){
+    if(!curIds.has(stay.id)){
+      const { error } = await sb.from('stays').delete().eq('id', stay.id);
+      if(error) throw error;
+    }
+  }
+  for(const {stay, primaryPetId, customerId} of current){
+    const old = baseById.get(stay.id);
+    const row = mapStayRow(stay, primaryPetId, customerId);
+    const oldRow = old ? mapStayRow(old.stay, old.primaryPetId, old.customerId) : null;
+    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { error } = await sb.from('stays').upsert(row);
+      if(error) throw error;
     }
   }
 }
