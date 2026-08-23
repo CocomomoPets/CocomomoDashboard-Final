@@ -1811,6 +1811,29 @@ function waLink(phone, message){
    checkouts. Each item comes with a ready-to-send WhatsApp message — tapping
    Send opens WhatsApp with it pre-filled so staff just review and hit send,
    rather than composing each one from scratch every day. */
+/* Whether `petId` is physically boarding with us on `dateStr` — checks every
+   active stay across every customer, since a pet can be present either as
+   the stay's own row or as a sharing partner on someone else's (using that
+   pet's own resolved dates either way via petDatesInStay). Used to keep
+   grooming reminders limited to pets who actually need a reminder to be
+   brought in — a boarding pet is already here, so a "bring your pet in"
+   message would be pointless/confusing for that owner. */
+function isPetBoardingOn(petId, dateStr){
+  for(const c of state.customers){
+    for(const p of c.pets){
+      for(const stay of (p.stays||[])){
+        if(stay.status !== 'Active') continue;
+        for(const sp of stay.pets){
+          const memberIds = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+          if(!memberIds.includes(petId)) continue;
+          const w = petDatesInStay(stay, sp, petId);
+          if(dateStr >= w.checkIn && dateStr <= w.checkOut) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 function computeReminders(dateStr){
   const dayLabel = fmtDateWithDay(dateStr);
   const dateShort = fmtDateSlashYY(dateStr);
@@ -1821,6 +1844,7 @@ function computeReminders(dateStr){
       (pet.groomingHistory||[]).forEach(g=>{
         if(g.date !== dateStr) return;
         if(g.status === 'Picked up') return; // already done, nothing to remind about
+        if(isPetBoardingOn(pet.id, dateStr)) return; // already here for boarding — no reminder needed
         const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${pet.name} has a grooming appointment on tomorrow (${dateShort}) at ${fmtTimeAMPM(g.time)}.\nSee you then!`;
         groomItems.push({ cust, pet, record:g, message, sent: !!g.reminderSent, kind:'groom', groomId:g.id });
       });
@@ -1853,6 +1877,7 @@ function computeReminders(dateStr){
       });
     });
   });
+  groomItems.sort((a,b)=> (a.record.time||'').localeCompare(b.record.time||'') || (a.record.bay||'').localeCompare(b.record.bay||''));
   return { dateStr, dayLabel, groomItems, checkinItems, checkoutItems };
 }
 function setReminderSent(item, sent){
@@ -2464,8 +2489,10 @@ function renderCustomersMain(){
           <span class="payments-title">Membership points</span>
           <span class="points-balance-badge">${pointsBalance(cust).toLocaleString()} pts</span>
           <button class="btn btn-sm" id="addPointsBtn">+ Add / deduct points</button>
+          <button class="btn btn-sm" id="togglePointsHistoryBtn">${_pointsHistoryOpen.has(cust.id) ? 'Hide history ▲' : `Show history (${cust.pointsHistory.length}) ▼`}</button>
         </div>
-        ${cust.pointsHistory.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No points activity recorded yet.</div>` :
+        ${_pointsHistoryOpen.has(cust.id) ? (
+          cust.pointsHistory.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No points activity recorded yet.</div>` :
           cust.pointsHistory.slice().sort((a,b)=>b.date.localeCompare(a.date)).map(p=>`
             <div class="payment-row" data-edit-points="${p.id}" style="cursor:pointer;">
               <span class="badge ${p.type==='Add'?'badge-active':'badge-past'}">${p.type==='Add'?'+ Added':'− Used'}</span>
@@ -2476,7 +2503,8 @@ function renderCustomersMain(){
               <button class="btn btn-sm" data-edit-points-btn="${p.id}">Edit</button>
               <button class="btn btn-sm btn-danger" data-del-points="${p.id}">✕</button>
             </div>
-          `).join('')}
+          `).join('')
+        ) : ''}
       </div>` : ''}
       <div class="agreement-section">
         <div class="payments-head">
@@ -2552,6 +2580,11 @@ function renderCustomersMain(){
   document.getElementById('remoteLinkBtn').addEventListener('click', ()=>copyRemoteSigningLink(cust));
   const addPointsBtn = document.getElementById('addPointsBtn');
   if(addPointsBtn) addPointsBtn.addEventListener('click', ()=>openPointsModal(cust));
+  const togglePointsHistoryBtn = document.getElementById('togglePointsHistoryBtn');
+  if(togglePointsHistoryBtn) togglePointsHistoryBtn.addEventListener('click', ()=>{
+    if(_pointsHistoryOpen.has(cust.id)) _pointsHistoryOpen.delete(cust.id); else _pointsHistoryOpen.add(cust.id);
+    renderCustomersMain();
+  });
   document.querySelectorAll('[data-edit-points-btn]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
@@ -2584,6 +2617,10 @@ function renderCustomersMain(){
   scheduleSync();
 }
 let _subTab = 'info';
+// UI-only (not saved/synced) — which customers currently have their points
+// history expanded open. Collapsed by default; the Add/deduct button stays
+// clickable either way since it's outside the collapsible part.
+let _pointsHistoryOpen = new Set();
 function curSub(){ return _subTab; }
 function setSub(s){ _subTab = s; document.querySelectorAll('#petSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.sub===s)); }
 let _groomSelection = new Set(); // ids of grooming appointments currently ticked for bulk actions on the pet's Grooming history tab — cleared whenever a different pet/tab is opened
@@ -2718,7 +2755,15 @@ function collectGroomingForDate(date){
       });
     });
   });
-  list.sort((a,b)=> (a.g.time||'').localeCompare(b.g.time||''));
+  // Not arrived / In progress first (sorted by time), then Done & informed,
+  // then Picked up last — finished appointments drop to the bottom instead
+  // of staying mixed in by time, so what still needs attention stays on top.
+  const STATUS_RANK = { 'Not arrived':0, 'In progress':0, 'Done & informed':1, 'Picked up':2 };
+  list.sort((a,b)=>{
+    const rankDiff = (STATUS_RANK[a.g.status] ?? 0) - (STATUS_RANK[b.g.status] ?? 0);
+    if(rankDiff !== 0) return rankDiff;
+    return (a.g.time||'').localeCompare(b.g.time||'');
+  });
   return list;
 }
 
@@ -2909,6 +2954,19 @@ function petBoardingHtml(cust, pet){
   const upcoming = all.filter(s => s.checkOut >= today).sort((a,b)=> a.checkIn.localeCompare(b.checkIn));
   const past = all.filter(s => s.checkOut < today).sort((a,b)=> b.checkIn.localeCompare(a.checkIn));
   return `
+    <div class="cust-card" style="margin-bottom:12px;">
+      <div class="section-title" style="margin:0 0 10px;">Vaccination &amp; tick treatment</div>
+      <div class="info-grid">
+        <div class="info-field">
+          <label>Last vaccination date</label>
+          <div style="max-width:190px;">${dateOverlayHtml('pet_lastVax', pet.lastVax||'')}</div>
+        </div>
+        <div class="info-field">
+          <label>Last tick treatment date</label>
+          <div style="max-width:190px;">${dateOverlayHtml('pet_lastTick', pet.lastTick||'')}</div>
+        </div>
+      </div>
+    </div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div class="section-title" style="margin:0;">Boarding history</div>
       <button class="btn btn-primary btn-sm" data-act="new-stay">+ New stay</button>
@@ -5299,7 +5357,8 @@ function openFreeGroomingSummaryModal(assignedList){
   openModal(`
     <div class="modal-head"><h3>Free grooming auto-booked</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">This stay earned ${assignedList.length} free Basic Grooming (FBG) appointment${assignedList.length===1?'':'s'}. Tap any appointment below to edit its date, time, bay, status, colour, or anything else — you'll come back to this list afterward.</div>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">This stay earned ${assignedList.length} free Basic Grooming (FBG) appointment${assignedList.length===1?'':'s'}. Tap any appointment below to edit its date, time, bay, status, colour, or anything else — or remove it if it shouldn't be booked. You'll come back to this list afterward.</div>
+      ${assignedList.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No free grooming appointments left to review.</div>` : ''}
       ${assignedList.map((a,i)=>`
         <div class="today-card" data-fbg-edit="${i}" style="cursor:pointer;">
           <div class="avatar" style="${avatarStyle(a.record.groomColor || colorFor(a.cust.id))}">${initials(a.cust.name)}</div>
@@ -5307,7 +5366,7 @@ function openFreeGroomingSummaryModal(assignedList){
             <div class="today-card-pet">${ANIMAL_ICON[a.pet.type]||'🐾'} ${petLabel(a.pet)} <span class="badge badge-active">FBG</span></div>
             <div class="today-card-sub">${fmtDateWithDay(a.record.date)} · ${a.record.time} · ${a.record.bay} · ${GROOM_STATUS_ICON[a.record.status]||''} ${esc(a.record.status||'Not arrived')}</div>
           </div>
-          <div style="color:var(--ink-soft);font-size:12px;font-weight:600;">Edit ›</div>
+          <button class="btn btn-sm btn-danger" data-fbg-remove="${i}" title="Don't book this one">Don't book</button>
         </div>
       `).join('')}
     </div>
@@ -5316,8 +5375,24 @@ function openFreeGroomingSummaryModal(assignedList){
     </div>
   `);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-fbg-remove]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const a = assignedList[+btn.dataset.fbgRemove];
+      // This FBG was just auto-assigned and hasn't been acted on yet (still
+      // "Not arrived") — declining it here is choosing not to book it at
+      // all, not cancelling a real appointment, so it's just removed rather
+      // than logged as a cancellation.
+      a.pet.groomingHistory = (a.pet.groomingHistory||[]).filter(g=>g.id!==a.record.id);
+      assignedList.splice(+btn.dataset.fbgRemove, 1);
+      scheduleSync();
+      if(assignedList.length===0){ closeModal(); if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); toast('Free grooming appointment removed'); }
+      else { openFreeGroomingSummaryModal(assignedList); toast('Free grooming appointment removed'); }
+    });
+  });
   document.querySelectorAll('[data-fbg-edit]').forEach(el=>{
-    el.addEventListener('click', ()=>{
+    el.addEventListener('click', (e)=>{
+      if(e.target.closest('[data-fbg-remove]')) return;
       const a = assignedList[+el.dataset.fbgEdit];
       openGroomModal(a.cust, a.pet, a.record, {
         onDone: ()=>{ if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); openFreeGroomingSummaryModal(assignedList); },
@@ -6255,6 +6330,16 @@ function renderBoardingCalendar(){
   document.getElementById('calPrevMonth').addEventListener('click', ()=>{ state.calendarMonth = shiftMonth(state.calendarMonth,-1); renderBoardingCalendar(); });
   document.getElementById('calNextMonth').addEventListener('click', ()=>{ state.calendarMonth = shiftMonth(state.calendarMonth,1); renderBoardingCalendar(); });
   document.getElementById('calThisMonthBtn').addEventListener('click', ()=>{ state.calendarMonth = todayStr().slice(0,7); renderBoardingCalendar(); });
+  // The whole month renders as one wide, horizontally-scrollable table —
+  // every re-render (e.g. switching tabs and back) reset that scroll
+  // position back to day 1, so on the back half of the month you had to
+  // manually drag it over every time. Now: if we're looking at the current
+  // month and today's past the 16th, jump the scroll straight to today's
+  // column so the end of the month is visible without dragging.
+  if(ym === today.slice(0,7) && Number(today.slice(8,10)) > 16){
+    const todayCol = main.querySelector('.cal-today-col');
+    if(todayCol) todayCol.scrollIntoView({ inline:'center', block:'nearest' });
+  }
   document.getElementById('calNewBookingBtn').addEventListener('click', ()=>openCalendarNewBookingModal(null, null));
   document.getElementById('calAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
 
