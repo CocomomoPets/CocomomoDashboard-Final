@@ -513,6 +513,7 @@
     <button class="btn" id="staffBtn" title="Manage staff and their leave dates — shown on the Today grid, Boarding calendar, and Grooming availability">Staff</button>
     <button class="btn" id="archiveBtn" title="Move old, finished bookings/appointments/payments out of the main tables to keep the app fast — and search them later if needed">Archive</button>
     <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
+    <button class="btn" id="backupHistoryBtn" title="Browse and download the last 30 automatic daily backups">Backup history</button>
   </div>
 
   <div class="body">
@@ -846,6 +847,10 @@ async function loadFromCloud(){
   _cloudLoaded = true;
   render();
   checkSignedAgreements();
+  // Fire-and-forget — never awaited, so a slow or failing auto-backup can
+  // never delay the dashboard becoming usable. See maybeRunAutoBackup()
+  // for why this exists and how it's kept safe.
+  maybeRunAutoBackup();
   if(!_agreementPollStarted && cloudEnabled && sbSession){
     _agreementPollStarted = true;
     setInterval(checkSignedAgreements, 60000);
@@ -6566,6 +6571,95 @@ async function restoreArchivedRecord(kind, id){
     toast('Restore failed — see console. Nothing was removed from the archive unless the live-table copy was written successfully first.');
   }
 }
+/* =========================================================
+   AUTO-BACKUP (27 Aug 2026, Pain Point #1). Replaces "must remember to
+   click Download backup weekly" with an automatic daily snapshot — no
+   staff action needed. Runs once per calendar day (id = today's date, so
+   a same-day write is a no-op rather than a duplicate) right after the
+   normal cloud load finishes; never blocks the UI on it, and any failure
+   here only logs to console rather than interrupting normal use. Snapshot
+   content is identical to the manual "Download backup" file (see
+   snapshotForBackup()), just written to its own table instead of
+   downloaded — a table nothing else in the app ever writes to, so a
+   mistake in the live tables (like the Phase 7/8 incident) can't also
+   damage a backup that was already safely written before the mistake
+   happened.
+   ========================================================= */
+async function maybeRunAutoBackup(){
+  if(!cloudEnabled) return;
+  try{
+    const today = todayStr();
+    const { data: existing, error: checkErr } = await sb.from('backup_snapshots').select('id').eq('id', today).maybeSingle();
+    if(checkErr){ console.error('Auto-backup check failed:', checkErr); return; }
+    if(existing) return; // already have today's snapshot
+    const { error: insErr } = await sb.from('backup_snapshots').insert({ id: today, data: snapshotForBackup() });
+    if(insErr){ console.error('Auto-backup save failed:', insErr); return; }
+    await pruneOldAutoBackups();
+  }catch(err){ console.error('Auto-backup failed:', err); }
+}
+/* Keeps only the most recent 30 daily snapshots so the table doesn't grow
+   forever — same reasoning as Archiving itself. 30 days of daily recovery
+   points is already far more coverage than the old weekly manual backup
+   ever gave. */
+async function pruneOldAutoBackups(){
+  const { data: rows, error } = await sb.from('backup_snapshots').select('id').order('id', {ascending:false});
+  if(error){ console.error('Auto-backup prune check failed:', error); return; }
+  const toDelete = (rows||[]).slice(30).map(r=>r.id);
+  if(!toDelete.length) return;
+  const { error: delErr } = await sb.from('backup_snapshots').delete().in('id', toDelete);
+  if(delErr) console.error('Auto-backup prune failed:', delErr);
+}
+/* Read-only browser for the last 30 auto-backups — pick a date, download
+   that day's exact snapshot as a file, same format as manual "Download
+   backup". Fetches the list fresh every time the modal opens rather than
+   relying on anything cached in state, since these are meant to be a
+   trustworthy record independent of whatever's currently in memory. */
+async function openBackupHistoryModal(){
+  openModal(`
+    <div class="modal-head"><h3>Backup history</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
+        One automatic snapshot per day, kept for the last 30 days — written the first time the dashboard is opened each day, no action needed. Click Download on any date to get that day's exact backup file.
+      </div>
+      <div id="backupHistoryList" style="font-size:13px;color:var(--ink-soft);">Loading…</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  const listBox = document.getElementById('backupHistoryList');
+  if(!cloudEnabled){ listBox.innerHTML = `<div>Backup history needs an active cloud connection.</div>`; return; }
+  try{
+    const { data: rows, error } = await sb.from('backup_snapshots').select('id, created_at').order('id', {ascending:false});
+    if(error) throw error;
+    if(!rows || !rows.length){ listBox.innerHTML = `<div>No automatic backups yet — the first one is written next time the dashboard loads.</div>`; return; }
+    listBox.innerHTML = rows.map(r=>
+      `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(fmtDate(r.id))}</div><div class="today-card-sub">Saved ${esc(new Date(r.created_at).toLocaleString())}</div></div><button class="btn btn-sm" data-download-backup="${r.id}">Download</button></div>`
+    ).join('');
+    listBox.querySelectorAll('[data-download-backup]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const id = btn.dataset.downloadBackup;
+        btn.disabled = true; btn.textContent = 'Fetching…';
+        try{
+          const { data: row, error: fetchErr } = await sb.from('backup_snapshots').select('data').eq('id', id).maybeSingle();
+          if(fetchErr) throw fetchErr;
+          if(!row){ toast('That backup no longer exists'); return; }
+          downloadBackupFile(row.data, id);
+          toast('Backup downloaded');
+        }catch(err){
+          console.error('Backup download failed:', err);
+          toast('Could not download that backup — see console.');
+        }finally{
+          btn.disabled = false; btn.textContent = 'Download';
+        }
+      });
+    });
+  }catch(err){
+    console.error('Backup history load failed:', err);
+    listBox.innerHTML = `<div>Failed to load backup history — see console.</div>`;
+  }
+}
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
    — Today grid, Boarding calendar, Grooming availability — via
@@ -7668,26 +7762,32 @@ document.querySelectorAll('.tab-btn').forEach(b=>{
 document.getElementById('custSearch').addEventListener('input', renderSidebarOrHide);
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
-document.getElementById('backupBtn').addEventListener('click', ()=>{
-  // Customers/pets/change-log/cancellations/shop-config moved out of
-  // snapshotForCloud() over the course of the migration — none of them are
-  // part of what's pushed to the blob table anymore, since each lives in
-  // its own table now. A backup file still needs to be a COMPLETE,
-  // standalone snapshot for disaster recovery, so they're all added back
-  // in here.
-  const snapshot = { ...snapshotForCloud(), ...snapshotShopConfig(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
+/* Full standalone snapshot for disaster recovery — Customers/pets/change-
+   log/cancellations/shop-config all moved out of snapshotForCloud() over
+   the course of the migration (each lives in its own table now), so
+   they're explicitly added back in here. Shared by the manual "Download
+   backup" button, the automatic daily snapshot, and the "Backup history"
+   downloader — all three need the exact same complete shape. */
+function snapshotForBackup(){
+  return { ...snapshotForCloud(), ...snapshotShopConfig(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
+}
+function downloadBackupFile(snapshot, filenameStamp){
   const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
   a.href = url;
-  a.download = `cocomomo-backup-${stamp}.json`;
+  a.download = `cocomomo-backup-${filenameStamp}.json`;
   document.body.appendChild(a);
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+document.getElementById('backupBtn').addEventListener('click', ()=>{
+  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+  downloadBackupFile(snapshotForBackup(), stamp);
   toast('Backup downloaded');
 });
+document.getElementById('backupHistoryBtn').addEventListener('click', openBackupHistoryModal);
 
 let _pendingBelongingTarget = null;
 document.getElementById('belongingFileInput').addEventListener('change', async (e)=>{
