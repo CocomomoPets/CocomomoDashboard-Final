@@ -2197,6 +2197,34 @@ function normalizeClosedAppt(a){
   if(!time && !contactName && !contactPhone) return null;
   return { time, contactName, contactPhone };
 }
+/* One-line drop-off/pick-up display for a stay's check-in or check-out side
+   — shared by the Today grid, the stay card, and the calendar day-detail
+   popup so the wording stays consistent everywhere this shows up. On an
+   actual closed day this is the mandatory drop-off/pick-up arrangement
+   (time + contact); on an ordinary day it's just the optional check-in/
+   check-out time the customer gave, with no contact info required. Returns
+   '' if nothing is on file. Pass editAttr (e.g. `data-edit-closed-appt="id|kind"`)
+   to make the line clickable-to-edit; omit it for a plain read-only line
+   (used on the Today grid, which already jumps elsewhere on card click). */
+function apptTimeLineHtml(stay, kind, editAttr){
+  const info = stay[kind];
+  if(!info || !info.time) return '';
+  const isDropoff = kind==='dropoff';
+  const relevantDate = isDropoff ? stay.checkIn : stay.checkOut;
+  const closed = closedDateFor(relevantDate);
+  const contactBit = (info.contactName || info.contactPhone) ? ` · ${esc(info.contactName)} (${esc(info.contactPhone)})` : '';
+  const label = closed
+    ? `🚫 Closed-day ${isDropoff?'drop-off':'pick-up'}: ${esc(info.time)}${contactBit}`
+    : `🕐 ${isDropoff?'Check-in':'Check-out'} time: ${esc(info.time)}`;
+  const boxed = closed || editAttr;
+  const styleParts = [
+    'margin-top:6px;font-size:12px;font-weight:600;',
+    `color:${closed?'#A23B2C':'var(--ink-soft)'};`,
+    boxed ? `border-radius:8px;padding:6px 10px;${closed?'background:#FBE4E2;border:1px solid #EEB3AC;':'background:var(--panel-2);border:1px solid var(--line-soft);'}` : '',
+    editAttr ? 'cursor:pointer;' : '',
+  ];
+  return `<div ${editAttr||''} style="${styleParts.join('')}">${label}${editAttr?' <span style="font-weight:400;text-decoration:underline;">Edit</span>':''}</div>`;
+}
 function normalizeStay(s){
   // checkedInPets: array of petIds individually marked "checked in" — needed
   // now that pets sharing one room can arrive on different dates. Old data
@@ -2740,6 +2768,20 @@ function collectStaysForDate(date){
       });
     });
   });
+  // Same pattern as collectGroomingForDate: items already actioned (checked
+  // in / checked out) sink to the bottom of that day's list instead of
+  // staying mixed in, so what still needs attention stays on top. Sort is
+  // stable, so original order is otherwise preserved.
+  checkins.sort((a,b)=>{
+    const aDone = a.memberIds.every(id=>isPetCheckedIn(a.stay,id)) ? 1 : 0;
+    const bDone = b.memberIds.every(id=>isPetCheckedIn(b.stay,id)) ? 1 : 0;
+    return aDone - bDone;
+  });
+  checkouts.sort((a,b)=>{
+    const aDone = a.stay.status==='Past' ? 1 : 0;
+    const bDone = b.stay.status==='Past' ? 1 : 0;
+    return aDone - bDone;
+  });
   return { checkins, checkouts };
 }
 
@@ -2939,6 +2981,8 @@ function todayCardHtml(cust, pet, stay, sp, memberIds, mode, allowCheckout){
     <div class="today-card-main">
       <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${groupRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
       <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
+      ${mode==='in' ? apptTimeLineHtml(stay, 'dropoff') : ''}
+      ${mode==='out' ? apptTimeLineHtml(stay, 'pickup') : ''}
       ${mode==='out' ? `<div class="today-card-sub">${(cust.authorizedPickups&&cust.authorizedPickups.length) ? `✅ Authorized: ${cust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;">⚠️ No authorized pickup persons on file — verify with owner</span>`}</div>` : ''}
     </div>
     <div class="today-card-room">${esc(sp.room)||'No room'}</div>
@@ -3019,8 +3063,8 @@ function stayCardHtml(cust, pet, stay){
     <div class="card-body ${isOpen?'':'closed'}">
       ${stay.status==='Active' ? `<div style="margin-top:12px;font-size:12.5px;">${(ownerCust.authorizedPickups&&ownerCust.authorizedPickups.length) ? `✅ Authorized for pickup: ${ownerCust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;font-weight:600;">⚠️ No authorized pickup persons on file for ${esc(ownerCust.name)}</span>`}</div>` : ''}
       ${stay.notes ? `<div style="margin-top:12px;font-size:12.5px;color:var(--ink-soft);"><strong>Notes:</strong> ${esc(stay.notes)}</div>` : ''}
-      ${stay.dropoff ? `<div data-edit-closed-appt="${stay.id}|dropoff" style="cursor:pointer;margin-top:12px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day drop-off: ${esc(stay.dropoff.time)} · ${esc(stay.dropoff.contactName)} (${esc(stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
-      ${stay.pickup ? `<div data-edit-closed-appt="${stay.id}|pickup" style="cursor:pointer;margin-top:8px;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;">🚫 Closed-day pick-up: ${esc(stay.pickup.time)} · ${esc(stay.pickup.contactName)} (${esc(stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
+      ${apptTimeLineHtml(stay, 'dropoff', `data-edit-closed-appt="${stay.id}|dropoff"`)}
+      ${apptTimeLineHtml(stay, 'pickup', `data-edit-closed-appt="${stay.id}|pickup"`)}
       ${stay.pets.map(sp => {
         const spPet = findPetById(sp.petId);
         const editable = stay.status==='Active';
@@ -3370,6 +3414,46 @@ function computeStayBilling(cust, stay){
     }
   });
   return { paid: groupPaid, balance: groupCost - groupPaid, isMerged:true, groupCost, groupStayCount: groupStays.length, paidChargesTotal: groupPaidCharges };
+}
+
+/* Every stay in the same "combined bill" group as `stay` — i.e. `stay`
+   itself plus any other stay(s) tied to it via a shared payment's stayIds.
+   Mirrors the grouping computeStayBilling does internally, exposed here so
+   the auto-mark-charges-paid logic below can act on the whole group, not
+   just the one stay a payment happened to be opened from. */
+function getStayBillingGroup(cust, stay){
+  const stayPayments = (cust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
+  const groupStayIds = new Set([stay.id]);
+  stayPayments.forEach(p=>(p.stayIds||[]).forEach(id=>groupStayIds.add(id)));
+  return Array.from(groupStayIds).map(id => id===stay.id ? stay : findStayById(id)).filter(Boolean);
+}
+/* Auto-marks a stay's (or combined-bill group's) additional charges as Paid
+   once the recorded Payments fully cover the total cost (room + charges) —
+   i.e. the payment amount just added/edited "included" the charges, so
+   there's no longer a reason for staff to also tap each charge's Paid
+   button by hand. Deliberately one-directional: editing a payment back down
+   below the total again does NOT un-mark charges, since "Paid" is meant to
+   mean "already settled" and un-settling something a staff member may have
+   separately confirmed in person would be more confusing than helpful —
+   the manual toggle stays available for correcting that by hand. Runs after
+   a payment is added or edited, over that payment's own stayIds. */
+function maybeAutoMarkChargesPaid(cust, stayIds){
+  if(!stayIds || !stayIds.length) return;
+  const done = new Set();
+  stayIds.forEach(stayId=>{
+    if(done.has(stayId)) return;
+    const stay = findStayById(stayId);
+    if(!stay){ done.add(stayId); return; }
+    const billing = computeStayBilling(cust, stay);
+    if(billing.balance <= 0.01){
+      getStayBillingGroup(cust, stay).forEach(st=>{
+        done.add(st.id);
+        (st.charges||[]).forEach(c=>{ if(!c.paid) c.paid = true; });
+      });
+    } else {
+      done.add(stayId);
+    }
+  });
 }
 
 function isHoliday(dateStr){
@@ -3729,6 +3813,7 @@ function wireSubContentEvents(cust, pet){
         if(!opt){ toast('No grooming option available for this pet'); return; }
         stay.charges.push({ id: uid('charge'), category:'Grooming', description: opt.label, amount: opt.amount, qty, paid:false });
         renderPetSubContent(cust, pet);
+        scheduleSync();
         toast('Charge added');
         return;
       }
@@ -3740,6 +3825,7 @@ function wireSubContentEvents(cust, pet){
       if(!amount || amount<=0){ toast('Please enter a valid amount'); return; }
       stay.charges.push({ id: uid('charge'), category: cat, description, amount, qty, paid:false });
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast('Charge added');
     });
   });
@@ -3756,6 +3842,7 @@ function wireSubContentEvents(cust, pet){
       charge.qty = qty;
       logChange('Charge', {stayId, chargeId}, charge.description||charge.category, 'qty', 'Quantity', oldQty, qty);
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast('Quantity updated');
     });
   });
@@ -3772,6 +3859,7 @@ function wireSubContentEvents(cust, pet){
       charge.amount = amount;
       logChange('Charge', {stayId, chargeId}, charge.description||charge.category, 'amount', 'Price (RM each)', oldAmount, amount);
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast('Price updated');
     });
   });
@@ -3784,6 +3872,7 @@ function wireSubContentEvents(cust, pet){
       if(!charge) return;
       charge.paid = !charge.paid;
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast(charge.paid ? 'Marked as already paid' : 'Marked as not yet paid');
     });
   });
@@ -3794,6 +3883,7 @@ function wireSubContentEvents(cust, pet){
       if(!stay) return;
       stay.charges = stay.charges.filter(c=>c.id!==chargeId);
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast('Charge removed');
     });
   });
@@ -4218,7 +4308,8 @@ function openPaymentModal(cust, existing, presetStayId){
       Object.assign(existing, data);
     }
     else{ cust.payments.push({ id:uid('pay'), ...data }); }
-    closeModal(); renderCustomersMain(); toast(existing?'Payment updated':'Payment added');
+    maybeAutoMarkChargesPaid(cust, data.stayIds);
+    closeModal(); renderCustomersMain(); scheduleSync(); toast(existing?'Payment updated':'Payment added');
   });
 }
 
@@ -4552,13 +4643,16 @@ function openPaidThroughModal(stay, onSaved){
 function openClosedApptEditModal(stay, kind, onSaved){
   const isDropoff = kind==='dropoff';
   const current = stay[kind] || {time:'', contactName:'', contactPhone:''};
+  const relevantDate = isDropoff ? stay.checkIn : stay.checkOut;
+  const isClosedDay = !!closedDateFor(relevantDate);
   openModal(`
-    <div class="modal-head"><h3>Edit ${isDropoff?'drop-off':'pick-up'} appointment</h3><button class="modal-close">✕</button></div>
+    <div class="modal-head"><h3>Edit ${isClosedDay ? (isDropoff?'drop-off':'pick-up')+' appointment' : (isDropoff?'check-in':'check-out')+' time'}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div class="form-grid c3">
-        <div class="field"><label>${isDropoff?'Drop-off':'Pick-up'} time</label><input type="time" id="ca_time" value="${esc(current.time)}"></div>
+        <div class="field"><label>${isDropoff?'Check-in':'Check-out'} time</label><input type="time" id="ca_time" value="${esc(current.time)}"></div>
+        ${isClosedDay ? `
         <div class="field"><label>Contact name</label><input id="ca_name" value="${esc(current.contactName)}" placeholder="${isDropoff?"Who's dropping off":"Who's picking up"}"></div>
-        <div class="field"><label>Contact number</label><input id="ca_phone" value="${esc(current.contactPhone)}" placeholder="Phone number"></div>
+        <div class="field"><label>Contact number</label><input id="ca_phone" value="${esc(current.contactPhone)}" placeholder="Phone number"></div>` : ''}
       </div>
     </div>
     <div class="modal-foot">
@@ -4569,13 +4663,14 @@ function openClosedApptEditModal(stay, kind, onSaved){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const time = document.getElementById('ca_time').value;
-    const contactName = document.getElementById('ca_name').value.trim();
-    const contactPhone = document.getElementById('ca_phone').value.trim();
-    if(!time || !contactName || !contactPhone){ toast('Please fill in time, contact name, and contact number'); return; }
-    stay[kind] = { time, contactName, contactPhone };
+    const nameEl = document.getElementById('ca_name'), phoneEl = document.getElementById('ca_phone');
+    const contactName = nameEl ? nameEl.value.trim() : '';
+    const contactPhone = phoneEl ? phoneEl.value.trim() : '';
+    if(isClosedDay && !(time && contactName && contactPhone)){ toast('Please fill in time, contact name, and contact number'); return; }
+    stay[kind] = normalizeClosedAppt({ time, contactName, contactPhone });
     closeModal();
     scheduleSync();
-    toast(`${isDropoff?'Drop-off':'Pick-up'} appointment updated`);
+    toast(`${isDropoff?'Check-in':'Check-out'} time updated`);
     if(onSaved) onSaved();
   });
 }
@@ -4617,29 +4712,33 @@ function openStayModal(cust, primaryPet, existing, afterSave){
   let workingDropoff = s.dropoff ? {...s.dropoff} : {time:'09:00', contactName:'', contactPhone:''};
   let workingPickup = s.pickup ? {...s.pickup} : {time:'17:00', contactName:'', contactPhone:''};
   function closedApptSectionHtml(){
-    const inClosed = closedDateFor(document.getElementById('s_in').value);
-    const outClosed = closedDateFor(document.getElementById('s_out').value);
-    if(!inClosed && !outClosed) return '';
-    return `<fieldset style="border-color:#EEB3AC;background:#FBE4E2;">
-      <legend style="color:#A23B2C;">🚫 Closed-day drop-off / pick-up</legend>
-      ${inClosed ? `
-      <div style="margin-bottom:${outClosed?'12px':'0'};">
-        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(document.getElementById('s_in').value)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
+    const inDate = document.getElementById('s_in').value;
+    const outDate = document.getElementById('s_out').value;
+    const inClosed = closedDateFor(inDate);
+    const outClosed = closedDateFor(outDate);
+    const anyClosed = inClosed || outClosed;
+    return `<fieldset ${anyClosed ? 'style="border-color:#EEB3AC;background:#FBE4E2;"' : ''}>
+      <legend ${anyClosed ? 'style="color:#A23B2C;"' : ''}>${anyClosed ? '🚫 Closed-day drop-off / pick-up' : 'Check-in / check-out time (optional)'}</legend>
+      <div style="margin-bottom:12px;">
+        ${inClosed ? `
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(inDate)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
         <div class="form-grid c3">
           <div class="field"><label>Drop-off time</label><input type="time" id="s_dropoff_time" value="${esc(workingDropoff.time)}"></div>
           <div class="field"><label>Contact name</label><input id="s_dropoff_name" value="${esc(workingDropoff.contactName)}" placeholder="Who's dropping off"></div>
           <div class="field"><label>Contact number</label><input id="s_dropoff_phone" value="${esc(workingDropoff.contactPhone)}" placeholder="Phone number"></div>
-        </div>
-      </div>` : ''}
-      ${outClosed ? `
+        </div>` : `
+        <div class="field" style="max-width:170px;"><label>Check-in time <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="time" id="s_dropoff_time" value="${esc(workingDropoff.time)}"></div>`}
+      </div>
       <div>
-        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(document.getElementById('s_out').value)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
+        ${outClosed ? `
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(outDate)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
         <div class="form-grid c3">
           <div class="field"><label>Pick-up time</label><input type="time" id="s_pickup_time" value="${esc(workingPickup.time)}"></div>
           <div class="field"><label>Contact name</label><input id="s_pickup_name" value="${esc(workingPickup.contactName)}" placeholder="Who's picking up"></div>
           <div class="field"><label>Contact number</label><input id="s_pickup_phone" value="${esc(workingPickup.contactPhone)}" placeholder="Phone number"></div>
-        </div>
-      </div>` : ''}
+        </div>` : `
+        <div class="field" style="max-width:170px;"><label>Check-out time <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="time" id="s_pickup_time" value="${esc(workingPickup.time)}"></div>`}
+      </div>
     </fieldset>`;
   }
   function wireClosedApptInputs(){
@@ -4833,8 +4932,8 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     const { customRate, customRateMode } = readCustomRate('s_rate');
     const payload = {
       checkIn, checkOut, status:document.getElementById('s_status').value, notes:document.getElementById('s_notes').value, customRate, customRateMode, pets:workingPets,
-      dropoff: inClosed ? {...workingDropoff} : null,
-      pickup: outClosed ? {...workingPickup} : null,
+      dropoff: inClosed ? {...workingDropoff} : normalizeClosedAppt({time:workingDropoff.time, contactName:'', contactPhone:''}),
+      pickup: outClosed ? {...workingPickup} : normalizeClosedAppt({time:workingPickup.time, contactName:'', contactPhone:''}),
     };
     const doSave = ()=>{
       let freeResult = { assignedCount:0, movedCount:0, assignedList:[] };
@@ -6428,8 +6527,8 @@ function openCalendarCellModal(roomId, dateStr){
           const idx = ownerPetIndex(o.cust, o.pet);
           const label = isTurnover ? turnoverLabel(o.kind) : (idx?`${idx}. `:'');
           const sharing = !isTurnover && occ.length > 1;
-          const showDropoff = closed && (o.kind==='checkin'||o.kind==='both') && o.stay.dropoff;
-          const showPickup = closed && (o.kind==='checkout'||o.kind==='both') && o.stay.pickup;
+          const showDropoff = (o.kind==='checkin'||o.kind==='both') && o.stay.dropoff;
+          const showPickup = (o.kind==='checkout'||o.kind==='both') && o.stay.pickup;
           return `
         <div class="today-card" data-cal-edit-stay="${o.stay.id}" style="cursor:pointer;">
           <div class="avatar" style="${avatarStyle(calendarColorFor(o.cust.id))}">${initials(o.cust.name)}</div>
@@ -6441,8 +6540,8 @@ function openCalendarCellModal(roomId, dateStr){
               ${sharing?'<span class="badge badge-active">Sharing room</span>':''}
             </div>
             <div class="today-card-sub">${esc(o.cust.name)} · ${esc(o.cust.phone)} · ${fmtDate(o.stay.checkIn)} → ${fmtDate(o.stay.checkOut)}</div>
-            ${showDropoff ? `<div data-cal-edit-closed-appt="${o.stay.id}|dropoff|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Drop-off: ${esc(o.stay.dropoff.time)} · ${esc(o.stay.dropoff.contactName)} (${esc(o.stay.dropoff.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
-            ${showPickup ? `<div data-cal-edit-closed-appt="${o.stay.id}|pickup|${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;color:#A23B2C;">🚫 Pick-up: ${esc(o.stay.pickup.time)} · ${esc(o.stay.pickup.contactName)} (${esc(o.stay.pickup.contactPhone)}) <span style="font-weight:400;text-decoration:underline;">Edit</span></div>` : ''}
+            ${showDropoff ? apptTimeLineHtml(o.stay, 'dropoff', `data-cal-edit-closed-appt="${o.stay.id}|dropoff|${o.cust.id}|${o.pet.id}"`) : ''}
+            ${showPickup ? apptTimeLineHtml(o.stay, 'pickup', `data-cal-edit-closed-appt="${o.stay.id}|pickup|${o.cust.id}|${o.pet.id}"`) : ''}
             <div data-cal-view-pet="${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;text-decoration:underline;color:var(--ink-soft);">View pet's page →</div>
           </div>
           <button class="btn btn-sm btn-danger" data-cal-delete-stay="${o.stay.id}" title="Delete this stay">Delete</button>
@@ -6578,29 +6677,33 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   let cbWorkingDropoff = {time:'09:00', contactName:'', contactPhone:''};
   let cbWorkingPickup = {time:'17:00', contactName:'', contactPhone:''};
   function cbClosedApptSectionHtml(){
-    const inClosed = closedDateFor(document.getElementById('cb_in').value);
-    const outClosed = closedDateFor(document.getElementById('cb_out').value);
-    if(!inClosed && !outClosed) return '';
-    return `<fieldset style="border-color:#EEB3AC;background:#FBE4E2;margin-top:14px;">
-      <legend style="color:#A23B2C;">🚫 Closed-day drop-off / pick-up</legend>
-      ${inClosed ? `
-      <div style="margin-bottom:${outClosed?'12px':'0'};">
-        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(document.getElementById('cb_in').value)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
+    const inDate = document.getElementById('cb_in').value;
+    const outDate = document.getElementById('cb_out').value;
+    const inClosed = closedDateFor(inDate);
+    const outClosed = closedDateFor(outDate);
+    const anyClosed = inClosed || outClosed;
+    return `<fieldset ${anyClosed ? 'style="border-color:#EEB3AC;background:#FBE4E2;margin-top:14px;"' : 'style="margin-top:14px;"'}>
+      <legend ${anyClosed ? 'style="color:#A23B2C;"' : ''}>${anyClosed ? '🚫 Closed-day drop-off / pick-up' : 'Check-in / check-out time (optional)'}</legend>
+      <div style="margin-bottom:12px;">
+        ${inClosed ? `
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-in (${fmtDate(inDate)}) falls on a closed day${inClosed.name?` — ${esc(inClosed.name)}`:''}. Arrange a drop-off appointment:</div>
         <div class="form-grid c3">
           <div class="field"><label>Drop-off time</label><input type="time" id="cb_dropoff_time" value="${esc(cbWorkingDropoff.time)}"></div>
           <div class="field"><label>Contact name</label><input id="cb_dropoff_name" value="${esc(cbWorkingDropoff.contactName)}" placeholder="Who's dropping off"></div>
           <div class="field"><label>Contact number</label><input id="cb_dropoff_phone" value="${esc(cbWorkingDropoff.contactPhone)}" placeholder="Phone number"></div>
-        </div>
-      </div>` : ''}
-      ${outClosed ? `
+        </div>` : `
+        <div class="field" style="max-width:170px;"><label>Check-in time <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="time" id="cb_dropoff_time" value="${esc(cbWorkingDropoff.time)}"></div>`}
+      </div>
       <div>
-        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(document.getElementById('cb_out').value)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
+        ${outClosed ? `
+        <div style="font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:8px;">Check-out (${fmtDate(outDate)}) falls on a closed day${outClosed.name?` — ${esc(outClosed.name)}`:''}. Arrange a pick-up appointment:</div>
         <div class="form-grid c3">
           <div class="field"><label>Pick-up time</label><input type="time" id="cb_pickup_time" value="${esc(cbWorkingPickup.time)}"></div>
           <div class="field"><label>Contact name</label><input id="cb_pickup_name" value="${esc(cbWorkingPickup.contactName)}" placeholder="Who's picking up"></div>
           <div class="field"><label>Contact number</label><input id="cb_pickup_phone" value="${esc(cbWorkingPickup.contactPhone)}" placeholder="Phone number"></div>
-        </div>
-      </div>` : ''}
+        </div>` : `
+        <div class="field" style="max-width:170px;"><label>Check-out time <span style="font-weight:400;color:var(--ink-soft);">(optional)</span></label><input type="time" id="cb_pickup_time" value="${esc(cbWorkingPickup.time)}"></div>`}
+      </div>
     </fieldset>`;
   }
   function cbWireClosedApptInputs(){
@@ -6711,8 +6814,8 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       const newStay = {
         id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, charges:[],
         pets: [stayPet],
-        dropoff: inClosed ? {...cbWorkingDropoff} : null,
-        pickup: outClosed ? {...cbWorkingPickup} : null,
+        dropoff: inClosed ? {...cbWorkingDropoff} : normalizeClosedAppt({time:cbWorkingDropoff.time, contactName:'', contactPhone:''}),
+        pickup: outClosed ? {...cbWorkingPickup} : normalizeClosedAppt({time:cbWorkingPickup.time, contactName:'', contactPhone:''}),
       };
       pet.stays.push(newStay);
       const petWindows = [pet.id, ...cbSharingIds].map(id=>({ petId:id, ...petDatesInStay(newStay, stayPet, id) }));
