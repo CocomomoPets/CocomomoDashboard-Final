@@ -2366,6 +2366,11 @@ function normalizePet(p){
     // text, so staff see them automatically rather than having to remember
     // to read the notes.
     riskFlags: Array.isArray(p?.riskFlags) ? p.riskFlags : [],
+    // Vet clinic + emergency contact (Pain Point #22) — surfaced the same
+    // prominent way risk flags are: pet header, Boarding tab, booking
+    // modal, active-stay card — so it's found in seconds during an actual
+    // emergency instead of requiring a search through paperwork.
+    vetClinic: p?.vetClinic || '', vetPhone: p?.vetPhone || '',
   };
 }
 /* Payments used to link to a single stay via `stayId`. They can now link to
@@ -2743,6 +2748,16 @@ function riskFlagBadgesHtml(pet, compact){
   if(compact) return ` <span title="${pet.riskFlags.map(esc).join(', ')}" style="color:#A23B2C;">⚠️</span>`;
   return pet.riskFlags.map(f=>`<span class="badge" style="background:#FBE4E2;color:#A23B2C;border:1px solid #EEB3AC;margin-left:4px;">⚠️ ${esc(f)}</span>`).join('');
 }
+/* Vet clinic + emergency contact (Pain Point #22) — same "surface it, don't
+   make anyone go dig for it" treatment as riskFlagBadgesHtml above. Shown
+   wherever staff would actually be looking during a real emergency: the
+   pet's own record, the Boarding tab, the New/Edit stay modal (so it's
+   visible during booking too), and the active-stay card. Returns '' if
+   nothing's on file yet, so it never displays an empty/misleading box. */
+function vetInfoLineHtml(pet){
+  if(!pet || (!pet.vetClinic && !pet.vetPhone)) return '';
+  return `<div style="margin-top:6px;font-size:12.5px;font-weight:600;color:#1E6B52;background:#E3F3EC;border:1px solid #B9E1CE;border-radius:8px;padding:6px 10px;display:inline-block;">🚑 Vet: ${esc(pet.vetClinic)||'—'}${pet.vetPhone?` · ${esc(pet.vetPhone)}`:''}</div>`;
+}
 function renderPetTabs(cust, activePet){
   const wrap = document.getElementById('petTabs');
   wrap.innerHTML = cust.pets.map(p=>`
@@ -2778,6 +2793,7 @@ function petInfoHtml(p){
         <div>
           <div class="section-title" style="margin:0;">${ANIMAL_ICON[p.type]||'🐾'} ${petLabel(p)}</div>
           <div style="margin-top:4px;">${riskFlagBadgesHtml(p)}</div>
+          <div>${vetInfoLineHtml(p)}</div>
           <div style="display:flex;gap:8px;margin-top:6px;">
             <button class="btn btn-sm" id="petPhotoUploadBtn">${p.photo?'Change photo':'Add photo'}</button>
             ${p.photo ? `<button class="btn btn-sm btn-danger" id="petPhotoRemoveBtn">Remove</button>` : ''}
@@ -2807,6 +2823,8 @@ function petInfoHtml(p){
         <label>Last tick treatment date</label>
         <div style="max-width:190px;">${dateOverlayHtml('pet_lastTick', p.lastTick||'')}</div>
       </div>
+      <div class="info-field"><label>🚑 Vet clinic</label><input id="pet_vetClinic" value="${esc(p.vetClinic)}" placeholder="Clinic name"></div>
+      <div class="info-field"><label>🚑 Vet phone</label><input id="pet_vetPhone" value="${esc(p.vetPhone)}" placeholder="Phone number"></div>
       <div class="info-field span2"><label>Medical condition</label><div>${esc(p.medical)||'None reported'}</div></div>
       <div class="info-field"><label>Personality</label><div>${esc(p.personality)||'—'}</div></div>
       <div class="info-field span2"><label>Special requests</label><div>${esc(p.special)||'None'}</div></div>
@@ -3093,6 +3111,13 @@ function petBoardingHtml(cust, pet){
         </div>
       </div>
     </div>
+    <div class="cust-card" style="margin-bottom:12px;">
+      <div class="section-title" style="margin:0 0 10px;">🚑 Vet &amp; emergency info</div>
+      <div class="info-grid">
+        <div class="info-field"><label>Vet clinic</label><input id="pet_vetClinic" value="${esc(pet.vetClinic)}" placeholder="Clinic name"></div>
+        <div class="info-field"><label>Vet phone</label><input id="pet_vetPhone" value="${esc(pet.vetPhone)}" placeholder="Phone number"></div>
+      </div>
+    </div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div class="section-title" style="margin:0;">Boarding history</div>
       <button class="btn btn-primary btn-sm" data-act="new-stay">+ New stay</button>
@@ -3156,6 +3181,7 @@ function stayCardHtml(cust, pet, stay){
         return `
         <div class="stay-pet-block">
           <h4>${ANIMAL_ICON[spPet?.type]||'🐾'} ${petLabel(spPet)} ${spPet?.id===pet.id?'<span class="badge badge-active">this pet</span>':''}${riskFlagBadgesHtml(spPet)}</h4>
+          ${vetInfoLineHtml(spPet)}
           <div class="kv-row"><span>Room</span><span>${esc(sp.room)||'Unassigned'}</span></div>
           ${hasOwnDates ? `<div class="kv-row"><span>Dates</span><span>${fmtDateWithDay(myWindow.checkIn)} → ${fmtDateWithDay(myWindow.checkOut)}</span></div>` : ''}
           <div class="kv-row"><span>Sharing with</span><span>${sp.sharingWith.length ? sharingPetLabelsWithDates(ownerCust, stay, sp).join(', ') : 'Not sharing'}</span></div>
@@ -3680,6 +3706,10 @@ function wireSubContentEvents(cust, pet){
   const lastTickEl = root.querySelector('#pet_lastTick');
   if(lastVaxEl){ lastVaxEl.addEventListener('change', ()=>{ pet.lastVax = lastVaxEl.value; toast('Updated'); scheduleSync(); }); wireDateOverlay('pet_lastVax'); }
   if(lastTickEl){ lastTickEl.addEventListener('change', ()=>{ pet.lastTick = lastTickEl.value; toast('Updated'); scheduleSync(); }); wireDateOverlay('pet_lastTick'); }
+  const vetClinicEl = root.querySelector('#pet_vetClinic');
+  const vetPhoneEl = root.querySelector('#pet_vetPhone');
+  if(vetClinicEl) vetClinicEl.addEventListener('change', ()=>{ pet.vetClinic = vetClinicEl.value.trim(); toast('Updated'); scheduleSync(); });
+  if(vetPhoneEl) vetPhoneEl.addEventListener('change', ()=>{ pet.vetPhone = vetPhoneEl.value.trim(); toast('Updated'); scheduleSync(); });
   const editPetBtn = root.querySelector('[data-act="edit-pet"]');
   if(editPetBtn) editPetBtn.addEventListener('click', ()=>openPetModal(cust, pet));
   const delPetBtn = root.querySelector('[data-act="delete-pet"]');
@@ -4617,7 +4647,7 @@ async function checkSignedAgreements(){
 
 /* ---- Pet modal ---- */
 function openPetModal(cust, existing){
-  const p = existing || {id:'', name:'', breed:'', colour:'', type:'Dog', gender:'Male', dob:'', boardingSize:'S', groomingSize:'S', spayed:'Yes', lastVax:'', lastTick:'', medical:'', personality:'', special:'', riskFlags:[]};
+  const p = existing || {id:'', name:'', breed:'', colour:'', type:'Dog', gender:'Male', dob:'', boardingSize:'S', groomingSize:'S', spayed:'Yes', lastVax:'', lastTick:'', medical:'', personality:'', special:'', riskFlags:[], vetClinic:'', vetPhone:''};
   const workingRiskFlags = new Set(p.riskFlags||[]);
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit pet':'Add pet'}</h3><button class="modal-close">✕</button></div>
@@ -4647,6 +4677,8 @@ function openPetModal(cust, existing){
         </div>
         <div class="field"><label>Last vaccination date</label>${dateOverlayHtml('p_vax', p.lastVax||'')}</div>
         <div class="field span2"><label>Last tick treatment date</label>${dateOverlayHtml('p_tick', p.lastTick||'')}</div>
+        <div class="field"><label>🚑 Vet clinic</label><input id="p_vetclinic" value="${esc(p.vetClinic)}" placeholder="Clinic name"></div>
+        <div class="field span2"><label>🚑 Vet phone</label><input id="p_vetphone" value="${esc(p.vetPhone)}" placeholder="Phone number"></div>
         <div class="field span2">
           <label>Risk flags <span style="font-weight:500;color:var(--ink-soft);">(shown as a prominent badge everywhere staff see this pet)</span></label>
           <div class="checks" id="p_riskflags_chips">${RISK_FLAGS.map(f=>`<label class="check-pill" style="cursor:pointer;"><input type="checkbox" value="${esc(f)}" data-riskflag ${workingRiskFlags.has(f)?'checked':''} style="margin-right:4px;">${esc(f)}</label>`).join('')}</div>
@@ -4682,6 +4714,7 @@ function openPetModal(cust, existing){
       lastVax:document.getElementById('p_vax').value, lastTick:document.getElementById('p_tick').value,
       medical:document.getElementById('p_medical').value, personality:document.getElementById('p_pers').value,
       special:document.getElementById('p_special').value, riskFlags,
+      vetClinic:document.getElementById('p_vetclinic').value.trim(), vetPhone:document.getElementById('p_vetphone').value.trim(),
     };
     if(existing){
       logFieldChanges('Pet', {petId: existing.id}, existing.name, existing, data, ['medical','personality','special'], {medical:'Medical condition', personality:'Personality', special:'Special requests'});
@@ -4959,6 +4992,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
         ${workingPets.length>1 ? `<button type="button" class="mini-remove" data-stayrow-remove="${idx}">✕</button>` : ''}
       </div>
       ${riskFlagBadgesHtml(pet) ? `<div style="margin-bottom:8px;">${riskFlagBadgesHtml(pet)}</div>` : ''}
+      ${vetInfoLineHtml(pet) ? `<div style="margin-bottom:8px;">${vetInfoLineHtml(pet)}</div>` : ''}
       ${sharingPickerHtml(`srow_share_${idx}`, sp.sharingWith, null, sp.dates)}
       <div class="field" style="margin-bottom:8px;">
         <label>Feeding instructions (this stay)</label>
@@ -5760,6 +5794,7 @@ function mapPetRow(p, customerId){
     boarding_size: p.boardingSize || null, grooming_size: p.groomingSize || null, spayed: p.spayed || null,
     last_vax: p.lastVax || null, last_tick: p.lastTick || null, medical: p.medical || null,
     personality: p.personality || null, special: p.special || null, risk_flags: p.riskFlags || [],
+    vet_clinic: p.vetClinic || null, vet_phone: p.vetPhone || null,
     // stays now has its own table (18 Aug 2026, Phase 4) — always send empty
     // here so this column stops carrying duplicate/stale data going forward,
     // and so a stays-only edit doesn't spuriously look like a pet-row change
@@ -5812,7 +5847,7 @@ async function loadCustomersPetsFromTables(){
       id: p.id, name: p.name, type: p.type, breed: p.breed, colour: p.colour, gender: p.gender, dob: p.dob,
       boardingSize: p.boarding_size, groomingSize: p.grooming_size, spayed: p.spayed,
       lastVax: p.last_vax, lastTick: p.last_tick, medical: p.medical, personality: p.personality, special: p.special,
-      riskFlags: p.risk_flags || [], photo: p.photo || null,
+      riskFlags: p.risk_flags || [], photo: p.photo || null, vetClinic: p.vet_clinic || '', vetPhone: p.vet_phone || '',
       stays: p.stays || [], groomingHistory: p.grooming_history || [],
     })),
   }));
