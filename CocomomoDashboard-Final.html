@@ -511,6 +511,7 @@
     <button class="btn" id="cancellationsBtn" title="View the log of cancelled grooming appointments and boarding stays">Cancellations</button>
     <button class="btn" id="changeLogBtn" title="Recent edits to prices, dates, and notes — with undo">Change log</button>
     <button class="btn" id="staffBtn" title="Manage staff and their leave dates — shown on the Today grid, Boarding calendar, and Grooming availability">Staff</button>
+    <button class="btn" id="archiveBtn" title="Move old, finished bookings/appointments/payments out of the main tables to keep the app fast — and search them later if needed">Archive</button>
     <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
   </div>
 
@@ -5578,6 +5579,7 @@ document.getElementById('policiesBtn').addEventListener('click', openPoliciesMod
 document.getElementById('cancellationsBtn').addEventListener('click', openCancellationsModal);
 document.getElementById('changeLogBtn').addEventListener('click', openChangeLogModal);
 document.getElementById('staffBtn').addEventListener('click', openStaffModal);
+document.getElementById('archiveBtn').addEventListener('click', openArchiveModal);
 document.getElementById('reportsBtn').addEventListener('click', ()=>openReportsModal());
 document.getElementById('remindersBtn').addEventListener('click', ()=>openRemindersModal());
 function openPoliciesModal(){
@@ -6272,6 +6274,210 @@ async function loadShopConfigFromTables(){
     if(typeof row.large_holiday === 'number') LARGE.holiday = row.large_holiday;
   }
   _lastSyncedShopConfigJSON = JSON.stringify(snapshotShopConfig());
+}
+/* =========================================================
+   ARCHIVING (27 Aug 2026, migration Phase 9 — the final piece of pain
+   point #18). Moves old, FINISHED stays/grooming appointments/payments out
+   of the live tables into matching _archive tables, so a normal page load
+   doesn't keep pulling in every booking ever made as history accumulates —
+   the actual "load time grows indefinitely" problem the original pain
+   point described. Deliberately manual (a button, never automatic/
+   scheduled) and always shows a preview count before touching anything:
+   every earlier migration phase only ever ADDED a new table, so the old
+   blob was always a safety net if something went wrong; this is the first
+   operation in the whole app that deletes rows outright, so it gets extra
+   caution — archive-insert happens first, and live-table delete only runs
+   after every archive insert has succeeded.
+   ========================================================= */
+
+/* Everything in state.customers that qualifies for archiving as of `cutoff`
+   (YYYY-MM-DD, exclusive — anything dated strictly before this qualifies).
+   Only Past stays, grooming already Done & informed/Picked up, and
+   payments whose every linked stay is itself being archived (or, for a
+   payment with no linked stay at all, one dated before the cutoff)
+   qualify — anything Active/in-progress is never included regardless of
+   date. */
+function findArchivableRecords(cutoff){
+  const stays = flattenAllStays(state.customers).filter(({stay}) => stay.status==='Past' && stay.checkOut < cutoff);
+  const archivableStayIds = new Set(stays.map(({stay})=>stay.id));
+  const grooms = flattenAllGrooms(state.customers).filter(({groom}) =>
+    (groom.status==='Done & informed' || groom.status==='Picked up') && groom.date < cutoff);
+  const payments = flattenAllPayments(state.customers).filter(({pmt}) => {
+    const ids = pmt.stayIds || [];
+    if(ids.length === 0) return pmt.date < cutoff;
+    return ids.every(id => archivableStayIds.has(id));
+  });
+  return { stays, grooms, payments };
+}
+/* Actually performs the move: insert into the three archive tables FIRST;
+   only once every archive insert has succeeded does it delete from the
+   live tables and local state. If an insert fails partway through, nothing
+   is deleted — a retry just re-upserts the same rows (idempotent), so a
+   failed attempt never leaves a record missing from both places. */
+async function runArchive({ stays, grooms, payments }){
+  if(!cloudEnabled){ toast('Archiving needs an active cloud connection'); throw new Error('Cloud not connected'); }
+  const nowIso = new Date().toISOString();
+  if(stays.length){
+    const rows = stays.map(({stay, primaryPetId, customerId}) => ({ ...mapStayRow(stay, primaryPetId, customerId), archived_at: nowIso }));
+    const { error } = await sb.from('stays_archive').upsert(rows);
+    if(error) throw error;
+  }
+  if(grooms.length){
+    const rows = grooms.map(({groom, petId, customerId}) => ({ ...mapGroomRow(groom, petId, customerId), archived_at: nowIso }));
+    const { error } = await sb.from('grooming_archive').upsert(rows);
+    if(error) throw error;
+  }
+  if(payments.length){
+    const rows = payments.map(({pmt, customerId}) => ({ ...mapPaymentRow(pmt, customerId), archived_at: nowIso }));
+    const { error } = await sb.from('payments_archive').upsert(rows);
+    if(error) throw error;
+  }
+  const stayIds = new Set(stays.map(({stay})=>stay.id));
+  const groomIds = new Set(grooms.map(({groom})=>groom.id));
+  const paymentIds = new Set(payments.map(({pmt})=>pmt.id));
+  for(const id of stayIds){ const { error } = await sb.from('stays').delete().eq('id', id); if(error) throw error; }
+  for(const id of groomIds){ const { error } = await sb.from('grooming_appointments').delete().eq('id', id); if(error) throw error; }
+  for(const id of paymentIds){ const { error } = await sb.from('payments').delete().eq('id', id); if(error) throw error; }
+  // Reflect it locally right away rather than waiting for a reload, and
+  // update every baseline that tracks these three areas so the next
+  // scheduleSync() doesn't see them as "removed since baseline" and try to
+  // delete them from the live table a second time (harmless — delete is
+  // idempotent — but pointless).
+  state.customers.forEach(c=>c.pets.forEach(p=>{
+    p.stays = (p.stays||[]).filter(s=>!stayIds.has(s.id));
+    p.groomingHistory = (p.groomingHistory||[]).filter(g=>!groomIds.has(g.id));
+  }));
+  state.customers.forEach(c=>{ c.payments = (c.payments||[]).filter(p=>!paymentIds.has(p.id)); });
+  const staysFlatNow = flattenAllStays(state.customers);
+  _lastSyncedStaysJSON = JSON.stringify(staysFlatNow); _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
+  const groomsFlatNow = flattenAllGrooms(state.customers);
+  _lastSyncedGroomsJSON = JSON.stringify(groomsFlatNow); _groomsBaseline = JSON.parse(_lastSyncedGroomsJSON);
+  const paymentsFlatNow = flattenAllPayments(state.customers);
+  _lastSyncedPaymentsJSON = JSON.stringify(paymentsFlatNow); _paymentsBaseline = JSON.parse(_lastSyncedPaymentsJSON);
+}
+function openArchiveModal(){
+  const defaultCutoff = addDays(todayStr(), -365);
+  openModal(`
+    <div class="modal-head"><h3>Archive old records</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
+        Moves finished bookings, grooming appointments, and their payments older than the date below out of the main tables and into a separate archive — keeps the app fast as history grows. Only Past stays, completed grooming (Done &amp; informed / Picked up), and payments tied to those are touched; anything Active or in-progress is never included, regardless of date. Nothing is deleted for good — search archived records anytime below.
+      </div>
+      <div class="field" style="max-width:220px;margin-bottom:12px;">
+        <label>Archive everything before</label>
+        ${dateOverlayHtml('arch_cutoff', defaultCutoff)}
+      </div>
+      <button class="btn" id="archivePreviewBtn">Preview</button>
+      <div id="archivePreviewResult" style="margin-top:14px;"></div>
+      <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--line-soft);">
+        <div style="font-weight:700;font-size:13px;margin-bottom:8px;">Search archived records</div>
+        <input id="arch_search" placeholder="Customer or pet name…" style="width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:7px;margin-bottom:10px;box-sizing:border-box;">
+        <div id="archSearchResults" style="font-size:12.5px;"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn btn-primary hidden" id="archiveConfirmBtn">Archive now</button>
+    </div>
+  `, {wide:true});
+  wireDateOverlay('arch_cutoff');
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  let previewData = null;
+  document.getElementById('archivePreviewBtn').addEventListener('click', ()=>{
+    const cutoff = document.getElementById('arch_cutoff').value;
+    if(!cutoff){ toast('Please pick a cutoff date'); return; }
+    previewData = findArchivableRecords(cutoff);
+    const { stays, grooms, payments } = previewData;
+    const resultBox = document.getElementById('archivePreviewResult');
+    const confirmBtn = document.getElementById('archiveConfirmBtn');
+    if(stays.length + grooms.length + payments.length === 0){
+      resultBox.innerHTML = `<div style="font-size:13px;color:var(--ink-soft);">Nothing qualifies yet — no Past stays, completed grooming, or their payments are dated before ${fmtDate(cutoff)}.</div>`;
+      confirmBtn.classList.add('hidden');
+      return;
+    }
+    resultBox.innerHTML = `
+      <div style="background:var(--panel-2);border:1px solid var(--line-soft);border-radius:8px;padding:12px 14px;font-size:13px;">
+        <div><strong>${stays.length}</strong> stay${stays.length===1?'':'s'} (checked out before ${fmtDate(cutoff)})</div>
+        <div><strong>${grooms.length}</strong> grooming appointment${grooms.length===1?'':'s'} (completed before ${fmtDate(cutoff)})</div>
+        <div><strong>${payments.length}</strong> payment${payments.length===1?'':'s'} (tied only to the above, or undated general payments before ${fmtDate(cutoff)})</div>
+      </div>`;
+    confirmBtn.classList.remove('hidden');
+  });
+  document.getElementById('archiveConfirmBtn').addEventListener('click', async ()=>{
+    if(!previewData) return;
+    if(!confirm(`Archive ${previewData.stays.length} stays, ${previewData.grooms.length} grooming appointments, and ${previewData.payments.length} payments? They'll move to the archive (searchable anytime) and disappear from customer/pet history in the main app.`)) return;
+    const btn = document.getElementById('archiveConfirmBtn');
+    btn.disabled = true; btn.textContent = 'Archiving…';
+    try{
+      await runArchive(previewData);
+      closeModal();
+      render();
+      toast('Archived successfully');
+    }catch(err){
+      console.error('Archiving failed:', err);
+      toast('Archiving failed — see console. Nothing was deleted from the live tables (archive-insert always runs first; live-delete only happens once that succeeds).');
+      btn.disabled = false; btn.textContent = 'Archive now';
+    }
+  });
+  wireArchiveSearch();
+}
+let _archSearchTimer = null;
+function wireArchiveSearch(){
+  const input = document.getElementById('arch_search');
+  input.addEventListener('input', ()=>{
+    clearTimeout(_archSearchTimer);
+    _archSearchTimer = setTimeout(()=>runArchiveSearch(input.value.trim()), 400);
+  });
+}
+/* Read-only lookup into the three archive tables — for the rare case
+   someone needs an old booking/payment after it's been archived (a
+   dispute, a repeat-customer history question). Matches by customer/pet
+   name against the still-live customer records (customers/pets themselves
+   are never archived), then queries the archive tables by customer_id —
+   nothing archived is ever loaded into state, only fetched on demand here. */
+async function runArchiveSearch(query){
+  const resultBox = document.getElementById('archSearchResults');
+  if(!resultBox) return;
+  if(!query){ resultBox.innerHTML = ''; return; }
+  if(!cloudEnabled){ resultBox.innerHTML = `<div style="color:var(--ink-soft);">Search needs an active cloud connection.</div>`; return; }
+  const q = query.toLowerCase();
+  const matchedCustomers = state.customers.filter(c => c.name.toLowerCase().includes(q) || c.pets.some(p=>p.name.toLowerCase().includes(q)));
+  if(matchedCustomers.length===0){ resultBox.innerHTML = `<div style="color:var(--ink-soft);">No customer matches "${esc(query)}".</div>`; return; }
+  const custIds = matchedCustomers.map(c=>c.id);
+  resultBox.innerHTML = `<div style="color:var(--ink-soft);">Searching…</div>`;
+  try{
+    const [stayRes, groomRes, paymentRes] = await Promise.all([
+      sb.from('stays_archive').select('*').in('customer_id', custIds).order('check_out', {ascending:false}),
+      sb.from('grooming_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}),
+      sb.from('payments_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}),
+    ]);
+    if(stayRes.error) throw stayRes.error;
+    if(groomRes.error) throw groomRes.error;
+    if(paymentRes.error) throw paymentRes.error;
+    const custName = id => (getCustomer(id)||{}).name || 'Unknown customer';
+    const petName = id => { const p = findPetById(id); return p ? p.name : 'Unknown pet'; };
+    const parts = [];
+    const stayRows = stayRes.data||[], groomRows = groomRes.data||[], paymentRows = paymentRes.data||[];
+    if(stayRows.length){
+      parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Stays</div>` + stayRows.map(s=>
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(s.customer_id))} · ${esc(petName(s.primary_pet_id))}</div><div class="today-card-sub">${fmtDate(s.check_in)} → ${fmtDate(s.check_out)} · ${esc(s.status)}</div></div></div>`
+      ).join(''));
+    }
+    if(groomRows.length){
+      parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Grooming</div>` + groomRows.map(g=>
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(g.customer_id))} · ${esc(petName(g.pet_id))}</div><div class="today-card-sub">${fmtDate(g.date)} ${esc(g.time||'')} · ${esc(g.status)}</div></div></div>`
+      ).join(''));
+    }
+    if(paymentRows.length){
+      parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Payments</div>` + paymentRows.map(p=>
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(p.customer_id))} · RM ${(+p.amount||0).toFixed(2)}</div><div class="today-card-sub">${fmtDate(p.date)} · ${esc(p.type)}</div></div></div>`
+      ).join(''));
+    }
+    resultBox.innerHTML = parts.length ? parts.join('') : `<div style="color:var(--ink-soft);">No archived records found for matching customer(s).</div>`;
+  }catch(err){
+    console.error('Archive search failed:', err);
+    resultBox.innerHTML = `<div style="color:var(--ink-soft);">Search failed — see console.</div>`;
+  }
 }
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
