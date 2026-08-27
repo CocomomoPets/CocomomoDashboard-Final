@@ -584,6 +584,10 @@ let _lastSyncedGroomsJSON = null; // 23 Aug 2026 migration — grooming tracked 
 let _groomsBaseline = []; // last-known flattened grooming list as reflected in the grooming_appointments table
 let _lastSyncedPaymentsJSON = null; // 23 Aug 2026 migration — payments tracked separately too, see syncPaymentsToTables()
 let _paymentsBaseline = []; // last-known flattened payments list as reflected in the payments table
+let _lastSyncedChangeLogJSON = null; // 27 Aug 2026 migration (Phase 7) — change log tracked separately too, see syncChangeLogToTables()
+let _changeLogBaseline = []; // last-known state.changeLog as reflected in the change_log table
+let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — cancellations tracked separately too, see syncCancellationsToTables()
+let _cancellationsBaseline = []; // last-known state.cancellations as reflected in the cancellations table
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -802,6 +806,16 @@ async function loadFromCloud(){
       // state.customers first, then load the authoritative copy.
       await migratePaymentsFromCustomersColumnIfNeeded(state.customers);
       await loadPaymentsFromTables();
+      // Change log & Cancellations (27 Aug 2026, Phase 7) — unlike the
+      // phases above these were always flat global lists (not nested per
+      // customer/pet), so the migration source is simply whatever's still
+      // sitting in the just-loaded blob (data.data.changeLog/.cancellations)
+      // — no flatten step needed. Same "migrate once, then load the
+      // authoritative copy" pattern as everywhere else.
+      await migrateChangeLogFromBlobIfNeeded(data.data.changeLog);
+      await loadChangeLogFromTables();
+      await migrateCancellationsFromBlobIfNeeded(data.data.cancellations);
+      await loadCancellationsFromTables();
       // Re-apply the same "pick a sensible selected customer/pet" step
       // hydrateStateFromRemote() already did — needed again since
       // state.customers just got replaced with the tables-loaded copy.
@@ -832,8 +846,6 @@ function snapshotForCloud(){
   return {
     shopName: state.shopName, rates: state.rates,
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
-    cancellations: state.cancellations,
-    changeLog: state.changeLog,
     staff: state.staff,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
@@ -869,6 +881,8 @@ async function saveToCloudNow(){
   const groomsJson = JSON.stringify(groomsFlat);
   const paymentsFlat = flattenAllPayments(state.customers);
   const paymentsJson = JSON.stringify(paymentsFlat);
+  const changeLogJson = JSON.stringify(state.changeLog||[]);
+  const cancellationsJson = JSON.stringify(state.cancellations||[]);
 
   // One "unit" per synced entity — each independently tracks whether it
   // changed, how to sync it, and how to commit its new baseline once synced.
@@ -889,6 +903,12 @@ async function saveToCloudNow(){
     { changed: paymentsJson !== _lastSyncedPaymentsJSON,
       run: ()=>syncPaymentsToTables(_paymentsBaseline, paymentsFlat),
       commit: ()=>{ _lastSyncedPaymentsJSON = paymentsJson; _paymentsBaseline = JSON.parse(paymentsJson); } },
+    { changed: changeLogJson !== _lastSyncedChangeLogJSON,
+      run: ()=>syncChangeLogToTables(_changeLogBaseline, state.changeLog||[]),
+      commit: ()=>{ _lastSyncedChangeLogJSON = changeLogJson; _changeLogBaseline = JSON.parse(changeLogJson); } },
+    { changed: cancellationsJson !== _lastSyncedCancellationsJSON,
+      run: ()=>syncCancellationsToTables(_cancellationsBaseline, state.cancellations||[]),
+      commit: ()=>{ _lastSyncedCancellationsJSON = cancellationsJson; _cancellationsBaseline = JSON.parse(cancellationsJson); } },
     { changed: json !== _lastSyncedJSON,
       run: async ()=>{
         const result = await withTimeout(
@@ -2564,7 +2584,7 @@ function renderCustomersMain(){
       state.customers = state.customers.filter(c=>c.id!==cust.id);
       state.selectedCustomerId = state.customers[0]?.id || null;
       state.selectedPetId = state.selectedCustomerId ? getCustomer(state.selectedCustomerId).pets[0]?.id : null;
-      render(); toast('Customer deleted');
+      render(); scheduleSync(); toast('Customer deleted');
     }
   });
   document.getElementById('addPaymentBtn').addEventListener('click', ()=>openPaymentModal(cust));
@@ -2580,14 +2600,14 @@ function renderCustomersMain(){
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
       cust.authorizedPickups = (cust.authorizedPickups||[]).filter(a=>a.id!==btn.dataset.delPickup);
-      renderCustomersMain(); toast('Removed');
+      renderCustomersMain(); scheduleSync(); toast('Removed');
     });
   });
   document.querySelectorAll('[data-del-payment]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
       cust.payments = cust.payments.filter(p=>p.id!==btn.dataset.delPayment);
-      renderCustomersMain(); toast('Payment removed');
+      renderCustomersMain(); scheduleSync(); toast('Payment removed');
     });
   });
   document.querySelectorAll('[data-edit-payment-btn]').forEach(btn=>{
@@ -2624,7 +2644,7 @@ function renderCustomersMain(){
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
       cust.pointsHistory = cust.pointsHistory.filter(p=>p.id!==btn.dataset.delPoints);
-      renderCustomersMain(); toast('Points entry removed');
+      renderCustomersMain(); scheduleSync(); toast('Points entry removed');
     });
   });
   document.querySelectorAll('[data-edit-points]').forEach(row=>{
@@ -3606,6 +3626,7 @@ function wireSubContentEvents(cust, pet){
       cust.pets = cust.pets.filter(p=>p.id!==pet.id);
       state.selectedPetId = cust.pets[0]?.id || null;
       renderCustomersMain();
+      scheduleSync();
       toast('Pet deleted');
     }
   });
@@ -3619,6 +3640,7 @@ function wireSubContentEvents(cust, pet){
         pet.photo = await compressImage(file, 500, 0.8);
         renderPetSubContent(cust, pet);
         renderPetTabs(cust, pet);
+        scheduleSync();
         toast('Photo added');
       }catch(err){ console.error(err); toast('Could not read that image'); }
     });
@@ -3628,6 +3650,7 @@ function wireSubContentEvents(cust, pet){
     pet.photo = null;
     renderPetSubContent(cust, pet);
     renderPetTabs(cust, pet);
+    scheduleSync();
     toast('Photo removed');
   });
   const viewPetPhoto = root.querySelector('[data-view-pet-photo]');
@@ -3693,7 +3716,7 @@ function wireSubContentEvents(cust, pet){
       e.stopPropagation();
       const owner = findPaymentOwner(btn.dataset.delPayment) || cust;
       owner.payments = owner.payments.filter(p=>p.id!==btn.dataset.delPayment);
-      renderPetSubContent(cust, pet); toast('Payment removed');
+      renderPetSubContent(cust, pet); scheduleSync(); toast('Payment removed');
     });
   });
   root.querySelectorAll('[data-edit-payment]').forEach(row=>{
@@ -3897,14 +3920,14 @@ function wireSubContentEvents(cust, pet){
       const val = input.value.trim();
       if(!val) return;
       const { slot } = findStayAndSlot(stayId, petId);
-      if(slot){ slot.belongings.push({item:val, photo:null}); renderPetSubContent(cust, pet); toast('Belonging added'); }
+      if(slot){ slot.belongings.push({item:val, photo:null}); renderPetSubContent(cust, pet); scheduleSync(); toast('Belonging added'); }
     });
   });
   root.querySelectorAll('[data-remove-belonging-inline]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const [stayId, petId, idx] = btn.dataset.removeBelongingInline.split(':');
       const { slot } = findStayAndSlot(stayId, petId);
-      if(slot){ slot.belongings.splice(+idx,1); renderPetSubContent(cust, pet); toast('Belonging removed'); }
+      if(slot){ slot.belongings.splice(+idx,1); renderPetSubContent(cust, pet); scheduleSync(); toast('Belonging removed'); }
     });
   });
   root.querySelectorAll('[data-attach-belonging]').forEach(btn=>{
@@ -4071,6 +4094,7 @@ function wireSubContentEvents(cust, pet){
       }
       input.value = '';
       renderPetSubContent(cust, pet);
+      scheduleSync();
       toast('Photo added');
     });
   });
@@ -4088,7 +4112,7 @@ function wireSubContentEvents(cust, pet){
       const [groomId, idx] = btn.dataset.removePhoto.split(':');
       const g = pet.groomingHistory.find(g=>g.id===groomId);
       g.photos.splice(+idx,1);
-      renderPetSubContent(cust, pet); toast('Photo removed');
+      renderPetSubContent(cust, pet); scheduleSync(); toast('Photo removed');
     });
   });
 }
@@ -4207,7 +4231,7 @@ function openCustomerModal(existing){
       existing.emergencyPhone=document.getElementById('f_ephone').value;
       existing.customerTypes=customerTypes;
       if(existing.id !== phone){ existing.id = phone; }
-      closeModal(); render();
+      closeModal(); render(); scheduleSync();
       if(!wasMembership && isMembershipCustomer(existing)){
         toast('Membership added — set their starting points balance');
         openPointsModal(existing);
@@ -4223,7 +4247,7 @@ function openCustomerModal(existing){
         customerTypes, payments:[], agreement:null, agreementToken:null, colorOverride:null, pointsHistory:[], pets:[] };
       state.customers.push(nc);
       state.selectedCustomerId = nc.id; state.selectedPetId = null;
-      closeModal(); render(); toast('Customer added');
+      closeModal(); render(); scheduleSync(); toast('Customer added');
       if(isMembershipCustomer(nc)){
         toast('New membership customer — set their starting points balance');
         openPointsModal(nc);
@@ -4337,7 +4361,7 @@ function openPickupModal(cust, existing){
   if(existing){
     document.getElementById('delBtn').addEventListener('click', ()=>{
       cust.authorizedPickups = (cust.authorizedPickups||[]).filter(x=>x.id!==existing.id);
-      closeModal(); renderCustomersMain(); toast('Removed');
+      closeModal(); renderCustomersMain(); scheduleSync(); toast('Removed');
     });
   }
   document.getElementById('saveBtn').addEventListener('click', ()=>{
@@ -4394,7 +4418,7 @@ function openPointsModal(cust, existing){
     };
     if(existing){ Object.assign(existing, data); }
     else{ cust.pointsHistory.push({ id:uid('pts'), ...data }); }
-    closeModal(); renderCustomersMain(); toast(existing?'Points entry updated':'Points updated');
+    closeModal(); renderCustomersMain(); scheduleSync(); toast(existing?'Points entry updated':'Points updated');
   });
 }
 
@@ -4475,7 +4499,7 @@ function openAgreementModal(cust){
       policyTextSnapshot: state.policyText,
       signatureDataUrl: pad.isEmpty() ? null : pad.dataUrl(),
     };
-    closeModal(); renderCustomersMain(); toast('Agreement signed');
+    closeModal(); renderCustomersMain(); scheduleSync(); toast('Agreement signed');
   });
 }
 
@@ -4525,7 +4549,7 @@ async function checkSignedAgreements(){
         changed = true;
       }
     });
-    if(changed){ render(); toast('A remote signature came in'); }
+    if(changed){ render(); scheduleSync(); toast('A remote signature came in'); }
   }catch(err){ console.error('checkSignedAgreements failed', err); }
 }
 
@@ -4602,7 +4626,7 @@ function openPetModal(cust, existing){
       Object.assign(existing, data);
     }
     else{ const np = {...data, id:uid('pet'), photo:null, stays:[], groomingHistory:[]}; cust.pets.push(np); state.selectedPetId = np.id; }
-    closeModal(); renderCustomersMain(); toast(existing?'Pet updated':'Pet added');
+    closeModal(); renderCustomersMain(); scheduleSync(); toast(existing?'Pet updated':'Pet added');
   });
 }
 
@@ -4969,7 +4993,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
         const petWindows = workingPets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(newStay, w, id) })));
         freeResult = assignFreeGroomings(cust, petWindows);
       }
-      closeModal(); onSaved();
+      closeModal(); onSaved(); scheduleSync();
       if(freeResult.assignedCount > 0){
         toast(`Stay ${existing?'updated':'created'} — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
         openFreeGroomingSummaryModal(freeResult.assignedList);
@@ -5219,6 +5243,7 @@ function openGroomModal(cust, pet, existing, opts){
     if(existing){
       Object.assign(existing, { date, ...basePayload });
       if(opts.onDone){ opts.onDone(); } else { closeModal(); if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render(); }
+      scheduleSync();
       toast('Appointment updated');
       return;
     }
@@ -5228,6 +5253,7 @@ function openGroomModal(cust, pet, existing, opts){
       pet.groomingHistory.push({ id:uid('groom'), photos:[], date, ...basePayload });
       closeModal();
       if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render();
+      scheduleSync();
       toast('Appointment booked');
       return;
     }
@@ -6049,6 +6075,123 @@ async function syncPaymentsToTables(baseline, current){
     }
   }
 }
+/* Change log & Cancellations — migrated to real Postgres tables (27 Aug
+   2026, migration Phase 7). Unlike stays/grooming/payments, these two were
+   always flat global lists (not nested inside customers/pets), so there's
+   no flatten/unflatten step — the table mirrors state.changeLog/
+   state.cancellations directly, and the migration source is whatever's
+   still sitting in the last blob save that had them (read once, same as
+   staff/customers before it). `ref`, `old_value`, and `new_value` are
+   stored as jsonb (not text) so a changed value keeps its original type —
+   a price stays a number, not a stringified one — across a save/reload. */
+function mapChangeLogRow(e){
+  return {
+    id: e.id, ts: e.ts, entity_type: e.entityType, ref: e.ref || {}, entity_label: e.entityLabel || '',
+    field: e.field, field_label: e.fieldLabel || e.field, old_value: e.oldValue ?? '', new_value: e.newValue ?? '', undone: !!e.undone,
+  };
+}
+async function migrateChangeLogFromBlobIfNeeded(blobChangeLog){
+  const { count, error } = await sb.from('change_log').select('*', {count:'exact', head:true});
+  if(error){ console.error('Change log migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  const list = Array.isArray(blobChangeLog) ? blobChangeLog : [];
+  if(!list.length) return;
+  const rows = list.map(mapChangeLogRow);
+  const { error: insErr } = await sb.from('change_log').insert(rows);
+  if(insErr){ console.error('Change log migration insert failed:', insErr); toast('Change log migration failed — see console. Old data is untouched.'); }
+}
+/* Loads the change log from the table (newest 300, matching the in-memory
+   cap logChange() has always enforced) and normalizes each row back into
+   the same shape logChange()/undoChange() expect. Also resets
+   `_changeLogBaseline`. */
+async function loadChangeLogFromTables(){
+  const { data: rows, error } = await sb.from('change_log').select('*').order('ts', {ascending:false}).limit(300);
+  if(error){ console.error('Change log load failed:', error); toast('Change log failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  state.changeLog = (rows||[]).map(r=>({
+    id: r.id, ts: r.ts, entityType: r.entity_type, ref: r.ref || {}, entityLabel: r.entity_label || '',
+    field: r.field, fieldLabel: r.field_label || r.field, oldValue: r.old_value, newValue: r.new_value, undone: !!r.undone,
+  }));
+  _lastSyncedChangeLogJSON = JSON.stringify(state.changeLog);
+  _changeLogBaseline = JSON.parse(_lastSyncedChangeLogJSON);
+}
+/* Diffs `baseline` against `current` (both the flat state.changeLog list)
+   and writes only the entries that actually changed — new entries get
+   inserted, an undone entry's `undone` flip gets upserted, and anything
+   that dropped off the in-memory 300-cap gets deleted to match. Same
+   upsert/delete pattern as everywhere else — safe to blindly retry. */
+async function syncChangeLogToTables(baseline, current){
+  const baseById = new Map(baseline.map(e=>[e.id, e]));
+  const curIds = new Set(current.map(e=>e.id));
+  for(const e of baseline){
+    if(!curIds.has(e.id)){
+      const { error } = await sb.from('change_log').delete().eq('id', e.id);
+      if(error) throw error;
+    }
+  }
+  for(const e of current){
+    const old = baseById.get(e.id);
+    const row = mapChangeLogRow(e);
+    const oldRow = old ? mapChangeLogRow(old) : null;
+    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { error } = await sb.from('change_log').upsert(row);
+      if(error) throw error;
+    }
+  }
+}
+function mapCancellationRow(c){
+  return {
+    id: c.id, type: c.type, reason: c.reason || '', note: c.note || '', cancelled_at: c.cancelledAt,
+    customer_name: c.customerName || '', pet_name: c.petName || '', summary: c.summary || '',
+  };
+}
+async function migrateCancellationsFromBlobIfNeeded(blobCancellations){
+  const { count, error } = await sb.from('cancellations').select('*', {count:'exact', head:true});
+  if(error){ console.error('Cancellations migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  const list = Array.isArray(blobCancellations) ? blobCancellations : [];
+  if(!list.length) return;
+  const rows = list.map(mapCancellationRow);
+  const { error: insErr } = await sb.from('cancellations').insert(rows);
+  if(insErr){ console.error('Cancellations migration insert failed:', insErr); toast('Cancellations migration failed — see console. Old data is untouched.'); }
+}
+/* Loads every cancellation from the table, newest first (this log has no
+   in-memory cap, unlike the change log — it's meant to be reviewed monthly
+   per the manager's routine, not truncated). Also resets
+   `_cancellationsBaseline`. */
+async function loadCancellationsFromTables(){
+  const { data: rows, error } = await sb.from('cancellations').select('*').order('cancelled_at', {ascending:false});
+  if(error){ console.error('Cancellations load failed:', error); toast('Cancellations failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  state.cancellations = (rows||[]).map(r=>({
+    id: r.id, type: r.type, reason: r.reason || '', note: r.note || '', cancelledAt: r.cancelled_at,
+    customerName: r.customer_name || '', petName: r.pet_name || '', summary: r.summary || '',
+  }));
+  _lastSyncedCancellationsJSON = JSON.stringify(state.cancellations);
+  _cancellationsBaseline = JSON.parse(_lastSyncedCancellationsJSON);
+}
+/* Diffs `baseline` against `current` (both the flat state.cancellations
+   list) and writes only what changed — in practice this log is
+   append-only (nothing ever edits or removes a past cancellation), so this
+   will almost always just be inserts, but the same generic diff pattern is
+   kept for consistency and safety. */
+async function syncCancellationsToTables(baseline, current){
+  const baseById = new Map(baseline.map(c=>[c.id, c]));
+  const curIds = new Set(current.map(c=>c.id));
+  for(const c of baseline){
+    if(!curIds.has(c.id)){
+      const { error } = await sb.from('cancellations').delete().eq('id', c.id);
+      if(error) throw error;
+    }
+  }
+  for(const c of current){
+    const old = baseById.get(c.id);
+    const row = mapCancellationRow(c);
+    const oldRow = old ? mapCancellationRow(old) : null;
+    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { error } = await sb.from('cancellations').upsert(row);
+      if(error) throw error;
+    }
+  }
+}
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
    — Today grid, Boarding calendar, Grooming availability — via
@@ -6296,7 +6439,7 @@ function openRatesModal(){
     });
     state.closedDates = workingClosed.filter(c=>c.start && c.end);
     state.closedWeekdays = Array.from(document.querySelectorAll('[data-closed-weekday]:checked')).map(cb=>+cb.value);
-    closeModal(); render(); toast('Rates & holidays saved');
+    closeModal(); render(); scheduleSync(); toast('Rates & holidays saved');
   });
 }
 
@@ -7138,7 +7281,7 @@ function openFullBookingModal(prefTime, prefBay){
       sizeCode:document.getElementById('b_size').value, cutCode:document.getElementById('b_cutcode').value, details:document.getElementById('b_details').value,
       addons, photos:[], status:'Not arrived', notes:document.getElementById('b_notes').value, customerId:cust.id, petId:pet.id,
     });
-    closeModal(); state.groomingDate = date; renderGroomingAvailability(); toast('Appointment booked');
+    closeModal(); state.groomingDate = date; renderGroomingAvailability(); scheduleSync(); toast('Appointment booked');
   });
 }
 
@@ -7152,11 +7295,12 @@ document.getElementById('custSearch').addEventListener('input', renderSidebarOrH
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
 document.getElementById('backupBtn').addEventListener('click', ()=>{
-  // Customers/pets moved out of snapshotForCloud() (18 Aug 2026 migration) —
-  // it's no longer part of what's pushed to the blob table, since it lives
-  // in its own tables now. A backup file still needs to be a COMPLETE,
-  // standalone snapshot for disaster recovery, so it's added back in here.
-  const snapshot = { ...snapshotForCloud(), customers: state.customers };
+  // Customers/pets/change-log/cancellations moved out of snapshotForCloud()
+  // over the course of the migration — none of them are part of what's
+  // pushed to the blob table anymore, since each lives in its own table
+  // now. A backup file still needs to be a COMPLETE, standalone snapshot
+  // for disaster recovery, so they're all added back in here.
+  const snapshot = { ...snapshotForCloud(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
   const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
