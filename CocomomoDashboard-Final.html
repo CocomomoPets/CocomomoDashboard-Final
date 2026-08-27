@@ -506,14 +506,11 @@
     </div>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
-    <button class="btn" id="remindersBtn" title="Tomorrow's grooming appointments and boarding checkouts, with a ready-to-send WhatsApp message for each">Reminders</button>
-    <button class="btn" id="reportsBtn" title="View monthly revenue, occupancy, and grooming report">Reports</button>
-    <button class="btn" id="cancellationsBtn" title="View the log of cancelled grooming appointments and boarding stays">Cancellations</button>
-    <button class="btn" id="changeLogBtn" title="Recent edits to prices, dates, and notes — with undo">Change log</button>
+    <button class="btn" id="scheduleBtn" title="Reminders for tomorrow's appointments/checkouts, and the monthly revenue/occupancy report">Reminders &amp; Reports</button>
+    <button class="btn" id="historyBtn" title="Recent edits (with undo) and the log of cancelled appointments/stays">Change log &amp; Cancellations</button>
     <button class="btn" id="staffBtn" title="Manage staff and their leave dates — shown on the Today grid, Boarding calendar, and Grooming availability">Staff</button>
     <button class="btn" id="archiveBtn" title="Move old, finished bookings/appointments/payments out of the main tables to keep the app fast — and search them later if needed">Archive</button>
-    <button class="btn" id="backupBtn" title="Download a backup of all data as a file">Download backup</button>
-    <button class="btn" id="backupHistoryBtn" title="Browse and download the last 30 automatic daily backups">Backup history</button>
+    <button class="btn" id="backupBtn" title="Download a backup now, or browse/download the last 30 automatic daily backups">Backup</button>
   </div>
 
   <div class="body">
@@ -1578,11 +1575,30 @@ function changeLogValueDisplay(v){
   if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return fmtDate(s);
   return s.length > 70 ? esc(s.slice(0,70))+'…' : esc(s);
 }
+/* Small in-modal tab switcher, styled to match the app's main top-level
+   tabs (.tab-btn) so it doesn't look like a new UI pattern. `tabs` is
+   [{label, active, onClick}] — used to let a few pairs of related modals
+   (Change log/Cancellations, Reminders/Reports) share one topbar button
+   instead of two, since flipping between them is just re-opening the
+   sibling modal (cheap — same pattern used for prev/next month|day nav
+   already in Reports/Reminders). */
+function subTabRowHtml(id, tabs){
+  return `<div id="${id}" style="display:flex;gap:6px;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:10px;padding:4px;margin-bottom:16px;">
+    ${tabs.map((t,i)=>`<button type="button" class="tab-btn${t.active?' active':''}" data-subtab-idx="${i}" style="flex:1;">${esc(t.label)}</button>`).join('')}
+  </div>`;
+}
+function wireSubTabRow(id, tabs){
+  document.querySelectorAll(`#${id} [data-subtab-idx]`).forEach(btn=>{
+    const t = tabs[+btn.dataset.subtabIdx];
+    if(!t.active) btn.addEventListener('click', t.onClick);
+  });
+}
 function openChangeLogModal(){
   const list = (state.changeLog || []).slice(0, 150);
   openModal(`
     <div class="modal-head"><h3>Change log</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('histTabs', [{label:'Change log', active:true}, {label:'Cancellations', active:false, onClick:()=>openCancellationsModal()}])}
       <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;">Recent edits to stay dates/rates, charges, payments, and pet notes — most recent first. Undo writes the old value back (and logs that as a new entry, so nothing is silently erased).</div>
       ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No changes logged yet.</div>` : list.map(e=>`
         <div class="today-card" style="cursor:default;">
@@ -1599,6 +1615,7 @@ function openChangeLogModal(){
       <button class="btn btn-primary" id="cancelBtn">Close</button>
     </div>
   `);
+  wireSubTabRow('histTabs', [{active:true}, {active:false, onClick:()=>openCancellationsModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.querySelectorAll('[data-undo-change]').forEach(btn=>{
     btn.addEventListener('click', ()=> undoChange(btn.dataset.undoChange));
@@ -1610,6 +1627,7 @@ function openCancellationsModal(){
   openModal(`
     <div class="modal-head"><h3>Cancellations</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('histTabs', [{label:'Change log', active:false, onClick:()=>openChangeLogModal()}, {label:'Cancellations', active:true}])}
       ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No cancellations recorded yet.</div>` : list.map(c=>`
         <div class="today-card" style="cursor:default;">
           <div class="today-card-main">
@@ -1625,6 +1643,7 @@ function openCancellationsModal(){
       <button class="btn btn-primary" id="cancelBtn">Close</button>
     </div>
   `);
+  wireSubTabRow('histTabs', [{active:false, onClick:()=>openChangeLogModal()}, {active:true}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
 }
 
@@ -1802,6 +1821,7 @@ function openReportsModal(monthStr){
   openModal(`
     <div class="modal-head"><h3>Monthly report</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:false, onClick:()=>openRemindersModal()}, {label:'Reports', active:true}])}
       <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
         <button class="btn btn-sm" id="reportPrevMonth">‹</button>
         <div style="font-weight:700;font-size:15px;">${monthLabel}</div>
@@ -1846,6 +1866,7 @@ function openReportsModal(monthStr){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('reportPrevMonth').addEventListener('click', ()=>openReportsModal(prevMonth));
   document.getElementById('reportNextMonth').addEventListener('click', ()=>openReportsModal(nextMonth));
+  wireSubTabRow('schedTabs', [{active:false, onClick:()=>openRemindersModal()}, {active:true}]);
 }
 function addMonthsToMonthStr(monthStr, delta){
   const [y,m] = monthStr.split('-').map(Number);
@@ -1975,6 +1996,7 @@ function openRemindersModal(dateStr){
   openModal(`
     <div class="modal-head"><h3>Reminders</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:true}, {label:'Reports', active:false, onClick:()=>openReportsModal()}])}
       <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
         <button class="btn btn-sm" id="remPrevDay">‹</button>
         <div style="font-weight:700;font-size:15px;">${r.dayLabel}</div>
@@ -1999,6 +2021,7 @@ function openRemindersModal(dateStr){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('remPrevDay').addEventListener('click', ()=>openRemindersModal(prevDate));
   document.getElementById('remNextDay').addEventListener('click', ()=>openRemindersModal(nextDate));
+  wireSubTabRow('schedTabs', [{active:true}, {active:false, onClick:()=>openReportsModal()}]);
   function findItem(key){ return allItems.find((it,i)=>itemKey(it,i)===key); }
   document.querySelectorAll('[data-copy-reminder]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
@@ -5581,12 +5604,10 @@ function bayOptionsHtml(date, time, selectedBay, excludeId){
    ========================================================= */
 document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
-document.getElementById('cancellationsBtn').addEventListener('click', openCancellationsModal);
-document.getElementById('changeLogBtn').addEventListener('click', openChangeLogModal);
+document.getElementById('historyBtn').addEventListener('click', openChangeLogModal);
 document.getElementById('staffBtn').addEventListener('click', openStaffModal);
 document.getElementById('archiveBtn').addEventListener('click', openArchiveModal);
-document.getElementById('reportsBtn').addEventListener('click', ()=>openReportsModal());
-document.getElementById('remindersBtn').addEventListener('click', ()=>openRemindersModal());
+document.getElementById('scheduleBtn').addEventListener('click', ()=>openRemindersModal());
 function openPoliciesModal(){
   openModal(`
     <div class="modal-head"><h3>Boarding policies</h3><button class="modal-close">✕</button></div>
@@ -6614,10 +6635,12 @@ async function pruneOldAutoBackups(){
    backup". Fetches the list fresh every time the modal opens rather than
    relying on anything cached in state, since these are meant to be a
    trustworthy record independent of whatever's currently in memory. */
-async function openBackupHistoryModal(){
+async function openBackupModal(){
   openModal(`
-    <div class="modal-head"><h3>Backup history</h3><button class="modal-close">✕</button></div>
+    <div class="modal-head"><h3>Backup</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      <button class="btn btn-primary" id="downloadNowBtn" style="width:100%;margin-bottom:18px;">Download backup now</button>
+      <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Backup history</div>
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
         One automatic snapshot per day, kept for the last 30 days — written the first time the dashboard is opened each day, no action needed. Click Download on any date to get that day's exact backup file.
       </div>
@@ -6628,6 +6651,11 @@ async function openBackupHistoryModal(){
     </div>
   `);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('downloadNowBtn').addEventListener('click', ()=>{
+    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    downloadBackupFile(snapshotForBackup(), stamp);
+    toast('Backup downloaded');
+  });
   const listBox = document.getElementById('backupHistoryList');
   if(!cloudEnabled){ listBox.innerHTML = `<div>Backup history needs an active cloud connection.</div>`; return; }
   try{
@@ -7782,12 +7810,7 @@ function downloadBackupFile(snapshot, filenameStamp){
   a.remove();
   URL.revokeObjectURL(url);
 }
-document.getElementById('backupBtn').addEventListener('click', ()=>{
-  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
-  downloadBackupFile(snapshotForBackup(), stamp);
-  toast('Backup downloaded');
-});
-document.getElementById('backupHistoryBtn').addEventListener('click', openBackupHistoryModal);
+document.getElementById('backupBtn').addEventListener('click', openBackupModal);
 
 let _pendingBelongingTarget = null;
 document.getElementById('belongingFileInput').addEventListener('change', async (e)=>{
