@@ -1513,7 +1513,7 @@ function logCancellation(type, reason, note, cust, pet, summary){
   state.cancellations.unshift({
     id: uid('cancel'), type, reason, note,
     cancelledAt: new Date().toISOString(),
-    customerName: cust ? cust.name : '', petName: pet ? petLabel(pet) : '',
+    customerId: cust ? cust.id : null, customerName: cust ? cust.name : '', petName: pet ? petLabel(pet) : '',
     summary,
   });
 }
@@ -1622,12 +1622,62 @@ function openChangeLogModal(){
   });
 }
 
-function openCancellationsModal(){
+/* Shared "click this card, jump to that customer's record, close the
+   modal" wiring — used by both the Lapsed customers and Repeat cancellers
+   panels, since it's the exact same interaction in both places. */
+function wireJumpToCustomerCards(selector){
+  document.querySelectorAll(selector).forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const custId = el.dataset.jumpCustomer;
+      const cust = getCustomer(custId);
+      if(!cust) return;
+      state.activeTab='customers'; state.selectedCustomerId = custId; state.selectedPetId = cust.pets?.[0]?.id || null;
+      closeModal();
+      render();
+    });
+  });
+}
+/* Pain Point #13: cancellations were logged one-by-one with no pattern
+   surfaced across them. Groups state.cancellations by customer (matching
+   by customerId when the record has one; older cancellations logged
+   before customerId existed fall back to matching by customerName) within
+   the last `months`, and returns anyone at or above `minCount` — sorted
+   most-cancellations-first. */
+function computeRepeatCancellers(months, minCount){
+  const cutoff = addMonths(todayStr(), -months);
+  const groups = new Map();
+  (state.cancellations||[]).forEach(c=>{
+    if(c.cancelledAt.slice(0,10) < cutoff) return;
+    const key = c.customerId || `name:${c.customerName}`;
+    if(!groups.has(key)) groups.set(key, { customerId: c.customerId, customerName: c.customerName, count:0, entries: [] });
+    const g = groups.get(key);
+    g.count++;
+    g.entries.push(c);
+  });
+  return Array.from(groups.values()).filter(g=>g.count >= minCount).sort((a,b)=> b.count - a.count);
+}
+function openCancellationsModal(minCount){
+  minCount = minCount || 2;
+  const cancelMonths = 6;
   const list = state.cancellations || [];
+  const repeaters = computeRepeatCancellers(cancelMonths, minCount);
   openModal(`
     <div class="modal-head"><h3>Cancellations</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       ${subTabRowHtml('histTabs', [{label:'Change log', active:false, onClick:()=>openChangeLogModal()}, {label:'Cancellations', active:true}])}
+      <div style="font-weight:700;font-size:13px;margin-bottom:6px;">🔁 Repeat cancellers (last ${cancelMonths} months)</div>
+      <div style="display:flex;gap:6px;margin-bottom:12px;">
+        ${[2,3,5].map(n=>`<button class="btn btn-sm ${n===minCount?'btn-primary':''}" data-cancel-threshold="${n}">${n}+ cancellations</button>`).join('')}
+      </div>
+      ${repeaters.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);margin-bottom:18px;">No customer has ${minCount}+ cancellations in the last ${cancelMonths} months.</div>` : repeaters.map(g=>`
+        <div class="today-card" ${g.customerId?`data-jump-customer="${g.customerId}"`:'style="cursor:default;"'}>
+          <div class="today-card-main">
+            <div class="today-card-pet">${esc(g.customerName)||'Unknown customer'} <span class="badge badge-past">${g.count} cancellations</span></div>
+            <div class="today-card-sub">${g.entries.map(e=>`${e.type} · ${fmtDate(e.cancelledAt.slice(0,10))} · ${esc(e.reason)}`).join(' · ')}</div>
+          </div>
+        </div>
+      `).join('')}
+      <div style="font-weight:700;font-size:13px;margin:18px 0 6px;">All cancellations</div>
       ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No cancellations recorded yet.</div>` : list.map(c=>`
         <div class="today-card" style="cursor:default;">
           <div class="today-card-main">
@@ -1645,6 +1695,10 @@ function openCancellationsModal(){
   `);
   wireSubTabRow('histTabs', [{active:false, onClick:()=>openChangeLogModal()}, {active:true}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-cancel-threshold]').forEach(btn=>{
+    btn.addEventListener('click', ()=> openCancellationsModal(+btn.dataset.cancelThreshold));
+  });
+  wireJumpToCustomerCards('[data-jump-customer]');
 }
 
 /* Monthly operations report — revenue breakdown, room occupancy %, grooming
@@ -1919,7 +1973,7 @@ function openLapsedCustomersModal(months){
         ${[3,6,12].map(m=>`<button class="btn btn-sm ${m===months?'btn-primary':''}" data-lapsed-months="${m}">${m} months</button>`).join('')}
       </div>
       ${results.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No lapsed customers at the ${months}-month mark.</div>` : results.map(r=>`
-        <div class="today-card" data-jump-lapsed="${r.cust.id}">
+        <div class="today-card" data-jump-customer="${r.cust.id}">
           <div class="today-card-main">
             <div class="today-card-pet">${esc(r.cust.name)}</div>
             <div class="today-card-sub">${esc(r.cust.phone)}</div>
@@ -1937,14 +1991,7 @@ function openLapsedCustomersModal(months){
   document.querySelectorAll('[data-lapsed-months]').forEach(btn=>{
     btn.addEventListener('click', ()=> openLapsedCustomersModal(+btn.dataset.lapsedMonths));
   });
-  document.querySelectorAll('[data-jump-lapsed]').forEach(el=>{
-    el.addEventListener('click', ()=>{
-      const cust = getCustomer(el.dataset.jumpLapsed);
-      state.activeTab='customers'; state.selectedCustomerId = el.dataset.jumpLapsed; state.selectedPetId = cust?.pets?.[0]?.id || null;
-      closeModal();
-      render();
-    });
-  });
+  wireJumpToCustomerCards('[data-jump-customer]');
 }
 
 /* Turns a stored contact number into the digits-only format wa.me needs
@@ -6310,7 +6357,7 @@ async function syncChangeLogToTables(baseline, current){
 function mapCancellationRow(c){
   return {
     id: c.id, type: c.type, reason: c.reason || '', note: c.note || '', cancelled_at: c.cancelledAt,
-    customer_name: c.customerName || '', pet_name: c.petName || '', summary: c.summary || '',
+    customer_id: c.customerId || null, customer_name: c.customerName || '', pet_name: c.petName || '', summary: c.summary || '',
   };
 }
 async function migrateCancellationsFromBlobIfNeeded(blobCancellations){
@@ -6332,7 +6379,7 @@ async function loadCancellationsFromTables(){
   if(error){ console.error('Cancellations load failed:', error); toast('Cancellations failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   state.cancellations = (rows||[]).map(r=>({
     id: r.id, type: r.type, reason: r.reason || '', note: r.note || '', cancelledAt: r.cancelled_at,
-    customerName: r.customer_name || '', petName: r.pet_name || '', summary: r.summary || '',
+    customerId: r.customer_id || null, customerName: r.customer_name || '', petName: r.pet_name || '', summary: r.summary || '',
   }));
   _lastSyncedCancellationsJSON = JSON.stringify(state.cancellations);
   _cancellationsBaseline = JSON.parse(_lastSyncedCancellationsJSON);
