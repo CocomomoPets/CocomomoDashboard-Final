@@ -6460,23 +6460,110 @@ async function runArchiveSearch(query){
     const stayRows = stayRes.data||[], groomRows = groomRes.data||[], paymentRows = paymentRes.data||[];
     if(stayRows.length){
       parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Stays</div>` + stayRows.map(s=>
-        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(s.customer_id))} · ${esc(petName(s.primary_pet_id))}</div><div class="today-card-sub">${fmtDate(s.check_in)} → ${fmtDate(s.check_out)} · ${esc(s.status)}</div></div></div>`
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(s.customer_id))} · ${esc(petName(s.primary_pet_id))}</div><div class="today-card-sub">${fmtDate(s.check_in)} → ${fmtDate(s.check_out)} · ${esc(s.status)}</div></div><button class="btn btn-sm" data-restore-archived="stay|${s.id}">Restore</button></div>`
       ).join(''));
     }
     if(groomRows.length){
       parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Grooming</div>` + groomRows.map(g=>
-        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(g.customer_id))} · ${esc(petName(g.pet_id))}</div><div class="today-card-sub">${fmtDate(g.date)} ${esc(g.time||'')} · ${esc(g.status)}</div></div></div>`
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(g.customer_id))} · ${esc(petName(g.pet_id))}</div><div class="today-card-sub">${fmtDate(g.date)} ${esc(g.time||'')} · ${esc(g.status)}</div></div><button class="btn btn-sm" data-restore-archived="groom|${g.id}">Restore</button></div>`
       ).join(''));
     }
     if(paymentRows.length){
       parts.push(`<div style="font-weight:700;margin:10px 0 4px;">Payments</div>` + paymentRows.map(p=>
-        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(p.customer_id))} · RM ${(+p.amount||0).toFixed(2)}</div><div class="today-card-sub">${fmtDate(p.date)} · ${esc(p.type)}</div></div></div>`
+        `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(custName(p.customer_id))} · RM ${(+p.amount||0).toFixed(2)}</div><div class="today-card-sub">${fmtDate(p.date)} · ${esc(p.type)}</div></div><button class="btn btn-sm" data-restore-archived="payment|${p.id}">Restore</button></div>`
       ).join(''));
     }
     resultBox.innerHTML = parts.length ? parts.join('') : `<div style="color:var(--ink-soft);">No archived records found for matching customer(s).</div>`;
+    resultBox.querySelectorAll('[data-restore-archived]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const [kind, id] = btn.dataset.restoreArchived.split('|');
+        btn.disabled = true; btn.textContent = 'Restoring…';
+        await restoreArchivedRecord(kind, id);
+      });
+    });
   }catch(err){
     console.error('Archive search failed:', err);
     resultBox.innerHTML = `<div style="color:var(--ink-soft);">Search failed — see console.</div>`;
+  }
+}
+/* Reverses a single archived record: reads it back from the archive table,
+   re-inserts it into the correct live table AND the matching spot in
+   state.customers (found via findPetById/getCustomer — the pet/customer
+   record itself is never archived, so this only fails if the pet/customer
+   was separately deleted since archiving), then removes it from the
+   archive table. Same archive-insert-order caution doesn't apply here in
+   reverse — the live-table upsert happens first, so a failure partway
+   through leaves the record in BOTH places rather than neither, which is
+   the safer failure mode for a restore (worst case: run it again, or
+   delete the archive copy by hand once you've confirmed it's back). */
+async function restoreArchivedRecord(kind, id){
+  if(!cloudEnabled){ toast('Restoring needs an active cloud connection'); return; }
+  try{
+    if(kind==='stay'){
+      const { data: row, error } = await sb.from('stays_archive').select('*').eq('id', id).maybeSingle();
+      if(error) throw error;
+      if(!row){ toast('Could not find that archived stay'); return; }
+      const pet = findPetById(row.primary_pet_id);
+      if(!pet){ toast('The pet this stay belonged to no longer exists — cannot restore'); return; }
+      const stay = normalizeStay({
+        id: row.id, checkIn: row.check_in, checkOut: row.check_out, status: row.status,
+        checkedIn: row.checked_in, checkedInPets: row.checked_in_pets || [],
+        notes: row.notes || '', customRate: row.custom_rate, customRateMode: row.custom_rate_mode || 'flat',
+        charges: row.charges || [], pets: row.pets || [], dropoff: row.dropoff || null, pickup: row.pickup || null,
+        paidThrough: row.paid_through || null, remindersSent: row.reminders_sent || {checkin:[],checkout:[]},
+      });
+      const { error: upErr } = await sb.from('stays').upsert(mapStayRow(stay, pet.id, row.customer_id));
+      if(upErr) throw upErr;
+      const { error: delErr } = await sb.from('stays_archive').delete().eq('id', id);
+      if(delErr) throw delErr;
+      pet.stays = [...(pet.stays||[]), stay];
+      const staysFlatNow = flattenAllStays(state.customers);
+      _lastSyncedStaysJSON = JSON.stringify(staysFlatNow); _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
+    } else if(kind==='groom'){
+      const { data: row, error } = await sb.from('grooming_archive').select('*').eq('id', id).maybeSingle();
+      if(error) throw error;
+      if(!row){ toast('Could not find that archived appointment'); return; }
+      const pet = findPetById(row.pet_id);
+      if(!pet){ toast('The pet this appointment belonged to no longer exists — cannot restore'); return; }
+      const groom = normalizeGroom({
+        id: row.id, date: row.date, time: row.time || '', bay: row.bay || '', apptTypes: row.appt_types || [],
+        sizeCode: row.size_code || '', cutCode: row.cut_code || '', details: row.details || '',
+        addons: row.addons || [], photos: row.photos || [], notes: row.notes || '', status: row.status,
+        groomColor: row.groom_color || null, reminderSent: !!row.reminder_sent,
+        customerId: row.customer_id, petId: row.pet_id,
+      });
+      const { error: upErr } = await sb.from('grooming_appointments').upsert(mapGroomRow(groom, pet.id, row.customer_id));
+      if(upErr) throw upErr;
+      const { error: delErr } = await sb.from('grooming_archive').delete().eq('id', id);
+      if(delErr) throw delErr;
+      pet.groomingHistory = [...(pet.groomingHistory||[]), groom];
+      const groomsFlatNow = flattenAllGrooms(state.customers);
+      _lastSyncedGroomsJSON = JSON.stringify(groomsFlatNow); _groomsBaseline = JSON.parse(_lastSyncedGroomsJSON);
+    } else if(kind==='payment'){
+      const { data: row, error } = await sb.from('payments_archive').select('*').eq('id', id).maybeSingle();
+      if(error) throw error;
+      if(!row){ toast('Could not find that archived payment'); return; }
+      const cust = getCustomer(row.customer_id);
+      if(!cust){ toast('That customer no longer exists — cannot restore'); return; }
+      const pmt = normalizePayment({
+        id: row.id, type: row.type, amount: row.amount, date: row.date,
+        receiptNo: row.receipt_no || '', stayIds: row.stay_ids || [],
+      });
+      const { error: upErr } = await sb.from('payments').upsert(mapPaymentRow(pmt, cust.id));
+      if(upErr) throw upErr;
+      const { error: delErr } = await sb.from('payments_archive').delete().eq('id', id);
+      if(delErr) throw delErr;
+      cust.payments = [...(cust.payments||[]), pmt];
+      const paymentsFlatNow = flattenAllPayments(state.customers);
+      _lastSyncedPaymentsJSON = JSON.stringify(paymentsFlatNow); _paymentsBaseline = JSON.parse(_lastSyncedPaymentsJSON);
+    }
+    render();
+    toast('Restored to the live app');
+    const searchInput = document.getElementById('arch_search');
+    if(searchInput && searchInput.value.trim()) runArchiveSearch(searchInput.value.trim());
+  }catch(err){
+    console.error('Restore failed:', err);
+    toast('Restore failed — see console. Nothing was removed from the archive unless the live-table copy was written successfully first.');
   }
 }
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
