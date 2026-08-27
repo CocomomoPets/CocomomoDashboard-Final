@@ -588,6 +588,7 @@ let _lastSyncedChangeLogJSON = null; // 27 Aug 2026 migration (Phase 7) — chan
 let _changeLogBaseline = []; // last-known state.changeLog as reflected in the change_log table
 let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — cancellations tracked separately too, see syncCancellationsToTables()
 let _cancellationsBaseline = []; // last-known state.cancellations as reflected in the cancellations table
+let _lastSyncedShopConfigJSON = null; // 27 Aug 2026 migration (Phase 8) — shop config tracked separately too, see the shop_config unit in saveToCloudNow()
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -816,6 +817,14 @@ async function loadFromCloud(){
       await loadChangeLogFromTables();
       await migrateCancellationsFromBlobIfNeeded(data.data.cancellations);
       await loadCancellationsFromTables();
+      // Shop config (27 Aug 2026, Phase 8 — the last data area for pain
+      // point #18) — same "migrate once from the last blob save, then load
+      // the authoritative copy" pattern, but a singleton row instead of a
+      // list. Reads data.data directly (not a sub-field) since these were
+      // always top-level fields on the blob, not nested under a key of
+      // their own.
+      await migrateShopConfigFromBlobIfNeeded(data.data);
+      await loadShopConfigFromTables();
       // Re-apply the same "pick a sensible selected customer/pet" step
       // hydrateStateFromRemote() already did — needed again since
       // state.customers just got replaced with the tables-loaded copy.
@@ -842,13 +851,26 @@ async function loadFromCloud(){
   }
 }
 
-function snapshotForCloud(){
+/* Shop config (rates, surcharges, holidays, closed dates/weekdays, policy
+   text, the Deluxe-Large custom rate) — migrated to a real Postgres table
+   (27 Aug 2026, migration Phase 8, the last data area for pain point #18).
+   Unlike everything before it this is a single settings object, not a list
+   of independent rows, so it gets one singleton row (id = WORKSPACE_ID,
+   same convention as the old blob table) rather than a flatten/diff — the
+   whole row is just re-upserted whenever any field in it changes, same
+   pattern the blob save itself already used. */
+function snapshotShopConfig(){
   return {
     shopName: state.shopName, rates: state.rates,
-    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
-    staff: state.staff,
+    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL,
+    holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
+  };
+}
+function snapshotForCloud(){
+  return {
+    staff: state.staff, // kept here as a harmless fallback copy, same reasoning as the customers/staff fallback lines in hydrateStateFromRemote — staff already lives authoritatively in its own tables (Phase 1)
   };
 }
 
@@ -883,6 +905,7 @@ async function saveToCloudNow(){
   const paymentsJson = JSON.stringify(paymentsFlat);
   const changeLogJson = JSON.stringify(state.changeLog||[]);
   const cancellationsJson = JSON.stringify(state.cancellations||[]);
+  const shopConfigJson = JSON.stringify(snapshotShopConfig());
 
   // One "unit" per synced entity — each independently tracks whether it
   // changed, how to sync it, and how to commit its new baseline once synced.
@@ -909,6 +932,16 @@ async function saveToCloudNow(){
     { changed: cancellationsJson !== _lastSyncedCancellationsJSON,
       run: ()=>syncCancellationsToTables(_cancellationsBaseline, state.cancellations||[]),
       commit: ()=>{ _lastSyncedCancellationsJSON = cancellationsJson; _cancellationsBaseline = JSON.parse(cancellationsJson); } },
+    { changed: shopConfigJson !== _lastSyncedShopConfigJSON,
+      run: async ()=>{
+        const result = await withTimeout(
+          sb.from('shop_config').upsert(mapShopConfigRow(JSON.parse(shopConfigJson))),
+          10000, 'timeout'
+        );
+        if(result === 'timeout') throw new Error('Connection timed out');
+        if(result.error) throw result.error;
+      },
+      commit: ()=>{ _lastSyncedShopConfigJSON = shopConfigJson; } },
     { changed: json !== _lastSyncedJSON,
       run: async ()=>{
         const result = await withTimeout(
@@ -6192,6 +6225,54 @@ async function syncCancellationsToTables(baseline, current){
     }
   }
 }
+function mapShopConfigRow(cfg){
+  return {
+    id: WORKSPACE_ID, shop_name: cfg.shopName, rates: cfg.rates,
+    surcharge_sm: cfg.surchargeSM, surcharge_lxl: cfg.surchargeLXL,
+    holidays: cfg.holidays, closed_dates: cfg.closedDates, closed_weekdays: cfg.closedWeekdays,
+    policy_text: cfg.policyText, large_normal: cfg.LARGE_normal, large_holiday: cfg.LARGE_holiday,
+    updated_at: new Date().toISOString(),
+  };
+}
+/* One-time, safe-to-run-repeatedly: if the table's still empty and the just-
+   loaded blob still has these fields (from the very last blob save that
+   still wrote them), copies them into the new singleton row. blobData is
+   the raw `data.data` object from the blob load — same source every other
+   phase's migration function reads from. */
+async function migrateShopConfigFromBlobIfNeeded(blobData){
+  const { count, error } = await sb.from('shop_config').select('*', {count:'exact', head:true});
+  if(error){ console.error('Shop config migration check failed:', error); return; }
+  if(count > 0) return; // already migrated — never overwrite
+  if(!blobData || blobData.rates == null) return; // nothing to migrate from
+  const cfg = {
+    shopName: blobData.shopName, rates: blobData.rates,
+    surchargeSM: blobData.surchargeSM, surchargeLXL: blobData.surchargeLXL,
+    holidays: blobData.holidays, closedDates: blobData.closedDates, closedWeekdays: blobData.closedWeekdays,
+    policyText: blobData.policyText, LARGE_normal: blobData.LARGE_normal, LARGE_holiday: blobData.LARGE_holiday,
+  };
+  const { error: insErr } = await sb.from('shop_config').insert(mapShopConfigRow(cfg));
+  if(insErr){ console.error('Shop config migration insert failed:', insErr); toast('Shop config migration failed — see console. Old data is untouched.'); }
+}
+/* Loads the single shop_config row and applies it onto state/LARGE. Also
+   resets `_lastSyncedShopConfigJSON` so the next save only sends something
+   if a field actually changed from here. */
+async function loadShopConfigFromTables(){
+  const { data: row, error } = await sb.from('shop_config').select('*').eq('id', WORKSPACE_ID).maybeSingle();
+  if(error){ console.error('Shop config load failed:', error); toast('Shop settings failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(row){
+    state.shopName = row.shop_name ?? state.shopName;
+    state.rates = row.rates ?? state.rates;
+    state.surchargeSM = row.surcharge_sm ?? state.surchargeSM;
+    state.surchargeLXL = row.surcharge_lxl ?? state.surchargeLXL;
+    state.holidays = row.holidays ?? state.holidays;
+    state.closedDates = row.closed_dates ?? state.closedDates;
+    state.closedWeekdays = row.closed_weekdays ?? state.closedWeekdays;
+    state.policyText = row.policy_text ?? state.policyText;
+    if(typeof row.large_normal === 'number') LARGE.normal = row.large_normal;
+    if(typeof row.large_holiday === 'number') LARGE.holiday = row.large_holiday;
+  }
+  _lastSyncedShopConfigJSON = JSON.stringify(snapshotShopConfig());
+}
 /* Staff & leave management (13 Aug 2026): a simple staff list, each with
    zero or more leave date ranges. Leave shown wherever staff schedule work
    — Today grid, Boarding calendar, Grooming availability — via
@@ -7295,12 +7376,13 @@ document.getElementById('custSearch').addEventListener('input', renderSidebarOrH
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
 document.getElementById('backupBtn').addEventListener('click', ()=>{
-  // Customers/pets/change-log/cancellations moved out of snapshotForCloud()
-  // over the course of the migration — none of them are part of what's
-  // pushed to the blob table anymore, since each lives in its own table
-  // now. A backup file still needs to be a COMPLETE, standalone snapshot
-  // for disaster recovery, so they're all added back in here.
-  const snapshot = { ...snapshotForCloud(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
+  // Customers/pets/change-log/cancellations/shop-config moved out of
+  // snapshotForCloud() over the course of the migration — none of them are
+  // part of what's pushed to the blob table anymore, since each lives in
+  // its own table now. A backup file still needs to be a COMPLETE,
+  // standalone snapshot for disaster recovery, so they're all added back
+  // in here.
+  const snapshot = { ...snapshotForCloud(), ...snapshotShopConfig(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
   const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type:'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
