@@ -1821,7 +1821,7 @@ function openReportsModal(monthStr){
   openModal(`
     <div class="modal-head"><h3>Monthly report</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:false, onClick:()=>openRemindersModal()}, {label:'Reports', active:true}])}
+      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:false, onClick:()=>openRemindersModal()}, {label:'Reports', active:true}, {label:'Lapsed customers', active:false, onClick:()=>openLapsedCustomersModal()}])}
       <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
         <button class="btn btn-sm" id="reportPrevMonth">‹</button>
         <div style="font-weight:700;font-size:15px;">${monthLabel}</div>
@@ -1866,12 +1866,85 @@ function openReportsModal(monthStr){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('reportPrevMonth').addEventListener('click', ()=>openReportsModal(prevMonth));
   document.getElementById('reportNextMonth').addEventListener('click', ()=>openReportsModal(nextMonth));
-  wireSubTabRow('schedTabs', [{active:false, onClick:()=>openRemindersModal()}, {active:true}]);
+  wireSubTabRow('schedTabs', [{active:false, onClick:()=>openRemindersModal()}, {active:true}, {active:false, onClick:()=>openLapsedCustomersModal()}]);
 }
 function addMonthsToMonthStr(monthStr, delta){
   const [y,m] = monthStr.split('-').map(Number);
   const d = new Date(y, m-1+delta, 1);
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+}
+/* Pain Point #6: customers who've gone quiet get no flag at all right now
+   — this is that flag. A customer qualifies as "lapsed" only if they have
+   SOME booking history (never conflating "hasn't come back in a while"
+   with "hasn't booked their first visit yet" — a brand-new customer isn't
+   lapsed) AND nothing upcoming or currently active (a customer mid-stay,
+   or with a future booking already on the books, isn't lapsed just
+   because their LAST stay happened to end a while ago). `lastActivity` is
+   the most recent date across every stay (by check-out) and grooming
+   appointment across all of the customer's pets. */
+function computeLapsedCustomers(monthsThreshold){
+  const cutoff = addMonths(todayStr(), -monthsThreshold);
+  const today = todayStr();
+  const results = [];
+  state.customers.forEach(cust=>{
+    let lastActivity = null, hasAnyHistory = false, hasUpcomingOrActive = false;
+    cust.pets.forEach(pet=>{
+      (pet.stays||[]).forEach(s=>{
+        hasAnyHistory = true;
+        const d = s.checkOut || s.checkIn;
+        if(!lastActivity || d > lastActivity) lastActivity = d;
+        if(s.status==='Active' || s.checkOut >= today) hasUpcomingOrActive = true;
+      });
+      (pet.groomingHistory||[]).forEach(g=>{
+        hasAnyHistory = true;
+        if(!lastActivity || g.date > lastActivity) lastActivity = g.date;
+        if(g.date >= today && g.status!=='Picked up' && g.status!=='Done & informed') hasUpcomingOrActive = true;
+      });
+    });
+    if(!hasAnyHistory || hasUpcomingOrActive) return;
+    if(lastActivity < cutoff) results.push({ cust, lastActivity });
+  });
+  results.sort((a,b)=> a.lastActivity.localeCompare(b.lastActivity)); // longest-gone first
+  return results;
+}
+function openLapsedCustomersModal(months){
+  months = months || 3;
+  const results = computeLapsedCustomers(months);
+  openModal(`
+    <div class="modal-head"><h3>Lapsed customers</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:false, onClick:()=>openRemindersModal()}, {label:'Reports', active:false, onClick:()=>openReportsModal()}, {label:'Lapsed customers', active:true}])}
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Customers with no boarding stay or grooming appointment (past or upcoming) in the last ${months} months — worth a win-back message. New customers who haven't booked their first visit yet aren't included.</div>
+      <div style="display:flex;gap:6px;margin-bottom:14px;">
+        ${[3,6,12].map(m=>`<button class="btn btn-sm ${m===months?'btn-primary':''}" data-lapsed-months="${m}">${m} months</button>`).join('')}
+      </div>
+      ${results.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No lapsed customers at the ${months}-month mark.</div>` : results.map(r=>`
+        <div class="today-card" data-jump-lapsed="${r.cust.id}">
+          <div class="today-card-main">
+            <div class="today-card-pet">${esc(r.cust.name)}</div>
+            <div class="today-card-sub">${esc(r.cust.phone)}</div>
+            <div class="today-card-sub">Last visit: ${fmtDateWithDay(r.lastActivity)}</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  wireSubTabRow('schedTabs', [{active:false, onClick:()=>openRemindersModal()}, {active:false, onClick:()=>openReportsModal()}, {active:true}]);
+  document.querySelectorAll('[data-lapsed-months]').forEach(btn=>{
+    btn.addEventListener('click', ()=> openLapsedCustomersModal(+btn.dataset.lapsedMonths));
+  });
+  document.querySelectorAll('[data-jump-lapsed]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const cust = getCustomer(el.dataset.jumpLapsed);
+      state.activeTab='customers'; state.selectedCustomerId = el.dataset.jumpLapsed; state.selectedPetId = cust?.pets?.[0]?.id || null;
+      closeModal();
+      render();
+    });
+  });
 }
 
 /* Turns a stored contact number into the digits-only format wa.me needs
@@ -1996,7 +2069,7 @@ function openRemindersModal(dateStr){
   openModal(`
     <div class="modal-head"><h3>Reminders</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:true}, {label:'Reports', active:false, onClick:()=>openReportsModal()}])}
+      ${subTabRowHtml('schedTabs', [{label:'Reminders', active:true}, {label:'Reports', active:false, onClick:()=>openReportsModal()}, {label:'Lapsed customers', active:false, onClick:()=>openLapsedCustomersModal()}])}
       <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:16px;">
         <button class="btn btn-sm" id="remPrevDay">‹</button>
         <div style="font-weight:700;font-size:15px;">${r.dayLabel}</div>
@@ -2021,7 +2094,7 @@ function openRemindersModal(dateStr){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('remPrevDay').addEventListener('click', ()=>openRemindersModal(prevDate));
   document.getElementById('remNextDay').addEventListener('click', ()=>openRemindersModal(nextDate));
-  wireSubTabRow('schedTabs', [{active:true}, {active:false, onClick:()=>openReportsModal()}]);
+  wireSubTabRow('schedTabs', [{active:true}, {active:false, onClick:()=>openReportsModal()}, {active:false, onClick:()=>openLapsedCustomersModal()}]);
   function findItem(key){ return allItems.find((it,i)=>itemKey(it,i)===key); }
   document.querySelectorAll('[data-copy-reminder]').forEach(btn=>{
     btn.addEventListener('click', async ()=>{
