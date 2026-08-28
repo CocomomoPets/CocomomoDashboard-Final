@@ -504,6 +504,7 @@
     <div id="syncStatus" class="sync-status sync-off">
       <span class="sync-dot"></span><span class="sync-label">Cloud sync not set up</span>
     </div>
+    <button class="btn" id="enquiryBtn" title="Quick nights &amp; price estimate for an unconfirmed enquiry — nothing here is saved">Enquiry calculator</button>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
     <button class="btn" id="scheduleBtn" title="Reminders for tomorrow's appointments/checkouts, and the monthly revenue/occupancy report">Reminders &amp; Reports</button>
@@ -5756,6 +5757,7 @@ function bayOptionsHtml(date, time, selectedBay, excludeId){
 /* =========================================================
    RATES & HOLIDAYS MODAL
    ========================================================= */
+document.getElementById('enquiryBtn').addEventListener('click', openEnquiryModal);
 document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
 document.getElementById('historyBtn').addEventListener('click', openChangeLogModal);
@@ -6960,6 +6962,166 @@ function openStaffModal(){
       saveBtn.disabled = false; saveBtn.textContent = 'Save';
     }
   });
+}
+
+/* Quick enquiry calculator — nights + estimated price for a NOT-YET-CONFIRMED
+   customer. Reads live rates/surcharges/holidays from state so it's always in
+   sync with Rates & Holidays, but never creates or saves anything anywhere. */
+function openEnquiryModal(){
+  let roomKind = 'dogdeluxe'; // 'dogdeluxe' | 'Suite room' | 'Royal Suite' | 'Cat Deluxe'
+  let pets = [{ size:'S' }]; // pets[0] = main pet (room rate only); rest pay sharing surcharge
+
+  function petRowHtml(p, i){
+    return `<div class="pet-row" data-prow="${i}" style="display:flex;align-items:center;gap:8px;padding:7px 0;${i>0?'border-top:1px solid var(--line-soft);':''}">
+      <span style="font-size:12px;color:var(--ink-soft);white-space:nowrap;min-width:112px;">${i===0?'Pet 1 (room rate)':`Pet ${i+1} (+surcharge)`}</span>
+      <select data-p-size style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
+        ${PET_SIZES.map(s=>`<option value="${s}" ${p.size===s?'selected':''}>${s}${['S','M'].includes(s)?'':''}</option>`).join('')}
+      </select>
+      ${i>0?`<button type="button" class="mini-remove" data-p-remove="${i}">✕</button>`:''}
+    </div>`;
+  }
+
+  openModal(`
+    <div class="modal-head"><h3>Enquiry calculator</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="background:var(--teal-tint,#E3ECF8);border-radius:8px;padding:9px 12px;font-size:12.5px;color:var(--teal-dark,#144A87);margin-bottom:14px;">
+        For working out a quote before anything is confirmed — nothing entered here is saved.
+      </div>
+      <div class="form-grid">
+        <div class="field"><label>Check-in</label>${dateOverlayHtml('enq_checkin', todayStr())}</div>
+        <div class="field"><label>Check-out</label>${dateOverlayHtml('enq_checkout', addDays(todayStr(),1))}</div>
+        <div class="field span2"><label>Room type</label>
+          <select id="enq_room">
+            <option value="dogdeluxe">Dog Deluxe</option>
+            <option value="Suite room">Suite room</option>
+            <option value="Royal Suite">Royal Suite</option>
+            <option value="Cat Deluxe">Cat Deluxe</option>
+          </select>
+        </div>
+      </div>
+      <fieldset>
+        <legend>Pets sharing this room <span style="font-weight:400;color:var(--ink-soft);">— size determines rate (Dog Deluxe) and any sharing surcharge</span></legend>
+        <div id="enqPetRows">${pets.map(petRowHtml).join('')}</div>
+        <button type="button" class="add-line" id="enqAddPet">+ Add another pet sharing</button>
+      </fieldset>
+      <div id="enqResult"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="enqCloseBtn">Close</button>
+    </div>
+  `, {wide:true});
+
+  wireDateOverlay('enq_checkin');
+  wireDateOverlay('enq_checkout');
+
+  function refreshPetRows(){
+    document.getElementById('enqPetRows').innerHTML = pets.map(petRowHtml).join('');
+    wirePetRows();
+    calc();
+  }
+  function wirePetRows(){
+    document.querySelectorAll('#enqPetRows [data-prow]').forEach(row=>{
+      const i = +row.dataset.prow;
+      row.querySelector('[data-p-size]').addEventListener('change', e=>{ pets[i].size = e.target.value; calc(); });
+    });
+    document.querySelectorAll('[data-p-remove]').forEach(btn=>{
+      btn.addEventListener('click', ()=>{ pets.splice(+btn.dataset.pRemove,1); refreshPetRows(); });
+    });
+  }
+  document.getElementById('enqAddPet').addEventListener('click', ()=>{
+    pets.push({ size:'S' });
+    refreshPetRows();
+  });
+  document.getElementById('enq_room').addEventListener('change', e=>{ roomKind = e.target.value; calc(); });
+  document.getElementById('enq_checkin').addEventListener('change', calc);
+  document.getElementById('enq_checkout').addEventListener('change', calc);
+  document.getElementById('enqCloseBtn').addEventListener('click', closeModal);
+
+  function calc(){
+    const ci = document.getElementById('enq_checkin').value;
+    const co = document.getElementById('enq_checkout').value;
+    const box = document.getElementById('enqResult');
+    if(!ci || !co){
+      box.innerHTML = `<div style="color:var(--ink-soft);font-size:13px;padding:10px 2px;">Enter both dates to see nights &amp; an estimate.</div>`;
+      return;
+    }
+    const nights = nightsBetween(ci, co);
+    if(nights<=0){
+      box.innerHTML = `<div style="color:var(--danger);font-size:13px;padding:10px 2px;">Check-out must be after check-in.</div>`;
+      return;
+    }
+
+    // Rate lookup, mirroring computeStayCost()'s logic exactly.
+    function rateForNight(dateStr){
+      const holiday = isHoliday(dateStr);
+      let rate;
+      if(roomKind==='dogdeluxe'){
+        const anyLarge = pets.some(p=>['L','XL','XXL'].includes(p.size));
+        rate = anyLarge ? LARGE : state.rates['Dog Deluxe (Bottom)'];
+      } else {
+        rate = state.rates[roomKind];
+      }
+      if(!rate) rate = {normal:0, holiday:0};
+      return { holiday, amount: holiday ? rate.holiday : rate.normal, rate };
+    }
+
+    let normalNights=0, holidayNights=0, normalRate=0, holidayRate=0, roomTotal=0;
+    for(let n=0;n<nights;n++){
+      const dateStr = addDays(ci, n);
+      const { holiday, amount, rate } = rateForNight(dateStr);
+      roomTotal += amount;
+      if(holiday){ holidayNights++; holidayRate = rate.holiday; } else { normalNights++; normalRate = rate.normal; }
+    }
+
+    // Sharing surcharge — every pet after the first, per night, by its own size.
+    const extraPets = pets.slice(1);
+    let surchargeTotal = 0;
+    const surchargeLines = [];
+    extraPets.forEach((p,i)=>{
+      const isLarge = ['L','XL','XXL'].includes(p.size);
+      const perNight = isLarge ? state.surchargeLXL : state.surchargeSM;
+      const amt = perNight * nights;
+      surchargeTotal += amt;
+      surchargeLines.push(`<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
+        <span>Pet ${i+2} sharing (${p.size}) — RM${perNight}/night × ${nights} night${nights===1?'':'s'}</span>
+        <span>RM ${amt.toFixed(2)}</span>
+      </div>`);
+    });
+
+    const grandTotal = roomTotal + surchargeTotal;
+    const roomLabel = roomKind==='dogdeluxe'
+      ? (pets.some(p=>['L','XL','XXL'].includes(p.size)) ? 'Dog Deluxe L/XL/XXL' : 'Dog Deluxe S/M')
+      : roomKind;
+
+    let html = `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line-soft);">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;">
+        <span style="font-family:var(--font-display);font-size:26px;font-weight:700;color:var(--teal-dark,#144A87);">${nights}</span>
+        <span style="color:var(--ink-soft);font-size:13px;">night${nights===1?'':'s'} · ${fmtDateSlash(ci)} → ${fmtDateSlash(co)} · ${esc(roomLabel)}</span>
+      </div>`;
+
+    if(normalNights>0){
+      html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;">
+        <span>Normal RM${normalRate}/night × ${normalNights} night${normalNights===1?'':'s'}</span>
+        <span>RM ${(normalRate*normalNights).toFixed(2)}</span>
+      </div>`;
+    }
+    if(holidayNights>0){
+      html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;color:#9c5a1e;">
+        <span>Holiday RM${holidayRate}/night × ${holidayNights} night${holidayNights===1?'':'s'}</span>
+        <span>RM ${(holidayRate*holidayNights).toFixed(2)}</span>
+      </div>`;
+    }
+    html += surchargeLines.join('');
+    html += `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:16px;padding-top:10px;margin-top:6px;border-top:1px solid var(--line-soft);color:var(--teal-dark,#144A87);">
+        <span>Estimated total</span><span>RM ${grandTotal.toFixed(2)}</span>
+      </div>
+      <div style="font-size:11.5px;color:var(--ink-soft);margin-top:10px;">Estimate only — promo/custom rates and closed-day fees aren't included. Confirm exact pricing when actually booking the stay.</div>
+    </div>`;
+    box.innerHTML = html;
+  }
+
+  wirePetRows();
+  calc();
 }
 
 function openRatesModal(){
