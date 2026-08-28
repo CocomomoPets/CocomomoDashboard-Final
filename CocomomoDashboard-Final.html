@@ -2456,6 +2456,13 @@ function normalizeStay(s){
     // marker — never subtracted again from the balance (that's already
     // reflected in a recorded Payment). null/unset = not marked either way.
     paidThrough: s?.paidThrough || null,
+    // Explicit "combine into one bill" grouping — set by the "Merge into
+    // one bill" action so staff can see one combined total across several
+    // stays (on each of their own cards) even before any payment exists.
+    // Stays sharing the same id here are one group; independent of (but
+    // unified with, see stayBillingGroupIds) the older payment-stayIds
+    // merge mechanism. null/unset = not explicitly merged.
+    billingGroupId: s?.billingGroupId || null,
     // Which check-in/check-out reminders have already been sent (manually,
     // outside the app) for each pet in this stay — {checkin:[petId,...],
     // checkout:[petId,...]} — so the Reminders list can be marked off
@@ -2921,6 +2928,7 @@ function petInfoHtml(p){
         </div>
       </div>
       <div style="display:flex;gap:6px;">
+        <button class="btn btn-sm" id="petCombineWhatsAppBtn" title="Combine this owner's stays (any pet, any room) into one WhatsApp quote with one grand total">WhatsApp message</button>
         <button class="btn btn-sm" data-act="edit-pet">Edit</button>
         <button class="btn btn-sm btn-danger" data-act="delete-pet">Delete</button>
       </div>
@@ -3363,7 +3371,10 @@ function stayCardHtml(cust, pet, stay){
         <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
         ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${fmtRM2(cost.paidChargesTotal)} of the additional charges above is marked paid.</div>` : ''}
         <div class="cost-total">Estimated total: RM ${fmtRM2(cost.total)}</div>
-        ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">Combined into one bill with ${billing.groupStayCount-1} other stay${billing.groupStayCount-1===1?'':'s'} — combined bill total RM ${fmtRM2(billing.groupCost)}</div>` : ''}
+        ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span>Combined into one bill with ${billing.groupStayCount-1} other stay${billing.groupStayCount-1===1?'':'s'} — combined bill total RM ${fmtRM2(billing.groupCost)}</span>
+          ${stay.billingGroupId ? `<button type="button" class="btn btn-sm btn-ghost" data-unmerge-stay="${stay.id}">Unmerge</button>` : ''}
+        </div>` : ''}
         <div class="cost-paid">Paid amount${billing.isMerged?' (combined bill)':''}: RM ${fmtRM2(billing.paid)}</div>
         ${billing.balance > 0.004
           ? `<div class="cost-outstanding">Outstanding${billing.isMerged?' (combined)':''}: RM ${fmtRM2(billing.balance)}</div>`
@@ -3619,13 +3630,41 @@ function surchargePetLabel(surchargeByPet){
     return `${name} sharing, ${info.nights} night${info.nights===1?'':'s'}`;
   }).join(' · ');
 }
+/* Every stay id in the same "combined bill" group as `stay` — via an
+   explicit merge (stay.billingGroupId, set by "Merge into one bill" before
+   any payment exists) AND/OR any payment whose stayIds already ties stays
+   together. Expanded to a fixed point so either mechanism pulls in the
+   other — e.g. two stays explicitly merged, then a payment later added
+   covering just one of them, still counts as covering the whole group. */
+function stayBillingGroupIds(cust, stay){
+  const allStays = allCustomerStays(cust).map(x=>x.stay);
+  const byId = {}; allStays.forEach(st=>{ byId[st.id] = st; });
+  byId[stay.id] = stay;
+  const ids = new Set([stay.id]);
+  let changed = true;
+  while(changed){
+    changed = false;
+    const activeGroupIds = new Set(Array.from(ids).map(id=>byId[id] && byId[id].billingGroupId).filter(Boolean));
+    if(activeGroupIds.size){
+      allStays.forEach(st=>{
+        if(st.billingGroupId && activeGroupIds.has(st.billingGroupId) && !ids.has(st.id)){ ids.add(st.id); changed = true; }
+      });
+    }
+    (cust.payments||[]).forEach(p=>{
+      const pids = p.stayIds||[];
+      if(pids.some(id=>ids.has(id))){
+        pids.forEach(id=>{ if(!ids.has(id)){ ids.add(id); changed = true; } });
+      }
+    });
+  }
+  return ids;
+}
 function computeStayBilling(cust, stay){
   const cost = computeStayCost(stay);
-  const stayPayments = (cust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
-  const groupStayIds = new Set([stay.id]);
-  stayPayments.forEach(p=>(p.stayIds||[]).forEach(id=>groupStayIds.add(id)));
+  const groupStayIds = stayBillingGroupIds(cust, stay);
   const isMerged = groupStayIds.size > 1;
   if(!isMerged){
+    const stayPayments = (cust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
     const paid = stayPayments.reduce((s,p)=>s+(+p.amount||0),0);
     return { paid, balance: cost.total - paid, isMerged:false, groupCost:cost.total, groupStayCount:1, paidChargesTotal: cost.paidChargesTotal };
   }
@@ -3644,15 +3683,12 @@ function computeStayBilling(cust, stay){
   return { paid: groupPaid, balance: groupCost - groupPaid, isMerged:true, groupCost, groupStayCount: groupStays.length, paidChargesTotal: groupPaidCharges };
 }
 
-/* Every stay in the same "combined bill" group as `stay` — i.e. `stay`
-   itself plus any other stay(s) tied to it via a shared payment's stayIds.
-   Mirrors the grouping computeStayBilling does internally, exposed here so
-   the auto-mark-charges-paid logic below can act on the whole group, not
-   just the one stay a payment happened to be opened from. */
+/* Every stay in the same "combined bill" group as `stay` (see
+   stayBillingGroupIds above) — exposed here so the auto-mark-charges-paid
+   logic below can act on the whole group, not just the one stay a payment
+   happened to be opened from. */
 function getStayBillingGroup(cust, stay){
-  const stayPayments = (cust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
-  const groupStayIds = new Set([stay.id]);
-  stayPayments.forEach(p=>(p.stayIds||[]).forEach(id=>groupStayIds.add(id)));
+  const groupStayIds = stayBillingGroupIds(cust, stay);
   return Array.from(groupStayIds).map(id => id===stay.id ? stay : findStayById(id)).filter(Boolean);
 }
 /* Auto-marks a stay's (or combined-bill group's) additional charges as Paid
@@ -3832,6 +3868,8 @@ function wireSubContentEvents(cust, pet){
   if(vetPhoneEl) vetPhoneEl.addEventListener('change', ()=>{ pet.vetPhone = vetPhoneEl.value.trim(); toast('Updated'); scheduleSync(); });
   const editPetBtn = root.querySelector('[data-act="edit-pet"]');
   if(editPetBtn) editPetBtn.addEventListener('click', ()=>openPetModal(cust, pet));
+  const petCombineBtn = root.querySelector('#petCombineWhatsAppBtn');
+  if(petCombineBtn) petCombineBtn.addEventListener('click', ()=>openCombineWhatsAppModal(cust.id));
   const delPetBtn = root.querySelector('[data-act="delete-pet"]');
   if(delPetBtn) delPetBtn.addEventListener('click', ()=>{
     if(confirm(`Delete ${pet.name}'s record, including boarding & grooming history?`)){
@@ -3987,6 +4025,13 @@ function wireSubContentEvents(cust, pet){
       e.stopPropagation();
       const s = findStayById(el.dataset.clearPaidThrough);
       if(s){ s.paidThrough = null; scheduleSync(); renderPetSubContent(cust, pet); toast('Cleared'); }
+    });
+  });
+  root.querySelectorAll('[data-unmerge-stay]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const s = findStayById(el.dataset.unmergeStay);
+      if(s){ s.billingGroupId = null; scheduleSync(); renderPetSubContent(cust, pet); toast('Removed from combined bill'); }
     });
   });
 
@@ -4486,7 +4531,8 @@ function allCustomerStays(cust){
   return out.sort((a,b)=> b.stay.checkIn.localeCompare(a.stay.checkIn));
 }
 function openPaymentModal(cust, existing, presetStayId){
-  const p = existing || { id:'', type:'Deposit', amount:'', date: todayStr(), receiptNo:'', stayIds: presetStayId ? [presetStayId] : [] };
+  const presetIds = Array.isArray(presetStayId) ? presetStayId : (presetStayId ? [presetStayId] : []);
+  const p = existing || { id:'', type:'Deposit', amount:'', date: todayStr(), receiptNo:'', stayIds: presetIds };
   const stays = allCustomerStays(cust);
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit payment':'Add payment'}</h3><button class="modal-close">✕</button></div>
@@ -6049,6 +6095,7 @@ function mapStayRow(s, primaryPetId, customerId){
     notes: s.notes || null, custom_rate: (s.customRate === '' || s.customRate == null) ? null : +s.customRate,
     custom_rate_mode: s.customRateMode || 'flat', charges: s.charges || [], pets: s.pets || [],
     dropoff: s.dropoff || null, pickup: s.pickup || null, paid_through: s.paidThrough || null,
+    billing_group_id: s.billingGroupId || null,
     reminders_sent: s.remindersSent || {checkin:[],checkout:[]},
   };
 }
@@ -6097,6 +6144,7 @@ async function loadStaysFromTables(){
       notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
       charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
       paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+      billingGroupId: s.billing_group_id || null,
     });
     (stayById[s.primary_pet_id] = stayById[s.primary_pet_id] || []).push(stay);
   });
@@ -7203,17 +7251,21 @@ function groupDateRangesForMessage(dateStrs){
   return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
 }
 
-function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
+/* Computes everything for ONE room booking (one stay.pets row) up through
+   the boarding-only subtotal — shared by the single-stay "WhatsApp message"
+   button and the customer-level "combine multiple stays" feature below.
+   Returns null if the dates are broken (caller decides how to report that). */
+function buildBoardingBlock(stay, sp){
   const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
   const pets = petIds.map(id=>findPetById(id)).filter(Boolean);
-  if(pets.length===0) return '';
-  const mainPet = pets[0];
+  if(pets.length===0) return null;
   const room = roomTypeFor(sp.room);
   const roomLabel = genericRoomLabel(room ? room.type : '');
   const win = spRoomWindow(stay, sp);
   const checkIn = win.checkIn, checkOut = win.checkOut;
   const nights = nightsBetween(checkIn, checkOut);
-  if(nights<=0) return `${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :\n\nCheck-out must be after check-in — please fix the dates on this stay first.`;
+  const namesLabel = pets.map(p=>p.name).join(' & ');
+  if(nights<=0) return { namesLabel, roomLabel, pets, lines: ['Check-out must be after check-in — please fix the dates on this stay first.'], boardingTotal: 0, lastLineIsCombine: false, charges: [], chargesTotal: 0, fbgCount: 0, checkIn, checkOut };
 
   // Nights already marked paid (stay.paidThrough, see "Nights paid" on the
   // stay card) are skipped entirely from the quote below — only the
@@ -7251,8 +7303,6 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
   }
 
   const lines = [];
-  lines.push(`${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :`);
-  lines.push('');
 
   const coClosed = closedDateFor(checkOut);
   const pickupTime = stay.pickup && stay.pickup.time;
@@ -7349,10 +7399,8 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
     }
   }
 
-  // Additional charges — stay-level, shown at the end regardless of which
-  // boarding case above applied. Free basic grooming (FBG) appointments
-  // don't carry a charge (they're free) so they're counted separately and
-  // just noted in the final bold total line.
+  // Additional charges — stay-level. Free basic grooming (FBG) appointments
+  // don't carry a charge (they're free) so they're counted separately.
   // For the WhatsApp message specifically, a dog Bath/Cut charge (stored as
   // "Bath (M)" / "Cut (L)" from the preset picker) reads as customer-facing
   // wording instead — "M size dog basic grooming" / "L size dog full
@@ -7372,6 +7420,16 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
       (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<checkOut
     ).length;
   });
+
+  return { namesLabel, roomLabel, pets, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount, checkIn, checkOut };
+}
+
+function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
+  const block = buildBoardingBlock(stay, sp);
+  if(!block) return '';
+  const { namesLabel, roomLabel, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount } = block;
+
+  const out = [`${namesLabel}'s ${roomLabel} boarding details :`, '', ...lines];
   const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
 
   // Deposit already paid on the customer's card, linked to this stay —
@@ -7385,26 +7443,104 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
 
   if(!hasExtra){
     // Nothing to add on — just bold the final total in place.
-    const lastIdx = lines.length-1;
-    lines[lastIdx] = lines[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
+    const lastIdx = out.length-1;
+    out[lastIdx] = out[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
   } else {
     // Tag the boarding-only subtotal so it's clear what it covers, then add
     // a combine step bringing in charges/grooming/deposit, bold on the
     // final line only.
     if(lastLineIsCombine){
-      const lastIdx = lines.length-1;
-      lines[lastIdx] = lines[lastIdx] + ' (Boarding)';
+      const lastIdx = out.length-1;
+      out[lastIdx] = out[lastIdx] + ' (Boarding)';
     }
-    lines.push('');
+    out.push('');
     const grandTotal = boardingTotal + chargesTotal - depositTotal;
     const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...charges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
     if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
-    lines.push(addendsParts.join(' '));
+    out.push(addendsParts.join(' '));
     const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
-    lines.push(`= *Total RM ${fmtRM(grandTotal)}${balanceNote}${fbgNote}*`);
+    out.push(`= *Total RM ${fmtRM(grandTotal)}${balanceNote}${fbgNote}*`);
   }
 
-  return lines.join('\n');
+  return out.join('\n');
+}
+
+/* Every (stay, sp) room-booking block this customer actually owns — i.e.
+   stays physically stored under one of this customer's own pets, so NOT
+   stays where their pet is only a sharing partner booked under someone
+   else's stay (that's billed to the other owner, not this customer). Lets
+   the combine feature below gather every pet/room this customer is
+   currently paying for, even across separate stay records. */
+function allOwnStayRoomBlocksForCustomer(cust){
+  const out = [];
+  (cust.pets||[]).forEach(p=>{
+    (p.stays||[]).forEach(stay=>{
+      stay.pets.forEach((sp, spIdx)=>{
+        out.push({ stay, sp, spIdx });
+      });
+    });
+  });
+  return out;
+}
+
+/* Combines several room-booking blocks (possibly different pets, different
+   rooms, even different stay records) into ONE WhatsApp quote with ONE
+   grand total — for when an owner with pets spread across multiple
+   bookings wants to settle everything in one go. Charges/FBG are pooled
+   across every included block; deposits are summed once per matching
+   payment (a payment linked to more than one included stay is only
+   counted once, not once per stay). */
+function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
+  const blocks = entries.map(({stay, sp})=>({ stay, block: buildBoardingBlock(stay, sp) })).filter(x=>x.block);
+  if(blocks.length===0) return '';
+
+  const out = [`${esc(ownerCust.name)}'s boarding details :`, ''];
+  let boardingTotal = 0;
+  const allCharges = [];
+  let fbgCount = 0;
+  blocks.forEach(({block}, i)=>{
+    out.push(`— ${block.namesLabel} (${block.roomLabel}) —`);
+    out.push(...block.lines);
+    if(i < blocks.length-1) out.push('');
+    boardingTotal += block.boardingTotal;
+    allCharges.push(...block.charges);
+    fbgCount += block.fbgCount;
+  });
+  out.push('');
+
+  const chargesTotal = allCharges.reduce((s,c)=>s+c.amount,0);
+  const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
+
+  const includedStayIds = new Set(blocks.map(b=>b.stay.id));
+  const depositTotal = ((ownerCust && ownerCust.payments) || [])
+    .filter(p => p.type==='Deposit' && (p.stayIds||[]).some(id=>includedStayIds.has(id)))
+    .reduce((s,p)=>s+(+p.amount||0), 0);
+
+  // Sum every block's own boarding subtotal into one combined boarding
+  // figure — always shown as its own combine step here (unlike the
+  // single-stay message, where a lone block skips straight to the total)
+  // since there's more than one block's worth of numbers to bring together.
+  const boardingAddends = blocks.map(({block})=>`RM ${fmtRM(block.boardingTotal)}`).join(' + ');
+  const hasExtra = allCharges.length>0 || fbgCount>0 || depositTotal>0;
+  out.push(`${boardingAddends}${blocks.length>1?` = RM ${fmtRM(boardingTotal)}`:''}${hasExtra?' (Boarding)':''}`);
+
+  if(hasExtra){
+    out.push('');
+    const grandTotal = boardingTotal + chargesTotal - depositTotal;
+    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...allCharges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
+    if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
+    out.push(addendsParts.join(' '));
+    const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
+    out.push(`= *Total RM ${fmtRM(grandTotal)}${balanceNote}${fbgNote}*`);
+  } else if(blocks.length===1){
+    // Single block, nothing extra — same shorthand as the single-stay button.
+    const lastIdx = out.length-1;
+    out[lastIdx] = out[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
+  } else {
+    out[out.length-1] = out[out.length-1].replace(` = RM ${fmtRM(boardingTotal)}`, ` = *Total RM ${fmtRM(boardingTotal)}*`);
+  }
+
+  return out.join('\n');
 }
 
 function openBoardingWhatsAppModal(stayId, spIndex){
@@ -7428,6 +7564,82 @@ function openBoardingWhatsAppModal(stayId, spIndex){
   document.getElementById('copyEnqBtn').addEventListener('click', async ()=>{
     try{ await navigator.clipboard.writeText(message); toast('Message copied'); }
     catch(err){ toast('Could not copy — long-press the message text instead'); }
+  });
+}
+
+/* Picker for combining several of a customer's own stays (different pets
+   and/or different rooms — even separate stay records) into one WhatsApp
+   quote with one grand total, for when the owner wants to settle
+   everything for all their pets in one go. */
+function openCombineWhatsAppModal(custId){
+  const cust = getCustomer(custId);
+  if(!cust) return;
+  const entries = allOwnStayRoomBlocksForCustomer(cust);
+  if(entries.length===0){ toast('No stays on file for this customer yet'); return; }
+  // Active/upcoming first, defaulted checked; Past shown further down, unchecked.
+  const sorted = entries.slice().sort((a,b)=>{
+    if(a.stay.status!==b.stay.status) return a.stay.status==='Active' ? -1 : 1;
+    return a.stay.checkIn.localeCompare(b.stay.checkIn);
+  });
+
+  function rowHtml(entry, idx){
+    const { stay, sp } = entry;
+    const win = spRoomWindow(stay, sp);
+    const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
+    const names = petIds.map(id=>findPetById(id)).filter(Boolean).map(p=>p.name).join(' & ');
+    const room = roomTypeFor(sp.room);
+    const roomLabel = genericRoomLabel(room ? room.type : '');
+    return `<label class="charge-row" style="cursor:pointer;">
+      <input type="checkbox" data-combine-idx="${idx}" ${stay.status==='Active'?'checked':''} style="margin-right:4px;">
+      <span class="charge-desc">${esc(names)} — ${esc(roomLabel)}</span>
+      <span class="charge-qty">${fmtDateSlash(win.checkIn)} → ${fmtDateSlash(win.checkOut)}</span>
+      <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${esc(stay.status)}</span>
+    </label>`;
+  }
+
+  openModal(`
+    <div class="modal-head"><h3>Combine stays</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(cust.name)}'s stays to combine — handy when they want to settle for all their pets at once, even across different rooms or bookings. "Merge into one bill" links them right away (no payment needed) so the combined total shows on each stay's own card; "Generate message" builds one WhatsApp quote covering all of them.</div>
+      <div id="combineRows">${sorted.map(rowHtml).join('')}</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn" id="mergeCombineBtn">Merge into one bill</button>
+      <button class="btn btn-primary" id="genCombineBtn">Generate message</button>
+    </div>
+  `, {wide:true});
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('mergeCombineBtn').addEventListener('click', ()=>{
+    const checked = Array.from(document.querySelectorAll('[data-combine-idx]:checked')).map(el=>+el.dataset.combineIdx);
+    if(checked.length<2){ toast('Select at least 2 stays to merge into one bill'); return; }
+    const groupId = uid('billgrp');
+    checked.forEach(i=>{ sorted[i].stay.billingGroupId = groupId; });
+    scheduleSync();
+    closeModal();
+    renderCustomersMain();
+    toast('Merged — combined total now shows on each stay\'s card');
+  });
+  document.getElementById('genCombineBtn').addEventListener('click', ()=>{
+    const checked = Array.from(document.querySelectorAll('[data-combine-idx]:checked')).map(el=>+el.dataset.combineIdx);
+    if(checked.length===0){ toast('Select at least one stay to combine'); return; }
+    const selected = checked.map(i=>sorted[i]);
+    const message = buildCombinedBoardingWhatsAppMessage(selected, cust);
+    openModal(`
+      <div class="modal-head"><h3>Combined WhatsApp message</h3><button class="modal-close">✕</button></div>
+      <div class="modal-body">
+        <div style="white-space:pre-line;font-size:13px;line-height:1.55;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:12px 14px;">${esc(message)}</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" id="backBtn">Back</button>
+        <button class="btn btn-primary" id="copyCombineBtn">Copy</button>
+      </div>
+    `, {wide:true});
+    document.getElementById('backBtn').addEventListener('click', ()=>openCombineWhatsAppModal(custId));
+    document.getElementById('copyCombineBtn').addEventListener('click', async ()=>{
+      try{ await navigator.clipboard.writeText(message); toast('Message copied'); }
+      catch(err){ toast('Could not copy — long-press the message text instead'); }
+    });
   });
 }
 
