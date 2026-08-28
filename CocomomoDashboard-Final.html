@@ -7353,7 +7353,18 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
   // boarding case above applied. Free basic grooming (FBG) appointments
   // don't carry a charge (they're free) so they're counted separately and
   // just noted in the final bold total line.
-  const charges = (stay.charges||[]).map(c=>({ label: c.description || c.category, amount: (+c.amount||0) * (+c.qty||1) }));
+  // For the WhatsApp message specifically, a dog Bath/Cut charge (stored as
+  // "Bath (M)" / "Cut (L)" from the preset picker) reads as customer-facing
+  // wording instead — "M size dog basic grooming" / "L size dog full
+  // grooming" — matching how cat grooming charges are already worded.
+  function whatsappChargeLabel(rawLabel){
+    const bathMatch = /^Bath \(([A-Za-z]+)\)$/.exec(rawLabel);
+    if(bathMatch) return `${bathMatch[1]} size dog basic grooming`;
+    const cutMatch = /^Cut \(([A-Za-z]+)\)$/.exec(rawLabel);
+    if(cutMatch) return `${cutMatch[1]} size dog full grooming`;
+    return rawLabel;
+  }
+  const charges = (stay.charges||[]).map(c=>({ label: whatsappChargeLabel(c.description || c.category), amount: (+c.amount||0) * (+c.qty||1) }));
   const chargesTotal = charges.reduce((s,c)=>s+c.amount,0);
   let fbgCount = 0;
   pets.forEach(p=>{
