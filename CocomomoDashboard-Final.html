@@ -5090,8 +5090,8 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     </div>
   `, {wide:true});
 
-  let workingDropoff = s.dropoff ? {...s.dropoff} : {time:'09:00', contactName:'', contactPhone:''};
-  let workingPickup = s.pickup ? {...s.pickup} : {time:'17:00', contactName:'', contactPhone:''};
+  let workingDropoff = s.dropoff ? {...s.dropoff} : {time: closedDateFor(s.checkIn) ? '09:00' : '', contactName:'', contactPhone:''};
+  let workingPickup = s.pickup ? {...s.pickup} : {time: closedDateFor(s.checkOut) ? '17:00' : '', contactName:'', contactPhone:''};
   function closedApptSectionHtml(){
     const inDate = document.getElementById('s_in').value;
     const outDate = document.getElementById('s_out').value;
@@ -8291,8 +8291,8 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   wireSharingPicker('cb_share', cbSharingIds, () => document.getElementById('cb_pet')?.value || null, cbSharingDates,
     () => ({ checkIn: document.getElementById('cb_in').value, checkOut: document.getElementById('cb_out').value }));
 
-  let cbWorkingDropoff = {time:'09:00', contactName:'', contactPhone:''};
-  let cbWorkingPickup = {time:'17:00', contactName:'', contactPhone:''};
+  let cbWorkingDropoff = {time: closedDateFor(initialCheckIn) ? '09:00' : '', contactName:'', contactPhone:''};
+  let cbWorkingPickup = {time: closedDateFor(initialCheckOut) ? '17:00' : '', contactName:'', contactPhone:''};
   function cbClosedApptSectionHtml(){
     const inDate = document.getElementById('cb_in').value;
     const outDate = document.getElementById('cb_out').value;
