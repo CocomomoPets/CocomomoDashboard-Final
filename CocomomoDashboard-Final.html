@@ -665,6 +665,37 @@ async function ensureLogin(){
    resetSelection=false (a live update arriving while someone's already
    browsing) instead tries to keep whatever they currently have open, only
    falling back if that record no longer exists in the new data. */
+/* Restores which customer/pet/tab/sub-tab/date/expanded-stay this browser
+   tab had open before a refresh (see saveNavState) — validated against
+   whatever's actually in state.customers right now, falling back to the
+   oldest customer if the saved one no longer exists. Called from BOTH
+   hydrateStateFromRemote's initial pass (still working off the older blob
+   copy, which may be incomplete/stale) AND again once loadCustomersPetsFromTables()
+   finishes with the real, authoritative copy — that second call is the one
+   that actually sticks, since it runs right before the first render(). */
+function applySavedNavSelection(){
+  const nav = loadNavState();
+  let restored = false;
+  if(nav && nav.selectedCustomerId){
+    const navCust = state.customers.find(c=>c.id===nav.selectedCustomerId);
+    if(navCust){
+      state.selectedCustomerId = navCust.id;
+      state.selectedPetId = navCust.pets.some(p=>p.id===nav.selectedPetId) ? nav.selectedPetId : (navCust.pets[0]?.id || null);
+      restored = true;
+    }
+  }
+  if(!restored){
+    state.selectedCustomerId = state.customers[0]?.id || null;
+    state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+  }
+  if(nav){
+    if(['customers','today','calendar','grooming'].includes(nav.activeTab)) state.activeTab = nav.activeTab;
+    if(['info','boarding','grooming'].includes(nav.subTab)) _subTab = nav.subTab;
+    if(nav.groomingDate) state.groomingDate = nav.groomingDate;
+    if(nav.calendarMonth) state.calendarMonth = nav.calendarMonth;
+    if(nav.openStays && typeof nav.openStays==='object') state.openStays = nav.openStays;
+  }
+}
 function hydrateStateFromRemote(remote, opts){
   opts = opts || {};
   const resetSelection = opts.resetSelection !== false;
@@ -752,28 +783,11 @@ function hydrateStateFromRemote(remote, opts){
   if(resetSelection){
     // Fresh page load (a real browser refresh) — try to land back exactly
     // where this browser tab was before, with the freshly-loaded data,
-    // rather than always defaulting to the oldest customer on file.
-    const nav = loadNavState();
-    let restoredSelection = false;
-    if(nav && nav.selectedCustomerId){
-      const navCust = state.customers.find(c=>c.id===nav.selectedCustomerId);
-      if(navCust){
-        state.selectedCustomerId = navCust.id;
-        state.selectedPetId = navCust.pets.some(p=>p.id===nav.selectedPetId) ? nav.selectedPetId : (navCust.pets[0]?.id || null);
-        restoredSelection = true;
-      }
-    }
-    if(!restoredSelection){
-      state.selectedCustomerId = state.customers[0]?.id || null;
-      state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
-    }
-    if(nav){
-      if(['customers','today','calendar','grooming'].includes(nav.activeTab)) state.activeTab = nav.activeTab;
-      if(['info','boarding','grooming'].includes(nav.subTab)) _subTab = nav.subTab;
-      if(nav.groomingDate) state.groomingDate = nav.groomingDate;
-      if(nav.calendarMonth) state.calendarMonth = nav.calendarMonth;
-      if(nav.openStays && typeof nav.openStays==='object') state.openStays = nav.openStays;
-    }
+    // rather than always defaulting to the oldest customer on file. This
+    // first pass may still be working off the older/incomplete blob copy
+    // of customers (see loadFromCloud, which re-applies this once the
+    // authoritative table data is in) but doesn't hurt to try early too.
+    applySavedNavSelection();
   } else if(!state.customers.some(c=>c.id===state.selectedCustomerId)){
     state.selectedCustomerId = state.customers[0]?.id || null;
     state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
@@ -846,10 +860,11 @@ async function loadFromCloud(){
       await migrateShopConfigFromBlobIfNeeded(data.data);
       await loadShopConfigFromTables();
       // Re-apply the same "pick a sensible selected customer/pet" step
-      // hydrateStateFromRemote() already did — needed again since
-      // state.customers just got replaced with the tables-loaded copy.
-      state.selectedCustomerId = state.customers[0]?.id || null;
-      state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+      // hydrateStateFromRemote() already did — needed again now that
+      // state.customers just got replaced with the tables-loaded (real,
+      // complete) copy, since the earlier pass may have been working off
+      // an incomplete/stale blob copy that didn't have this customer yet.
+      applySavedNavSelection();
       setSyncStatus('ok','Synced');
     } else {
       // nothing saved yet — push current (seed) state as the first save
