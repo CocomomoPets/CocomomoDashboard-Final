@@ -7254,12 +7254,21 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
   lines.push(`${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :`);
   lines.push('');
 
-  const ciClosed = closedDateFor(checkIn);
   const coClosed = closedDateFor(checkOut);
-  const dropoffTime = stay.dropoff && stay.dropoff.time;
   const pickupTime = stay.pickup && stay.pickup.time;
-  lines.push(`Check In - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(ciClosed && dropoffTime) ? ` _(${dropoffTime})_` : ''}`);
-  lines.push(`Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+  // If some nights are already marked paid, this quote starts from the
+  // first not-yet-paid night — "From" / "Until/Check Out" instead of the
+  // usual "Check In" / "Check Out", since the pet already checked in
+  // earlier and this isn't a fresh arrival (so no drop-off time note here).
+  if(paidThroughCapped && paidThroughCapped > checkIn){
+    lines.push(`From - ${fmtDateOrdinalShort(paidThroughCapped)} (${weekdayShort(paidThroughCapped)})`);
+    lines.push(`Until/Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+  } else {
+    const ciClosed = closedDateFor(checkIn);
+    const dropoffTime = stay.dropoff && stay.dropoff.time;
+    lines.push(`Check In - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(ciClosed && dropoffTime) ? ` _(${dropoffTime})_` : ''}`);
+    lines.push(`Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+  }
   lines.push('');
 
   // Sharing composition line(s) — "RM60 (1x S/M size dog 1x room) + RM50
