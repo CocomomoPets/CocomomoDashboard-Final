@@ -750,8 +750,30 @@ function hydrateStateFromRemote(remote, opts){
   if(typeof remote.LARGE_normal === 'number') LARGE.normal = remote.LARGE_normal;
   if(typeof remote.LARGE_holiday === 'number') LARGE.holiday = remote.LARGE_holiday;
   if(resetSelection){
-    state.selectedCustomerId = state.customers[0]?.id || null;
-    state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+    // Fresh page load (a real browser refresh) — try to land back exactly
+    // where this browser tab was before, with the freshly-loaded data,
+    // rather than always defaulting to the oldest customer on file.
+    const nav = loadNavState();
+    let restoredSelection = false;
+    if(nav && nav.selectedCustomerId){
+      const navCust = state.customers.find(c=>c.id===nav.selectedCustomerId);
+      if(navCust){
+        state.selectedCustomerId = navCust.id;
+        state.selectedPetId = navCust.pets.some(p=>p.id===nav.selectedPetId) ? nav.selectedPetId : (navCust.pets[0]?.id || null);
+        restoredSelection = true;
+      }
+    }
+    if(!restoredSelection){
+      state.selectedCustomerId = state.customers[0]?.id || null;
+      state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
+    }
+    if(nav){
+      if(['customers','today','calendar','grooming'].includes(nav.activeTab)) state.activeTab = nav.activeTab;
+      if(['info','boarding','grooming'].includes(nav.subTab)) _subTab = nav.subTab;
+      if(nav.groomingDate) state.groomingDate = nav.groomingDate;
+      if(nav.calendarMonth) state.calendarMonth = nav.calendarMonth;
+      if(nav.openStays && typeof nav.openStays==='object') state.openStays = nav.openStays;
+    }
   } else if(!state.customers.some(c=>c.id===state.selectedCustomerId)){
     state.selectedCustomerId = state.customers[0]?.id || null;
     state.selectedPetId = state.customers[0]?.pets[0]?.id || null;
@@ -2562,6 +2584,7 @@ function render(){
   else if(state.activeTab === 'today') renderTodayView();
   else if(state.activeTab === 'calendar') renderBoardingCalendar();
   else renderGroomingAvailability();
+  saveNavState();
   scheduleSync();
 }
 
@@ -2863,8 +2886,35 @@ let _subTab = 'info';
 // clickable either way since it's outside the collapsible part.
 let _pointsHistoryOpen = new Set();
 function curSub(){ return _subTab; }
-function setSub(s){ _subTab = s; document.querySelectorAll('#petSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.sub===s)); }
+function setSub(s){ _subTab = s; document.querySelectorAll('#petSubtabs .subtab-btn').forEach(b=>b.classList.toggle('active', b.dataset.sub===s)); saveNavState(); }
 let _groomSelection = new Set(); // ids of grooming appointments currently ticked for bulk actions on the pet's Grooming history tab — cleared whenever a different pet/tab is opened
+
+/* Remembers which tab/customer/pet/sub-tab/date/expanded-stay someone was
+   looking at, per browser tab (sessionStorage, same lifetime as the PIN
+   unlock) — so a refresh lands back where they were (with fresh data)
+   instead of always jumping to the oldest customer on file. Saved on every
+   render() so it's always current without needing a call at each of the
+   many places selection/tab/date state changes. */
+function saveNavState(){
+  try{
+    sessionStorage.setItem('pawSalonNavState', JSON.stringify({
+      activeTab: state.activeTab,
+      selectedCustomerId: state.selectedCustomerId,
+      selectedPetId: state.selectedPetId,
+      subTab: _subTab,
+      groomingDate: state.groomingDate,
+      calendarMonth: state.calendarMonth,
+      openStays: state.openStays,
+    }));
+  }catch(err){ /* storage unavailable — just won't restore position on refresh */ }
+}
+function loadNavState(){
+  try{
+    const raw = sessionStorage.getItem('pawSalonNavState');
+    return raw ? JSON.parse(raw) : null;
+  }catch(err){ return null; }
+}
+
 
 /* Prominent red badge for a pet's risk flags — shown at every point staff
    look at or book this pet, instead of relying on someone reading through
@@ -2903,6 +2953,7 @@ function renderPetSubContent(cust, pet){
   else if(curSub()==='boarding') el.innerHTML = petBoardingHtml(cust, pet);
   else el.innerHTML = petGroomingHtml(cust, pet);
   wireSubContentEvents(cust, pet);
+  saveNavState();
   scheduleSync();
 }
 
