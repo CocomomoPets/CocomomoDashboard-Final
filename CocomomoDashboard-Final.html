@@ -506,12 +506,10 @@
     </div>
     <button class="btn" id="enquiryBtn" title="Quick nights &amp; price estimate for an unconfirmed enquiry — nothing here is saved">Enquiry calculator</button>
     <button class="btn" id="policiesBtn">Boarding policies</button>
-    <button class="btn" id="ratesBtn">Rates &amp; holidays</button>
+    <button class="btn" id="ratesBtn" title="Room rates, surcharges, holidays &amp; closed dates — plus Staff &amp; leave">Rates &amp; Staff</button>
     <button class="btn" id="scheduleBtn" title="Reminders for tomorrow's appointments/checkouts, and the monthly revenue/occupancy report">Reminders &amp; Reports</button>
     <button class="btn" id="historyBtn" title="Recent edits (with undo) and the log of cancelled appointments/stays">Change log &amp; Cancellations</button>
-    <button class="btn" id="staffBtn" title="Manage staff and their leave dates — shown on the Today grid, Boarding calendar, and Grooming availability">Staff</button>
-    <button class="btn" id="archiveBtn" title="Move old, finished bookings/appointments/payments out of the main tables to keep the app fast — and search them later if needed">Archive</button>
-    <button class="btn" id="backupBtn" title="Download a backup now, or browse/download the last 30 automatic daily backups">Backup</button>
+    <button class="btn" id="archiveBtn" title="Move old finished records out of the main tables — plus daily automatic Backups">Archive &amp; Backup</button>
   </div>
 
   <div class="body">
@@ -5769,7 +5767,6 @@ document.getElementById('enquiryBtn').addEventListener('click', openEnquiryModal
 document.getElementById('ratesBtn').addEventListener('click', openRatesModal);
 document.getElementById('policiesBtn').addEventListener('click', openPoliciesModal);
 document.getElementById('historyBtn').addEventListener('click', openChangeLogModal);
-document.getElementById('staffBtn').addEventListener('click', openStaffModal);
 document.getElementById('archiveBtn').addEventListener('click', openArchiveModal);
 document.getElementById('scheduleBtn').addEventListener('click', ()=>openRemindersModal());
 function openPoliciesModal(){
@@ -6551,6 +6548,7 @@ function openArchiveModal(){
   openModal(`
     <div class="modal-head"><h3>Archive old records</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('archiveBackupTabs', [{label:'Archive', active:true}, {label:'Backup', active:false, onClick:()=>openBackupModal()}])}
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
         Moves finished bookings, grooming appointments, and their payments older than the date below out of the main tables and into a separate archive — keeps the app fast as history grows. Only Past stays, completed grooming (Done &amp; informed / Picked up), and payments tied to those are touched; anything Active or in-progress is never included, regardless of date. Nothing is deleted for good — search archived records anytime below.
       </div>
@@ -6572,6 +6570,7 @@ function openArchiveModal(){
     </div>
   `, {wide:true});
   wireDateOverlay('arch_cutoff');
+  wireSubTabRow('archiveBackupTabs', [{active:true}, {active:false, onClick:()=>openBackupModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   let previewData = null;
   document.getElementById('archivePreviewBtn').addEventListener('click', ()=>{
@@ -6804,6 +6803,7 @@ async function openBackupModal(){
   openModal(`
     <div class="modal-head"><h3>Backup</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('archiveBackupTabs', [{label:'Archive', active:false, onClick:()=>openArchiveModal()}, {label:'Backup', active:true}])}
       <button class="btn btn-primary" id="downloadNowBtn" style="width:100%;margin-bottom:18px;">Download backup now</button>
       <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Backup history</div>
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
@@ -6815,6 +6815,7 @@ async function openBackupModal(){
       <button class="btn" id="cancelBtn">Close</button>
     </div>
   `);
+  wireSubTabRow('archiveBackupTabs', [{active:false, onClick:()=>openArchiveModal()}, {active:true}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('downloadNowBtn').addEventListener('click', ()=>{
     const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
@@ -6889,6 +6890,7 @@ function openStaffModal(){
   openModal(`
     <div class="modal-head"><h3>Staff</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('ratesStaffTabs', [{label:'Rates & holidays', active:false, onClick:()=>openRatesModal()}, {label:'Staff', active:true}])}
       <fieldset>
         <legend>Staff &amp; leave <span style="font-weight:400;color:var(--ink-soft);">— leave shown on the Today grid, Boarding calendar, and Grooming availability</span></legend>
         <div id="staffRows">${workingStaff.map(staffRowHtml).join('')}</div>
@@ -6900,6 +6902,7 @@ function openStaffModal(){
       <button class="btn btn-primary" id="saveBtn">Save</button>
     </div>
   `, {wide:true});
+  wireSubTabRow('ratesStaffTabs', [{active:false, onClick:()=>openRatesModal()}, {active:true}]);
 
   function syncStaffFromDom(){
     document.querySelectorAll('#staffRows [data-srow]').forEach(row=>{
@@ -7374,6 +7377,7 @@ function openRatesModal(){
   openModal(`
     <div class="modal-head"><h3>Rates &amp; holidays</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
+      ${subTabRowHtml('ratesStaffTabs', [{label:'Rates & holidays', active:true}, {label:'Staff', active:false, onClick:()=>openStaffModal()}])}
       <fieldset>
         <legend>Room rates (RM per night — normal / holiday)</legend>
         <div class="rate-row"><span class="rname">Dog Deluxe S/M</span>
@@ -7474,6 +7478,7 @@ function openRatesModal(){
     refreshClosed();
   });
   wireClosedEvents();
+  wireSubTabRow('ratesStaffTabs', [{active:true}, {active:false, onClick:()=>openStaffModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     state.rates['Dog Deluxe (Bottom)'] = {label:'Dog Deluxe S/M', normal:+document.getElementById('r_dsm_n').value, holiday:+document.getElementById('r_dsm_h').value};
@@ -8373,7 +8378,6 @@ function downloadBackupFile(snapshot, filenameStamp){
   a.remove();
   URL.revokeObjectURL(url);
 }
-document.getElementById('backupBtn').addEventListener('click', openBackupModal);
 
 let _pendingBelongingTarget = null;
 document.getElementById('belongingFileInput').addEventListener('change', async (e)=>{
