@@ -2928,7 +2928,6 @@ function petInfoHtml(p){
         </div>
       </div>
       <div style="display:flex;gap:6px;">
-        <button class="btn btn-sm" id="petCombineWhatsAppBtn" title="Combine this owner's stays (any pet, any room) into one WhatsApp quote with one grand total">WhatsApp message</button>
         <button class="btn btn-sm" data-act="edit-pet">Edit</button>
         <button class="btn btn-sm btn-danger" data-act="delete-pet">Delete</button>
       </div>
@@ -3291,6 +3290,8 @@ function stayCardHtml(cust, pet, stay){
         ${stay.status==='Active' && myCheckedIn ? `<button class="btn btn-sm btn-ghost" data-act="undo-checkin-stay" data-stay="${stay.id}" data-pet="${pet.id}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
         ${stay.status==='Active' ? `<button class="btn btn-sm" data-act="checkout-stay" data-stay="${stay.id}">Check out</button>` : ''}
         <button class="btn btn-sm" data-act="edit-stay" data-stay="${stay.id}">Edit</button>
+        <button class="btn btn-sm" data-act="combine-bill" data-stay="${stay.id}" title="Combine this stay with the owner's other stays into one bill">Combine bill</button>
+        <button class="btn btn-sm" data-act="combine-whatsapp" data-stay="${stay.id}" title="Combine this owner's stays (any pet, any room) into one WhatsApp quote with one grand total">Combine message</button>
         <button class="btn btn-sm btn-danger" data-act="delete-stay" data-stay="${stay.id}">Delete</button>
       </div>
     </div>
@@ -3868,8 +3869,6 @@ function wireSubContentEvents(cust, pet){
   if(vetPhoneEl) vetPhoneEl.addEventListener('change', ()=>{ pet.vetPhone = vetPhoneEl.value.trim(); toast('Updated'); scheduleSync(); });
   const editPetBtn = root.querySelector('[data-act="edit-pet"]');
   if(editPetBtn) editPetBtn.addEventListener('click', ()=>openPetModal(cust, pet));
-  const petCombineBtn = root.querySelector('#petCombineWhatsAppBtn');
-  if(petCombineBtn) petCombineBtn.addEventListener('click', ()=>openCombineWhatsAppModal(cust.id));
   const delPetBtn = root.querySelector('[data-act="delete-pet"]');
   if(delPetBtn) delPetBtn.addEventListener('click', ()=>{
     if(confirm(`Delete ${pet.name}'s record, including boarding & grooming history?`)){
@@ -3930,6 +3929,19 @@ function wireSubContentEvents(cust, pet){
       const ownerCust = findStayOwnerCustomer(st.id) || cust;
       const ownerPet = getPet(ownerCust, st.pets[0]?.petId) || pet;
       openStayModal(ownerCust, ownerPet, st);
+    });
+  });
+  root.querySelectorAll('[data-act="combine-bill"]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      openCombineBillModal(el.dataset.stay);
+    });
+  });
+  root.querySelectorAll('[data-act="combine-whatsapp"]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const ownerCust = findStayOwnerCustomer(el.dataset.stay) || cust;
+      openCombineWhatsAppModal(ownerCust.id);
     });
   });
   root.querySelectorAll('[data-act="delete-stay"]').forEach(el=>{
@@ -7571,6 +7583,68 @@ function openBoardingWhatsAppModal(stayId, spIndex){
    and/or different rooms — even separate stay records) into one WhatsApp
    quote with one grand total, for when the owner wants to settle
    everything for all their pets in one go. */
+/* Picker for merging several of a customer's own stays (different pets
+   and/or rooms, even separate stay records) into one BILL — sets a shared
+   billingGroupId directly, no payment required, so the combined total
+   shows on each of those stays' own cards right away (see
+   stayBillingGroupIds/computeStayBilling). Reopening this for a stay
+   that's already merged lets staff add or remove members from that same
+   group. Separate from the WhatsApp-message combine picker — this one
+   only affects billing/display, never generates message text. */
+function openCombineBillModal(stayId){
+  const stay = findStayById(stayId);
+  if(!stay) return;
+  const ownerCust = findStayOwnerCustomer(stayId);
+  if(!ownerCust) return;
+  const currentGroupId = stay.billingGroupId || null;
+  const entries = allCustomerStays(ownerCust); // [{pet, stay}]
+  const sorted = entries.slice().sort((a,b)=>{
+    if(a.stay.status!==b.stay.status) return a.stay.status==='Active' ? -1 : 1;
+    return a.stay.checkIn.localeCompare(b.stay.checkIn);
+  });
+
+  function rowHtml(entry, idx){
+    const { pet, stay: st } = entry;
+    const isDefaultChecked = st.id===stay.id || (currentGroupId && st.billingGroupId===currentGroupId);
+    return `<label class="charge-row" style="cursor:pointer;">
+      <input type="checkbox" data-mergebill-idx="${idx}" ${isDefaultChecked?'checked':''} style="margin-right:4px;">
+      <span class="charge-desc">${esc(pet.name)}</span>
+      <span class="charge-qty">${fmtDateSlash(st.checkIn)} → ${fmtDateSlash(st.checkOut)}</span>
+      <span class="badge ${st.status==='Active'?'badge-active':'badge-past'}">${esc(st.status)}</span>
+    </label>`;
+  }
+
+  openModal(`
+    <div class="modal-head"><h3>Combine bill</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(ownerCust.name)}'s stays to combine into one bill — the combined total shows on each of their stay cards right away, even before any payment is made.</div>
+      <div id="mergeBillRows">${sorted.map(rowHtml).join('')}</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn btn-primary" id="doMergeBtn">${currentGroupId?'Update combined bill':'Merge into one bill'}</button>
+    </div>
+  `, {wide:true});
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('doMergeBtn').addEventListener('click', ()=>{
+    const checkedIdxs = Array.from(document.querySelectorAll('[data-mergebill-idx]:checked')).map(el=>+el.dataset.mergebillIdx);
+    if(checkedIdxs.length<2){ toast('Select at least 2 stays to combine'); return; }
+    const checkedStays = checkedIdxs.map(i=>sorted[i].stay);
+    const groupId = currentGroupId || uid('billgrp');
+    // Anyone previously in this group but unchecked now leaves it.
+    if(currentGroupId){
+      sorted.forEach(({stay:st})=>{
+        if(st.billingGroupId===currentGroupId && !checkedStays.includes(st)) st.billingGroupId = null;
+      });
+    }
+    checkedStays.forEach(st=>{ st.billingGroupId = groupId; });
+    scheduleSync();
+    closeModal();
+    renderCustomersMain();
+    toast('Combined — total now shows on each stay\'s card');
+  });
+}
+
 function openCombineWhatsAppModal(custId){
   const cust = getCustomer(custId);
   if(!cust) return;
@@ -7600,26 +7674,15 @@ function openCombineWhatsAppModal(custId){
   openModal(`
     <div class="modal-head"><h3>Combine stays</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(cust.name)}'s stays to combine — handy when they want to settle for all their pets at once, even across different rooms or bookings. "Merge into one bill" links them right away (no payment needed) so the combined total shows on each stay's own card; "Generate message" builds one WhatsApp quote covering all of them.</div>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(cust.name)}'s stays to combine into one quote with one grand total — handy when they want to settle for all their pets at once, even across different rooms or bookings.</div>
       <div id="combineRows">${sorted.map(rowHtml).join('')}</div>
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Close</button>
-      <button class="btn" id="mergeCombineBtn">Merge into one bill</button>
       <button class="btn btn-primary" id="genCombineBtn">Generate message</button>
     </div>
   `, {wide:true});
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.getElementById('mergeCombineBtn').addEventListener('click', ()=>{
-    const checked = Array.from(document.querySelectorAll('[data-combine-idx]:checked')).map(el=>+el.dataset.combineIdx);
-    if(checked.length<2){ toast('Select at least 2 stays to merge into one bill'); return; }
-    const groupId = uid('billgrp');
-    checked.forEach(i=>{ sorted[i].stay.billingGroupId = groupId; });
-    scheduleSync();
-    closeModal();
-    renderCustomersMain();
-    toast('Merged — combined total now shows on each stay\'s card');
-  });
   document.getElementById('genCombineBtn').addEventListener('click', ()=>{
     const checked = Array.from(document.querySelectorAll('[data-combine-idx]:checked')).map(el=>+el.dataset.combineIdx);
     if(checked.length===0){ toast('Select at least one stay to combine'); return; }
