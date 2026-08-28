@@ -3293,7 +3293,7 @@ function stayCardHtml(cust, pet, stay){
       ${stay.notes ? `<div style="margin-top:12px;font-size:12.5px;color:var(--ink-soft);"><strong>Notes:</strong> ${esc(stay.notes)}</div>` : ''}
       ${apptTimeLineHtml(stay, 'dropoff', `data-edit-closed-appt="${stay.id}|dropoff"`)}
       ${apptTimeLineHtml(stay, 'pickup', `data-edit-closed-appt="${stay.id}|pickup"`)}
-      ${stay.pets.map(sp => {
+      ${stay.pets.map((sp, spIdx) => {
         const spPet = findPetById(sp.petId);
         const editable = stay.status==='Active';
         const key = `${stay.id}:${sp.petId}`;
@@ -3304,6 +3304,7 @@ function stayCardHtml(cust, pet, stay){
           <h4>${ANIMAL_ICON[spPet?.type]||'🐾'} ${petLabel(spPet)} ${spPet?.id===pet.id?'<span class="badge badge-active">this pet</span>':''}${riskFlagBadgesHtml(spPet)}</h4>
           ${vetInfoLineHtml(spPet)}
           <div class="kv-row"><span>Room</span><span>${esc(sp.room)||'Unassigned'}</span></div>
+          ${sp.room ? `<button type="button" class="btn btn-sm" data-whatsapp-msg="${stay.id}|${spIdx}" style="margin:4px 0 8px;">WhatsApp message</button>` : ''}
           ${hasOwnDates ? `<div class="kv-row"><span>Dates</span><span>${fmtDateWithDay(myWindow.checkIn)} → ${fmtDateWithDay(myWindow.checkOut)}</span></div>` : ''}
           <div class="kv-row"><span>Sharing with</span><span>${sp.sharingWith.length ? sharingPetLabelsWithDates(ownerCust, stay, sp).join(', ') : 'Not sharing'}</span></div>
           <div class="kv-row" style="align-items:stretch;">
@@ -3876,6 +3877,13 @@ function wireSubContentEvents(cust, pet){
       const id = el.dataset.toggleStay;
       state.openStays[id] = !(state.openStays[id] ?? true);
       renderPetSubContent(cust, pet);
+    });
+  });
+  root.querySelectorAll('[data-whatsapp-msg]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [stayId, spIdx] = el.dataset.whatsappMsg.split('|');
+      openBoardingWhatsAppModal(stayId, +spIdx);
     });
   });
   root.querySelectorAll('[data-act="edit-stay"]').forEach(el=>{
@@ -7122,6 +7130,244 @@ function openEnquiryModal(){
 
   wirePetRows();
   calc();
+}
+
+/* ===========================================================
+   WhatsApp boarding-details message builder
+   Generates the ready-to-copy quote text for one room booking within
+   a stay (sp = the stay.pets row for that room, sharingWith gives any
+   pets sharing it). Reads live rates/surcharges/holidays/closed-dates
+   from state — never saves or sends anything itself, just builds text
+   for the "Copy WhatsApp message" button to copy to the clipboard.
+   =========================================================== */
+function genericRoomLabel(roomType){
+  if(roomType==='Suite room') return 'Suite room';
+  if(roomType==='Royal Suite') return 'Royal Suite';
+  return 'Deluxe room'; // Dog Deluxe (Bottom/Upper) and Cat Deluxe both read as plain "Deluxe room"
+}
+// S/M share the same rate so they're grouped; L/XL/XXL show their exact size.
+function sizeGroupLabel(size){
+  return ['S','M'].includes(size) ? 'S/M' : (size || 'S/M');
+}
+function ordinalSuffix(n){
+  if(n>=11 && n<=13) return 'th';
+  switch(n%10){ case 1: return 'st'; case 2: return 'nd'; case 3: return 'rd'; default: return 'th'; }
+}
+// "2026-08-08" -> "8th Aug 26"
+function fmtDateOrdinalShort(s){
+  const d = new Date(s+'T00:00:00');
+  const day = d.getDate();
+  const month = d.toLocaleDateString('en-GB',{month:'short'});
+  const yr = String(d.getFullYear()).slice(2);
+  return `${day}${ordinalSuffix(day)} ${month} ${yr}`;
+}
+// "2026-08-10" -> "10/8" (no leading zeros, for the holiday/normal date-range notes)
+function fmtDateShortNoLeadingZero(s){
+  const d = new Date(s+'T00:00:00');
+  return `${d.getDate()}/${d.getMonth()+1}`;
+}
+// RM figure without trailing ".00" but keeping real decimals (e.g. 4.20)
+function fmtRM(n){
+  const rounded = Math.round((n+Number.EPSILON)*100)/100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+// Groups a sorted list of yyyy-mm-dd strings into consecutive-run ranges,
+// e.g. ["08-08","08-09","08-14"] -> "8/8 - 9/8, 14/8" — matches how the
+// normal-rate nights either side of a holiday block are shown together.
+function groupDateRangesForMessage(dateStrs){
+  if(dateStrs.length===0) return '';
+  const sorted = dateStrs.slice().sort();
+  const ranges = [];
+  let start = sorted[0], prev = sorted[0];
+  for(let i=1;i<sorted.length;i++){
+    const d = sorted[i];
+    if(addDays(prev,1)===d){ prev = d; continue; }
+    ranges.push([start, prev]);
+    start = d; prev = d;
+  }
+  ranges.push([start, prev]);
+  return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
+}
+
+function buildBoardingWhatsAppMessage(stay, sp){
+  const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
+  const pets = petIds.map(id=>findPetById(id)).filter(Boolean);
+  if(pets.length===0) return '';
+  const mainPet = pets[0];
+  const room = roomTypeFor(sp.room);
+  const roomLabel = genericRoomLabel(room ? room.type : '');
+  const win = spRoomWindow(stay, sp);
+  const checkIn = win.checkIn, checkOut = win.checkOut;
+  const nights = nightsBetween(checkIn, checkOut);
+  if(nights<=0) return `${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :\n\nCheck-out must be after check-in — please fix the dates on this stay first.`;
+
+  // Per-night breakdown, mirroring computeStayCost()'s own rate/surcharge logic.
+  const nightRows = [];
+  for(let n=0;n<nights;n++){
+    const dateStr = addDays(checkIn, n);
+    const holiday = isHoliday(dateStr);
+    const presentIds = petIds.filter(id=>{
+      const w = petDatesInStay(stay, sp, id);
+      return dateStr >= w.checkIn && dateStr < w.checkOut;
+    });
+    const anyLarge = presentIds.some(id=>{ const p=findPetById(id); return p && ['L','XL','XXL'].includes(p.boardingSize); });
+    let rateObj;
+    if(room && (room.type==='Dog Deluxe (Bottom)' || room.type==='Dog Deluxe (Upper)')){
+      rateObj = anyLarge ? LARGE : state.rates['Dog Deluxe (Bottom)'];
+    } else {
+      rateObj = room ? state.rates[room.type] : {normal:0, holiday:0};
+    }
+    if(!rateObj) rateObj = {normal:0, holiday:0};
+    const baseRate = holiday ? rateObj.holiday : rateObj.normal;
+    const extrasTonight = presentIds.slice(1).map(id=>findPetById(id)).filter(Boolean);
+    const surchargeAmt = extrasTonight.reduce((sum,p)=>{
+      const isLarge = ['L','XL','XXL'].includes(p.boardingSize);
+      return sum + (isLarge ? state.surchargeLXL : state.surchargeSM);
+    },0);
+    nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight });
+  }
+
+  const hasSharing = nightRows.some(r=>r.extrasTonight.length>0);
+  const holidayRows = nightRows.filter(r=>r.holiday);
+  const normalRows = nightRows.filter(r=>!r.holiday);
+  const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0;
+
+  const lines = [];
+  lines.push(`${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :`);
+  lines.push('');
+
+  const ciClosed = closedDateFor(checkIn);
+  const coClosed = closedDateFor(checkOut);
+  const dropoffTime = stay.dropoff && stay.dropoff.time;
+  const pickupTime = stay.pickup && stay.pickup.time;
+  lines.push(`Check In - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(ciClosed && dropoffTime) ? ` _(${dropoffTime})_` : ''}`);
+  lines.push(`Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+  lines.push('');
+
+  // Sharing composition line(s) — "RM60 (1x S/M size dog 1x room) + RM50
+  // (Additional 1x L size dog in same room) = RM110 per night". Grouped by
+  // size so e.g. two S/M extras show as "2x S/M size dog", not two lines.
+  function sharingLine(rows){
+    const sample = rows[0];
+    const baseRate = sample.baseRate;
+    const sizeCounts = {};
+    sample.extrasTonight.forEach(p=>{
+      const lbl = sizeGroupLabel(p.boardingSize);
+      sizeCounts[lbl] = (sizeCounts[lbl]||0)+1;
+    });
+    const extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
+    const perNight = baseRate + sample.surchargeAmt;
+    return { text: `RM${fmtRM(baseRate)} (1x dog/cat 1x room) + RM${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM${fmtRM(perNight)} per night`, perNight };
+  }
+
+  let boardingTotal = 0;
+  let lastLineIsCombine = false; // true when the last boarding line already ends in "X + Y = Z" (holiday split)
+
+  if(!hasHolidaySplit){
+    // Every night uses the same rate (all normal, or all holiday).
+    const rows = nightRows;
+    let perNight = rows[0].baseRate;
+    if(hasSharing){
+      const sl = sharingLine(rows);
+      perNight = sl.perNight;
+      lines.push(sl.text);
+      lines.push('');
+    }
+    boardingTotal = perNight * nights;
+    const holidayTag = rows[0].holiday ? ' (holiday rate)' : '';
+    lines.push(`${nights} night${nights===1?'':'s'} x RM${fmtRM(perNight)} = RM${fmtRM(boardingTotal)}${holidayTag}`);
+  } else {
+    let holidayPerNight = holidayRows[0].baseRate;
+    let normalPerNight = normalRows[0].baseRate;
+    if(hasSharing){
+      lines.push('_Holiday rate_');
+      const hs = sharingLine(holidayRows);
+      holidayPerNight = hs.perNight;
+      lines.push(hs.text);
+      const holidayTotal = holidayPerNight * holidayRows.length;
+      lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM${fmtRM(holidayPerNight)} = RM${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+      lines.push('');
+      lines.push('_Normal rate_');
+      const ns = sharingLine(normalRows);
+      normalPerNight = ns.perNight;
+      lines.push(ns.text);
+      const normalTotal = normalPerNight * normalRows.length;
+      lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM${fmtRM(normalPerNight)} = RM${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+      lines.push('');
+      boardingTotal = holidayTotal + normalTotal;
+      lines.push(`RM${fmtRM(holidayTotal)} + RM${fmtRM(normalTotal)} = RM${fmtRM(boardingTotal)}`);
+      lastLineIsCombine = true;
+    } else {
+      const holidayTotal = holidayPerNight * holidayRows.length;
+      const normalTotal = normalPerNight * normalRows.length;
+      lines.push('_Holiday rate_');
+      lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM${fmtRM(holidayPerNight)} = RM${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+      lines.push('');
+      lines.push('_Normal rate_');
+      lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM${fmtRM(normalPerNight)} = RM${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+      lines.push('');
+      boardingTotal = holidayTotal + normalTotal;
+      lines.push(`RM${fmtRM(holidayTotal)} + RM${fmtRM(normalTotal)} = RM${fmtRM(boardingTotal)}`);
+      lastLineIsCombine = true;
+    }
+  }
+
+  // Additional charges — stay-level, shown at the end regardless of which
+  // boarding case above applied. Free basic grooming (FBG) appointments
+  // don't carry a charge (they're free) so they're counted separately and
+  // just noted in the final bold total line.
+  const charges = (stay.charges||[]).map(c=>({ label: c.description || c.category, amount: (+c.amount||0) * (+c.qty||1) }));
+  const chargesTotal = charges.reduce((s,c)=>s+c.amount,0);
+  let fbgCount = 0;
+  pets.forEach(p=>{
+    fbgCount += (p.groomingHistory||[]).filter(g =>
+      (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<checkOut
+    ).length;
+  });
+  const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
+
+  if(charges.length===0 && fbgCount===0){
+    // Nothing to add on — just bold the final total in place.
+    const lastIdx = lines.length-1;
+    lines[lastIdx] = lines[lastIdx].replace(`RM${fmtRM(boardingTotal)}`, `*Total RM${fmtRM(boardingTotal)}*`);
+  } else {
+    // Tag the boarding-only subtotal so it's clear what it covers, then add
+    // a second combine step bringing in charges/grooming, bold on the final line only.
+    if(lastLineIsCombine){
+      const lastIdx = lines.length-1;
+      lines[lastIdx] = lines[lastIdx] + ' (Boarding)';
+    }
+    lines.push('');
+    const grandTotal = boardingTotal + chargesTotal;
+    const addendsLine = [`RM${fmtRM(boardingTotal)}`, ...charges.map(c=>`RM${fmtRM(c.amount)} (${esc(c.label)})`)].join(' + ');
+    lines.push(addendsLine);
+    lines.push(`= *Total RM${fmtRM(grandTotal)}${fbgNote}*`);
+  }
+
+  return lines.join('\n');
+}
+
+function openBoardingWhatsAppModal(stayId, spIndex){
+  const stay = findStayById(stayId);
+  if(!stay) return;
+  const sp = stay.pets[spIndex];
+  if(!sp) return;
+  const message = buildBoardingWhatsAppMessage(stay, sp);
+  openModal(`
+    <div class="modal-head"><h3>WhatsApp message</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="white-space:pre-line;font-size:13px;line-height:1.55;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:12px 14px;">${esc(message)}</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn btn-primary" id="copyEnqBtn">Copy</button>
+    </div>
+  `, {wide:true});
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('copyEnqBtn').addEventListener('click', async ()=>{
+    try{ await navigator.clipboard.writeText(message); toast('Message copied'); }
+    catch(err){ toast('Could not copy — long-press the message text instead'); }
+  });
 }
 
 function openRatesModal(){
