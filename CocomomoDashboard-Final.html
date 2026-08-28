@@ -3360,15 +3360,15 @@ function stayCardHtml(cust, pet, stay){
           `).join('')}
       </div>
       <div class="cost-box">
-        <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM${cost.surchargeTotal.toFixed(2)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM${cost.chargesTotal.toFixed(2)} additional charges${cost.paidChargesTotal>0?` (RM${cost.paidChargesTotal.toFixed(2)} of that already paid)`:''}`:''}</div>
-        ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${cost.paidChargesTotal.toFixed(2)} of the additional charges above is marked paid.</div>` : ''}
-        <div class="cost-total">Estimated total: RM ${cost.total.toFixed(2)}</div>
-        ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">Combined into one bill with ${billing.groupStayCount-1} other stay${billing.groupStayCount-1===1?'':'s'} — combined bill total RM ${billing.groupCost.toFixed(2)}</div>` : ''}
-        <div class="cost-paid">Paid amount${billing.isMerged?' (combined bill)':''}: RM ${billing.paid.toFixed(2)}</div>
+        <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
+        ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${fmtRM2(cost.paidChargesTotal)} of the additional charges above is marked paid.</div>` : ''}
+        <div class="cost-total">Estimated total: RM ${fmtRM2(cost.total)}</div>
+        ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">Combined into one bill with ${billing.groupStayCount-1} other stay${billing.groupStayCount-1===1?'':'s'} — combined bill total RM ${fmtRM2(billing.groupCost)}</div>` : ''}
+        <div class="cost-paid">Paid amount${billing.isMerged?' (combined bill)':''}: RM ${fmtRM2(billing.paid)}</div>
         ${billing.balance > 0.004
-          ? `<div class="cost-outstanding">Outstanding${billing.isMerged?' (combined)':''}: RM ${billing.balance.toFixed(2)}</div>`
+          ? `<div class="cost-outstanding">Outstanding${billing.isMerged?' (combined)':''}: RM ${fmtRM2(billing.balance)}</div>`
           : billing.balance < -0.004
-            ? `<div class="cost-outstanding cost-outstanding-clear">Paid in full — overpaid by RM ${Math.abs(billing.balance).toFixed(2)}</div>`
+            ? `<div class="cost-outstanding cost-outstanding-clear">Paid in full — overpaid by RM ${fmtRM2(Math.abs(billing.balance))}</div>`
             : `<div class="cost-outstanding cost-outstanding-clear">Outstanding: RM 0.00 — paid in full</div>`
         }
       </div>
@@ -3397,7 +3397,7 @@ function chargeAddRowHtml(stay){
     </select>
     ${isGroom ? `
       ${petOptions.length>1 ? `<select data-charge-groom-pet="${stay.id}">${petOptions.map(p=>`<option value="${p.id}" ${p.id===selectedPet?.id?'selected':''}>${esc(petLabel(p))}</option>`).join('')}</select>` : ''}
-      <select data-charge-groom-item="${stay.id}">${groomOpts.map(o=>`<option value="${o.key}" ${o.key===selectedOpt?.key?'selected':''}>${esc(o.label)} — RM${o.amount.toFixed(2)}</option>`).join('')}</select>
+      <select data-charge-groom-item="${stay.id}">${groomOpts.map(o=>`<option value="${o.key}" ${o.key===selectedOpt?.key?'selected':''}>${esc(o.label)} — RM ${fmtRM2(o.amount)}</option>`).join('')}</select>
       <input type="number" min="1" step="1" placeholder="Qty" value="1" data-charge-newqty="${stay.id}">
       <input type="number" step="0.01" min="0" value="${selectedOpt?selectedOpt.amount.toFixed(2):''}" data-charge-amount="${stay.id}" readonly title="Preset rate — pick a different item to change it" style="background:var(--line-soft);">
     ` : `
@@ -3421,8 +3421,8 @@ function chargeRowHtml(stayId, c, editable){
       ? `<span class="charge-qty-edit">Qty <input type="number" min="1" step="1" value="${qty}" data-charge-qty="${stayId}:${c.id}"></span>`
       : `<span class="charge-qty">× ${qty}</span>`}
     ${editable
-      ? `<span class="charge-qty-edit">RM <input type="number" min="0" step="0.01" value="${(+c.amount||0).toFixed(2)}" data-charge-amount-edit="${stayId}:${c.id}" style="width:64px;"> each${qty>1?` = RM ${lineTotal.toFixed(2)}`:''}</span>`
-      : `<span class="charge-amount">RM ${(+c.amount||0).toFixed(2)} each${qty>1?` = RM ${lineTotal.toFixed(2)}`:''}</span>`}
+      ? `<span class="charge-qty-edit">RM <input type="number" min="0" step="0.01" value="${(+c.amount||0).toFixed(2)}" data-charge-amount-edit="${stayId}:${c.id}" style="width:64px;"> each${qty>1?` = RM ${fmtRM2(lineTotal)}`:''}</span>`
+      : `<span class="charge-amount">RM ${fmtRM2(+c.amount||0)} each${qty>1?` = RM ${fmtRM2(lineTotal)}`:''}</span>`}
     ${paidBadge}
     ${editable ? `<button type="button" class="btn btn-sm btn-danger" data-charge-remove="${stayId}:${c.id}">✕</button>` : ''}
   </div>`;
@@ -7094,8 +7094,8 @@ function openEnquiryModal(){
       const amt = perNight * nights;
       surchargeTotal += amt;
       surchargeLines.push(`<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
-        <span>Pet ${i+2} sharing (${p.size}) — RM${perNight}/night × ${nights} night${nights===1?'':'s'}</span>
-        <span>RM ${amt.toFixed(2)}</span>
+        <span>Pet ${i+2} sharing (${p.size}) — RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'}</span>
+        <span>RM ${fmtRM2(amt)}</span>
       </div>`);
     });
 
@@ -7112,19 +7112,19 @@ function openEnquiryModal(){
 
     if(normalNights>0){
       html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;">
-        <span>Normal RM${normalRate}/night × ${normalNights} night${normalNights===1?'':'s'}</span>
-        <span>RM ${(normalRate*normalNights).toFixed(2)}</span>
+        <span>Normal RM ${fmtRM(normalRate)}/night × ${normalNights} night${normalNights===1?'':'s'}</span>
+        <span>RM ${fmtRM2(normalRate*normalNights)}</span>
       </div>`;
     }
     if(holidayNights>0){
       html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;color:#9c5a1e;">
-        <span>Holiday RM${holidayRate}/night × ${holidayNights} night${holidayNights===1?'':'s'}</span>
-        <span>RM ${(holidayRate*holidayNights).toFixed(2)}</span>
+        <span>Holiday RM ${fmtRM(holidayRate)}/night × ${holidayNights} night${holidayNights===1?'':'s'}</span>
+        <span>RM ${fmtRM2(holidayRate*holidayNights)}</span>
       </div>`;
     }
     html += surchargeLines.join('');
     html += `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:16px;padding-top:10px;margin-top:6px;border-top:1px solid var(--line-soft);color:var(--teal-dark,#144A87);">
-        <span>Estimated total</span><span>RM ${grandTotal.toFixed(2)}</span>
+        <span>Estimated total</span><span>RM ${fmtRM2(grandTotal)}</span>
       </div>
       <div style="font-size:11.5px;color:var(--ink-soft);margin-top:10px;">Estimate only — promo/custom rates and closed-day fees aren't included. Confirm exact pricing when actually booking the stay.</div>
     </div>`;
@@ -7169,10 +7169,21 @@ function fmtDateShortNoLeadingZero(s){
   const d = new Date(s+'T00:00:00');
   return `${d.getDate()}/${d.getMonth()+1}`;
 }
-// RM figure without trailing ".00" but keeping real decimals (e.g. 4.20)
+// RM figure without trailing ".00" but keeping real decimals (e.g. 4.20),
+// with thousand separators (11660 -> "11,660", 1234.5 -> "1,234.50").
 function fmtRM(n){
   const rounded = Math.round((n+Number.EPSILON)*100)/100;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+  const str = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+  const [intPart, decPart] = str.split('.');
+  const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return decPart ? `${withCommas}.${decPart}` : withCommas;
+}
+// Same thousand-separator treatment but always shows 2 decimals — for the
+// cost-box/charges/enquiry-calculator spots that always showed ".00" before.
+function fmtRM2(n){
+  const fixed = (+n||0).toFixed(2);
+  const [intPart, decPart] = fixed.split('.');
+  return `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${decPart}`;
 }
 // Groups a sorted list of yyyy-mm-dd strings into consecutive-run ranges,
 // e.g. ["08-08","08-09","08-14"] -> "8/8 - 9/8, 14/8" — matches how the
@@ -7192,7 +7203,7 @@ function groupDateRangesForMessage(dateStrs){
   return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
 }
 
-function buildBoardingWhatsAppMessage(stay, sp){
+function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
   const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
   const pets = petIds.map(id=>findPetById(id)).filter(Boolean);
   if(pets.length===0) return '';
@@ -7204,10 +7215,19 @@ function buildBoardingWhatsAppMessage(stay, sp){
   const nights = nightsBetween(checkIn, checkOut);
   if(nights<=0) return `${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :\n\nCheck-out must be after check-in — please fix the dates on this stay first.`;
 
+  // Nights already marked paid (stay.paidThrough, see "Nights paid" on the
+  // stay card) are skipped entirely from the quote below — only the
+  // not-yet-paid remainder is counted and shown.
+  let paidThroughCapped = null;
+  if(stay.paidThrough && stay.paidThrough > checkIn){
+    paidThroughCapped = stay.paidThrough > checkOut ? checkOut : stay.paidThrough;
+  }
+
   // Per-night breakdown, mirroring computeStayCost()'s own rate/surcharge logic.
   const nightRows = [];
   for(let n=0;n<nights;n++){
     const dateStr = addDays(checkIn, n);
+    if(paidThroughCapped && dateStr < paidThroughCapped) continue; // already paid — leave out of the quote
     const holiday = isHoliday(dateStr);
     const presentIds = petIds.filter(id=>{
       const w = petDatesInStay(stay, sp, id);
@@ -7229,11 +7249,6 @@ function buildBoardingWhatsAppMessage(stay, sp){
     },0);
     nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight });
   }
-
-  const hasSharing = nightRows.some(r=>r.extrasTonight.length>0);
-  const holidayRows = nightRows.filter(r=>r.holiday);
-  const normalRows = nightRows.filter(r=>!r.holiday);
-  const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0;
 
   const lines = [];
   lines.push(`${pets.map(p=>p.name).join(' & ')}'s ${roomLabel} boarding details :`);
@@ -7260,58 +7275,68 @@ function buildBoardingWhatsAppMessage(stay, sp){
     });
     const extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
     const perNight = baseRate + sample.surchargeAmt;
-    return { text: `RM${fmtRM(baseRate)} (1x dog/cat 1x room) + RM${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM${fmtRM(perNight)} per night`, perNight };
+    return { text: `RM ${fmtRM(baseRate)} (1x dog/cat 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
   }
 
   let boardingTotal = 0;
   let lastLineIsCombine = false; // true when the last boarding line already ends in "X + Y = Z" (holiday split)
 
-  if(!hasHolidaySplit){
-    // Every night uses the same rate (all normal, or all holiday).
-    const rows = nightRows;
-    let perNight = rows[0].baseRate;
-    if(hasSharing){
-      const sl = sharingLine(rows);
-      perNight = sl.perNight;
-      lines.push(sl.text);
-      lines.push('');
-    }
-    boardingTotal = perNight * nights;
-    const holidayTag = rows[0].holiday ? ' (holiday rate)' : '';
-    lines.push(`${nights} night${nights===1?'':'s'} x RM${fmtRM(perNight)} = RM${fmtRM(boardingTotal)}${holidayTag}`);
+  if(nightRows.length===0){
+    lines.push('All nights for this stay have already been paid — nothing new to quote for boarding.');
   } else {
-    let holidayPerNight = holidayRows[0].baseRate;
-    let normalPerNight = normalRows[0].baseRate;
-    if(hasSharing){
-      lines.push('_Holiday rate_');
-      const hs = sharingLine(holidayRows);
-      holidayPerNight = hs.perNight;
-      lines.push(hs.text);
-      const holidayTotal = holidayPerNight * holidayRows.length;
-      lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM${fmtRM(holidayPerNight)} = RM${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
-      lines.push('');
-      lines.push('_Normal rate_');
-      const ns = sharingLine(normalRows);
-      normalPerNight = ns.perNight;
-      lines.push(ns.text);
-      const normalTotal = normalPerNight * normalRows.length;
-      lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM${fmtRM(normalPerNight)} = RM${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
-      lines.push('');
-      boardingTotal = holidayTotal + normalTotal;
-      lines.push(`RM${fmtRM(holidayTotal)} + RM${fmtRM(normalTotal)} = RM${fmtRM(boardingTotal)}`);
-      lastLineIsCombine = true;
+    const hasSharing = nightRows.some(r=>r.extrasTonight.length>0);
+    const holidayRows = nightRows.filter(r=>r.holiday);
+    const normalRows = nightRows.filter(r=>!r.holiday);
+    const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0;
+    const quotedNights = nightRows.length;
+
+    if(!hasHolidaySplit){
+      // Every remaining night uses the same rate (all normal, or all holiday).
+      const rows = nightRows;
+      let perNight = rows[0].baseRate;
+      if(hasSharing){
+        const sl = sharingLine(rows);
+        perNight = sl.perNight;
+        lines.push(sl.text);
+        lines.push('');
+      }
+      boardingTotal = perNight * quotedNights;
+      const holidayTag = rows[0].holiday ? ' (holiday rate)' : '';
+      lines.push(`${quotedNights} night${quotedNights===1?'':'s'} x RM ${fmtRM(perNight)} = RM ${fmtRM(boardingTotal)}${holidayTag}`);
     } else {
-      const holidayTotal = holidayPerNight * holidayRows.length;
-      const normalTotal = normalPerNight * normalRows.length;
-      lines.push('_Holiday rate_');
-      lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM${fmtRM(holidayPerNight)} = RM${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
-      lines.push('');
-      lines.push('_Normal rate_');
-      lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM${fmtRM(normalPerNight)} = RM${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
-      lines.push('');
-      boardingTotal = holidayTotal + normalTotal;
-      lines.push(`RM${fmtRM(holidayTotal)} + RM${fmtRM(normalTotal)} = RM${fmtRM(boardingTotal)}`);
-      lastLineIsCombine = true;
+      let holidayPerNight = holidayRows[0].baseRate;
+      let normalPerNight = normalRows[0].baseRate;
+      if(hasSharing){
+        lines.push('_Holiday rate_');
+        const hs = sharingLine(holidayRows);
+        holidayPerNight = hs.perNight;
+        lines.push(hs.text);
+        const holidayTotal = holidayPerNight * holidayRows.length;
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push('');
+        lines.push('_Normal rate_');
+        const ns = sharingLine(normalRows);
+        normalPerNight = ns.perNight;
+        lines.push(ns.text);
+        const normalTotal = normalPerNight * normalRows.length;
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push('');
+        boardingTotal = holidayTotal + normalTotal;
+        lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
+        lastLineIsCombine = true;
+      } else {
+        const holidayTotal = holidayPerNight * holidayRows.length;
+        const normalTotal = normalPerNight * normalRows.length;
+        lines.push('_Holiday rate_');
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push('');
+        lines.push('_Normal rate_');
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push('');
+        boardingTotal = holidayTotal + normalTotal;
+        lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
+        lastLineIsCombine = true;
+      }
     }
   }
 
@@ -7329,22 +7354,34 @@ function buildBoardingWhatsAppMessage(stay, sp){
   });
   const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
 
-  if(charges.length===0 && fbgCount===0){
+  // Deposit already paid on the customer's card, linked to this stay —
+  // subtracted at the end of the addends line and reflected in the total,
+  // with an "outstanding balance" note (only shown when a deposit exists).
+  const depositTotal = ((ownerCust && ownerCust.payments) || [])
+    .filter(p => p.type==='Deposit' && (p.stayIds||[]).includes(stay.id))
+    .reduce((s,p)=>s+(+p.amount||0), 0);
+
+  const hasExtra = charges.length>0 || fbgCount>0 || depositTotal>0;
+
+  if(!hasExtra){
     // Nothing to add on — just bold the final total in place.
     const lastIdx = lines.length-1;
-    lines[lastIdx] = lines[lastIdx].replace(`RM${fmtRM(boardingTotal)}`, `*Total RM${fmtRM(boardingTotal)}*`);
+    lines[lastIdx] = lines[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
   } else {
     // Tag the boarding-only subtotal so it's clear what it covers, then add
-    // a second combine step bringing in charges/grooming, bold on the final line only.
+    // a combine step bringing in charges/grooming/deposit, bold on the
+    // final line only.
     if(lastLineIsCombine){
       const lastIdx = lines.length-1;
       lines[lastIdx] = lines[lastIdx] + ' (Boarding)';
     }
     lines.push('');
-    const grandTotal = boardingTotal + chargesTotal;
-    const addendsLine = [`RM${fmtRM(boardingTotal)}`, ...charges.map(c=>`RM${fmtRM(c.amount)} (${esc(c.label)})`)].join(' + ');
-    lines.push(addendsLine);
-    lines.push(`= *Total RM${fmtRM(grandTotal)}${fbgNote}*`);
+    const grandTotal = boardingTotal + chargesTotal - depositTotal;
+    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...charges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
+    if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
+    lines.push(addendsParts.join(' '));
+    const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
+    lines.push(`= *Total RM ${fmtRM(grandTotal)}${balanceNote}${fbgNote}*`);
   }
 
   return lines.join('\n');
@@ -7355,7 +7392,8 @@ function openBoardingWhatsAppModal(stayId, spIndex){
   if(!stay) return;
   const sp = stay.pets[spIndex];
   if(!sp) return;
-  const message = buildBoardingWhatsAppMessage(stay, sp);
+  const ownerCust = findStayOwnerCustomer(stayId);
+  const message = buildBoardingWhatsAppMessage(stay, sp, ownerCust);
   openModal(`
     <div class="modal-head"><h3>WhatsApp message</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
