@@ -2113,7 +2113,12 @@ function computeReminders(dateStr){
       });
     });
   });
-  groomItems.sort((a,b)=> (a.record.time||'').localeCompare(b.record.time||'') || (a.record.bay||'').localeCompare(b.record.bay||''));
+  groomItems.sort((a,b)=> (Number(a.sent)-Number(b.sent)) || (a.record.time||'').localeCompare(b.record.time||'') || (a.record.bay||'').localeCompare(b.record.bay||''));
+  // Sent items sink to the bottom (same pattern as Today grid's columns) —
+  // sort is stable, so within each group (unsent/sent) the original order
+  // (whatever order they were found in) is preserved.
+  checkinItems.sort((a,b)=> Number(a.sent)-Number(b.sent));
+  checkoutItems.sort((a,b)=> Number(a.sent)-Number(b.sent));
   return { dateStr, dayLabel, groomItems, checkinItems, checkoutItems };
 }
 function setReminderSent(item, sent){
