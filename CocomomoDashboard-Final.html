@@ -3957,6 +3957,44 @@ function isRoomAvailable(roomId, checkIn, checkOut, excludeStayId){
   }
   return true;
 }
+/* Live, server-side version of isRoomAvailable — pain point #5 follow-up
+   (29 Aug 2026), same reasoning as findGroomConflictLive: isRoomAvailable
+   above only checks THIS device's local in-memory copy of every stay, so
+   two devices booking the same room over overlapping dates within moments
+   of each other both pass the local check and create two genuinely
+   double-booked stays — version-safety only protects concurrent edits to
+   the SAME stay row, not two different new rows landing on the same room.
+   Queries the live `stays` table directly right before the booking is
+   committed. Broad date-overlap prefilter server-side, then the exact
+   per-pet room-window overlap (identical logic to isRoomAvailable, reusing
+   spRoomWindow) client-side against the freshly-fetched rows — reusing the
+   same normalizeStay shape loadStaysFromTables uses, so this stays
+   consistent with the rest of the app if that shape ever changes. Returns
+   true/false — never throws; a query failure is treated as "couldn't
+   confirm, proceed" so a network hiccup doesn't block booking outright. */
+async function isRoomAvailableLive(roomId, checkIn, checkOut, excludeStayId){
+  if(!cloudEnabled || !checkIn || !checkOut) return true;
+  let q = sb.from('stays').select('*').gt('check_out', checkIn).lt('check_in', checkOut);
+  if(excludeStayId) q = q.neq('id', excludeStayId);
+  const { data, error } = await q;
+  if(error){ console.error('Live room conflict check failed:', error); return true; }
+  for(const s of (data||[])){
+    const stay = normalizeStay({
+      id: s.id, checkIn: s.check_in, checkOut: s.check_out, status: s.status,
+      checkedIn: s.checked_in, checkedInPets: s.checked_in_pets || [],
+      notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
+      charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
+      paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+      billingGroupId: s.billing_group_id || null, daycareRate: s.daycare_rate,
+    });
+    for(const sp of (stay.pets||[])){
+      if(sp.room !== roomId) continue;
+      const w = spRoomWindow(stay, sp);
+      if(checkIn < w.checkOut && w.checkIn < checkOut) return false;
+    }
+  }
+  return true;
+}
 
 function petGroomingHtml(cust, pet){
   const today = todayStr();
@@ -5403,7 +5441,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
   function allPetsExcept(cust, ids){ return cust.pets.filter(p=>!ids.includes(p.id)); }
   wireStayRowEvents();
 
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const checkIn = document.getElementById('s_in').value;
     const checkOut = document.getElementById('s_out').value;
     if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid check-in/check-out dates'); return; }
@@ -5429,6 +5467,23 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     }
     const conflictRoom = workingPets.find(w => { const rw = spRoomWindow({checkIn, checkOut}, w); return !isRoomAvailable(w.room, rw.checkIn, rw.checkOut, existing?.id); });
     if(conflictRoom){ toast(`${conflictRoom.room} is already booked for these dates — please choose a different room`); return; }
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
+    // Re-check every assigned room against the LIVE table right before
+    // committing — same reasoning as findGroomConflictLive: closes the
+    // window where another device booked one of these rooms moments ago
+    // and this device hasn't reloaded yet.
+    let liveConflictRoom = null;
+    for(const w of workingPets){
+      const rw = spRoomWindow({checkIn, checkOut}, w);
+      const available = await isRoomAvailableLive(w.room, rw.checkIn, rw.checkOut, existing?.id);
+      if(!available){ liveConflictRoom = w; break; }
+    }
+    saveBtn.disabled = false; saveBtn.textContent = 'Save';
+    if(liveConflictRoom){
+      toast(`${liveConflictRoom.room} was just booked by another device — please choose a different room`);
+      return;
+    }
     for(const w of workingPets){
       const wPet = findPetAcrossStay(cust, w.petId);
       if(wPet && !confirmIfNearbyStay(wPet, checkIn, existing?.id)) return;
@@ -8748,7 +8803,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   document.getElementById('cb_cust_search').focus();
 
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const cust = getCustomer(document.getElementById('cb_cust').value);
     const pet = cust ? getPet(cust, document.getElementById('cb_pet').value) : null;
     if(!cust || !pet){ toast('Please pick a customer with a pet'); return; }
@@ -8777,6 +8832,14 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     const stayPet = { petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[], dates: cbSharingDates };
     const rowWindow = spRoomWindow({checkIn, checkOut}, stayPet);
     if(!isRoomAvailable(room, rowWindow.checkIn, rowWindow.checkOut, null)){ toast(`${room} is already booked for these dates`); return; }
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
+    // Live re-check right before committing — same reasoning as the other
+    // booking modal (see isRoomAvailableLive) — this is a separate code
+    // path (quick-book from the pet's card) with the same local-only gap.
+    const available = await isRoomAvailableLive(room, rowWindow.checkIn, rowWindow.checkOut, null);
+    saveBtn.disabled = false; saveBtn.textContent = 'Save';
+    if(!available){ toast(`${room} was just booked by another device — please choose a different room`); return; }
     if(!confirmIfNearbyStay(pet, checkIn, null)) return;
     const isDaycareNow = checkIn === checkOut;
     let customRate = null, customRateMode = 'flat', daycareRate = null;
