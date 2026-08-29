@@ -586,6 +586,7 @@ let _groomsBaseline = []; // last-known flattened grooming list as reflected in 
 let _groomVersions = new Map(); // pain point #5, phase 5 (29 Aug 2026) — id -> version this device last saw for each grooming appointment; kept OUTSIDE the groom objects, same reasoning as _stayVersions (phase 4)
 let _lastSyncedPaymentsJSON = null; // 23 Aug 2026 migration — payments tracked separately too, see syncPaymentsToTables()
 let _paymentsBaseline = []; // last-known flattened payments list as reflected in the payments table
+let _paymentVersions = new Map(); // pain point #5, phase 6 (29 Aug 2026) — id -> version this device last saw for each payment; kept OUTSIDE the payment objects, same reasoning as _groomVersions (phase 5)
 let _lastSyncedChangeLogJSON = null; // 27 Aug 2026 migration (Phase 7) — change log tracked separately too, see syncChangeLogToTables()
 let _changeLogBaseline = []; // last-known state.changeLog as reflected in the change_log table
 let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — cancellations tracked separately too, see syncCancellationsToTables()
@@ -6772,29 +6773,46 @@ async function loadPaymentsFromTables(){
     (byCust[p.customer_id] = byCust[p.customer_id] || []).push(pmt);
   });
   state.customers.forEach(c=>{ c.payments = byCust[c.id] || []; });
+  _paymentVersions = new Map((rows||[]).map(p=>[p.id, p.version]));
   const flatNow = flattenAllPayments(state.customers);
   _lastSyncedPaymentsJSON = JSON.stringify(flatNow);
   _paymentsBaseline = JSON.parse(_lastSyncedPaymentsJSON);
 }
 /* Diffs `baseline` against `current` (both flattened lists) and writes
-   only the payments that actually changed. Same upsert/delete pattern as
-   everywhere else — safe to blindly retry. */
+   only the payments that actually changed. New payments still go through
+   upsert() (retry-safe). Existing payments that changed use a conditional
+   update instead (WHERE id = X AND version = <last seen in
+   _paymentVersions>) — pain point #5, phase 6: 0 rows affected means
+   another device saved this same payment since this device last loaded
+   it, so this throws SyncConflictError instead of overwriting. Deletes
+   are conditioned the same way. Every successful write updates
+   _paymentVersions immediately, same reasoning as every phase before this
+   — so the next save's condition checks against what THIS save just
+   produced. */
 async function syncPaymentsToTables(baseline, current){
   const baseById = new Map(baseline.map(x=>[x.pmt.id, x]));
   const curIds = new Set(current.map(x=>x.pmt.id));
   for(const {pmt} of baseline){
     if(!curIds.has(pmt.id)){
-      const { error } = await sb.from('payments').delete().eq('id', pmt.id);
+      const { data, error } = await sb.from('payments').delete().eq('id', pmt.id).eq('version', _paymentVersions.get(pmt.id)).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A payment`, loadPaymentsFromTables);
+      _paymentVersions.delete(pmt.id);
     }
   }
   for(const {pmt, customerId} of current){
     const old = baseById.get(pmt.id);
     const row = mapPaymentRow(pmt, customerId);
     const oldRow = old ? mapPaymentRow(old.pmt, old.customerId) : null;
-    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
-      const { error } = await sb.from('payments').upsert(row);
+    if(!old){
+      const { data, error } = await sb.from('payments').upsert(row).select().single();
       if(error) throw error;
+      _paymentVersions.set(pmt.id, data.version);
+    } else if(JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { data, error } = await sb.from('payments').update(row).eq('id', pmt.id).eq('version', _paymentVersions.get(pmt.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A payment`, loadPaymentsFromTables);
+      _paymentVersions.set(pmt.id, data[0].version);
     }
   }
 }
@@ -7245,11 +7263,12 @@ async function restoreArchivedRecord(kind, id){
         id: row.id, type: row.type, amount: row.amount, date: row.date,
         receiptNo: row.receipt_no || '', stayIds: row.stay_ids || [],
       });
-      const { error: upErr } = await sb.from('payments').upsert(mapPaymentRow(pmt, cust.id));
+      const { data, error: upErr } = await sb.from('payments').upsert(mapPaymentRow(pmt, cust.id)).select().single();
       if(upErr) throw upErr;
       const { error: delErr } = await sb.from('payments_archive').delete().eq('id', id);
       if(delErr) throw delErr;
       cust.payments = [...(cust.payments||[]), pmt];
+      _paymentVersions.set(pmt.id, data.version);
       const paymentsFlatNow = flattenAllPayments(state.customers);
       _lastSyncedPaymentsJSON = JSON.stringify(paymentsFlatNow); _paymentsBaseline = JSON.parse(_lastSyncedPaymentsJSON);
     }
