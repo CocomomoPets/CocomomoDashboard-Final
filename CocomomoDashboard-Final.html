@@ -4510,18 +4510,22 @@ function wireSubContentEvents(cust, pet){
   // selected appointment. Anything that would land on an already-booked
   // bay/time is held back and handed to a follow-up popup so staff can pick
   // a new time/bay for just those, instead of silently skipping them.
-  function bulkApplyBooking(computeNew, verb){
+  async function bulkApplyBooking(computeNew, verb){
     let moved = 0; const conflicts = [];
-    pet.groomingHistory.forEach(g=>{
-      if(!_groomSelection.has(g.id)) return;
+    const selected = pet.groomingHistory.filter(g=>_groomSelection.has(g.id));
+    for(const g of selected){
       const { date:newDate, time:newTime, bay:newBay } = computeNew(g);
-      if(findGroomConflict(newDate, newTime, newBay, g.id)){
+      // Live check follows the local one — pain point #5 follow-up (29 Aug
+      // 2026), same reasoning as the booking modals: a bulk move can just
+      // as easily land on a slot another device booked moments ago, and
+      // the local-only check can't see that.
+      if(findGroomConflict(newDate, newTime, newBay, g.id) || await findGroomConflictLive(newDate, newTime, newBay, g.id)){
         conflicts.push({ groomId: g.id, newDate, newTime, newBay });
       } else {
         g.date = newDate; g.time = newTime; g.bay = newBay;
         moved++;
       }
-    });
+    }
     scheduleSync();
     renderPetSubContent(cust, pet);
     if(conflicts.length){
@@ -5524,7 +5528,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
       dropoff: inClosed ? {...workingDropoff} : normalizeClosedAppt({time:workingDropoff.time, contactName:'', contactPhone:''}),
       pickup: outClosed ? {...workingPickup} : normalizeClosedAppt({time:workingPickup.time, contactName:'', contactPhone:''}),
     };
-    const doSave = ()=>{
+    const doSave = async ()=>{
       let freeResult = { assignedCount:0, movedCount:0, assignedList:[] };
       if(existing){
         // Snapshot each pet's window as it stood BEFORE this edit (used to
@@ -5549,14 +5553,14 @@ function openStayModal(cust, primaryPet, existing, afterSave){
         // reusable appointment is left.
         if(existing.status === 'Active'){
           const petWindows = existing.pets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(existing, w, id) })));
-          freeResult = reconcileFreeGroomings(cust, existing, petWindows, oldWindowsByPetId);
+          freeResult = await reconcileFreeGroomings(cust, existing, petWindows, oldWindowsByPetId);
         }
       }
       else{
         const newStay = { id:uid('stay'), charges:[], ...payload };
         primaryPet.stays.push(newStay);
         const petWindows = workingPets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(newStay, w, id) })));
-        freeResult = assignFreeGroomings(cust, petWindows);
+        freeResult = await assignFreeGroomings(cust, petWindows);
       }
       closeModal(); onSaved(); scheduleSync();
       if(freeResult.assignedCount > 0){
@@ -5979,21 +5983,32 @@ function findFreeGroomSlot(date, prefTime, prefBay, excludeId){
    ("(Boarding)") for that pet, so it's safe to call again after a stay's
    dates are edited (e.g. check-out pushed later, crossing another 7-night
    threshold) without duplicating groomings already booked. */
-function assignFreeGroomings(cust, petWindows){
+async function assignFreeGroomings(cust, petWindows){
   let assignedCount = 0;
   const assignedList = [];
   const seen = new Set();
-  petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId)).forEach(({petId, checkIn, checkOut})=>{
+  for(const {petId, checkIn, checkOut} of petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId))){
     const { pet, cust: petCust } = findPetWithCustomer(petId);
-    if(!pet || pet.type !== 'Dog') return;
+    if(!pet || pet.type !== 'Dog') continue;
     const owner = petCust || cust;
     const dates = computeFreeGroomingDates(checkIn, checkOut);
-    dates.forEach((date, idx)=>{
+    for(let idx=0; idx<dates.length; idx++){
+      const date = dates[idx];
       const alreadyHas = (pet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
-      if(alreadyHas) return;
+      if(alreadyHas) continue;
       const isCheckoutDay = idx === dates.length - 1;
       const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
-      if(!slot) return;
+      if(!slot) continue;
+      // One live check on the FINAL resolved slot only, not on every
+      // candidate findFreeGroomSlot tries internally — pain point #5
+      // follow-up (29 Aug 2026). This is a much lower-risk path than a
+      // person actively picking a slot (it's a side effect of booking a
+      // stay, not a race to grab a specific time), so a single check here
+      // is enough to close the real gap (creating a live duplicate)
+      // without turning every stay save into a slow chain of per-candidate
+      // network round-trips. If it turns out taken, this date is simply
+      // skipped rather than double-booked — staff can add it manually.
+      if(await findGroomConflictLive(date, slot.time, slot.bay, null)) continue;
       const record = {
         id: uid('groom'), date, time: slot.time, bay: slot.bay,
         apptTypes: ['FBG'], sizeCode: pet.groomingSize || '', cutCode:'', details:'',
@@ -6004,8 +6019,8 @@ function assignFreeGroomings(cust, petWindows){
       pet.groomingHistory.push(record);
       assignedList.push({ cust: owner, pet, record });
       assignedCount++;
-    });
-  });
+    }
+  }
   return { assignedCount, assignedList };
 }
 /* Used when SAVING AN EDIT to an existing stay (not on first creation) —
@@ -6025,13 +6040,13 @@ function assignFreeGroomings(cust, petWindows){
    check — a slot that's already come and gone doesn't get moved, reused, or
    backfilled even if it's still "Not arrived"; only today's and future slots
    are reconciled. */
-function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
+async function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
   let assignedCount = 0, movedCount = 0;
   const assignedList = [];
   const seen = new Set();
-  petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId)).forEach(({petId, checkIn, checkOut})=>{
+  for(const {petId, checkIn, checkOut} of petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId))){
     const { pet, cust: petCust } = findPetWithCustomer(petId);
-    if(!pet || pet.type !== 'Dog') return;
+    if(!pet || pet.type !== 'Dog') continue;
     const owner = petCust || cust;
     const newDates = computeFreeGroomingDates(checkIn, checkOut);
     const oldWindow = (oldWindowsByPetId && oldWindowsByPetId[petId]) || { checkIn, checkOut };
@@ -6047,18 +6062,22 @@ function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
     const lockedDates = new Set(linked.filter(g => g.status==='Done & Informed' || g.status==='Picked up' || g.date < today).map(g=>g.date));
     const movablePool = linked.filter(g => g.status!=='Done & Informed' && g.status!=='Picked up' && g.date >= today);
     const neededDates = newDates.filter(d => !lockedDates.has(d) && d >= today);
-    neededDates.forEach((date, idx)=>{
+    for(let idx=0; idx<neededDates.length; idx++){
+      const date = neededDates[idx];
       const exactIdx = movablePool.findIndex(g=>g.date===date);
-      if(exactIdx>-1){ movablePool.splice(exactIdx,1); return; } // already right where it should be
+      if(exactIdx>-1){ movablePool.splice(exactIdx,1); continue; } // already right where it should be
       const isCheckoutDay = idx === neededDates.length - 1;
       if(movablePool.length){
         const g = movablePool.shift();
         const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', g.id);
-        if(slot){ g.date = date; g.time = slot.time; g.bay = slot.bay; movedCount++; }
-        return;
+        // Same one-live-check-on-the-final-slot approach as
+        // assignFreeGroomings above — see its comment for reasoning.
+        if(slot && !(await findGroomConflictLive(date, slot.time, slot.bay, g.id))){ g.date = date; g.time = slot.time; g.bay = slot.bay; movedCount++; }
+        continue;
       }
       const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', null);
-      if(!slot) return;
+      if(!slot) continue;
+      if(await findGroomConflictLive(date, slot.time, slot.bay, null)) continue;
       const record = {
         id: uid('groom'), date, time: slot.time, bay: slot.bay,
         apptTypes: ['FBG'], sizeCode: pet.groomingSize || '', cutCode:'', details:'',
@@ -6069,12 +6088,12 @@ function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
       pet.groomingHistory.push(record);
       assignedList.push({ cust: owner, pet, record });
       assignedCount++;
-    });
+    }
     // Any leftover movablePool entries (more not-done FBGs than the stay now
     // needs, e.g. it was shortened) are left in place rather than auto-deleted
     // — staff can remove them via the usual grooming-history delete if truly
     // no longer wanted.
-  });
+  }
   return { assignedCount, movedCount, assignedList };
 }
 /* Shown right after a stay is created if any free groomings were earned —
@@ -8917,7 +8936,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       const cr = readCustomRate('cb_rate');
       customRate = cr.customRate; customRateMode = cr.customRateMode;
     }
-    const doSave = ()=>{
+    const doSave = async ()=>{
       const newStay = {
         id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, daycareRate, charges:[],
         pets: [stayPet],
@@ -8926,7 +8945,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       };
       pet.stays.push(newStay);
       const petWindows = [pet.id, ...cbSharingIds].map(id=>({ petId:id, ...petDatesInStay(newStay, stayPet, id) }));
-      const freeResult = assignFreeGroomings(cust, petWindows);
+      const freeResult = await assignFreeGroomings(cust, petWindows);
       closeModal();
       state.calendarMonth = checkIn.slice(0,7);
       renderBoardingCalendar();
