@@ -614,6 +614,7 @@ function describeSupabaseError(err){
 let _lastSyncError = null;
 let sbSession = null;
 let _agreementPollStarted = false;
+let _autoBackupPollStarted = false; // pain point #5 follow-up (29 Aug 2026) — see maybeRunAutoBackup()
 
 /* Multi-device conflict safety (pain point #5, phase-by-phase rollout).
    Thrown when a conditional update/delete affects 0 rows — meaning
@@ -913,6 +914,15 @@ async function loadFromCloud(){
   // never delay the dashboard becoming usable. See maybeRunAutoBackup()
   // for why this exists and how it's kept safe.
   maybeRunAutoBackup();
+  if(!_autoBackupPollStarted && cloudEnabled){
+    _autoBackupPollStarted = true;
+    // Re-checks every minute so the 10:30am/6pm snapshots actually get
+    // taken sometime after those times pass, for whoever already has the
+    // dashboard open — not just once at page load like the agreement poll
+    // below. See maybeRunAutoBackup()'s comment for the real limitation
+    // this doesn't solve (nobody has it open at all that day).
+    setInterval(maybeRunAutoBackup, 60000);
+  }
   if(!_agreementPollStarted && cloudEnabled && sbSession){
     _agreementPollStarted = true;
     setInterval(checkSignedAgreements, 60000);
@@ -1622,8 +1632,15 @@ function unlinkPaymentsFromStay(cust, stayId){
 }
 /* Records one cancelled grooming appointment or boarding stay into the
    Cancellations log (state.cancellations), newest first. `summary` is a
-   short human-readable line describing what was deleted (date/time/room etc). */
+   short human-readable line describing what was deleted (date/time/room etc).
+   Skips logging entirely when reason is "Other" and the note is just a test
+   marker ("test"/"testing", case- and whitespace-insensitive) — staff
+   testing the delete flow itself, not a real cancellation worth keeping in
+   the report. Only applies to "Other" specifically, not the named reasons,
+   so a genuine "Customer cancelled" or "Wrongly keyed in" is never skipped
+   no matter what's typed in the note. */
 function logCancellation(type, reason, note, cust, pet, summary){
+  if(reason === 'Other' && /^test(ing)?$/i.test((note||'').trim())) return;
   state.cancellations.unshift({
     id: uid('cancel'), type, reason, note,
     cancelledAt: new Date().toISOString(),
@@ -7330,39 +7347,63 @@ async function restoreArchivedRecord(kind, id){
   }
 }
 /* =========================================================
-   AUTO-BACKUP (27 Aug 2026, Pain Point #1). Replaces "must remember to
-   click Download backup weekly" with an automatic daily snapshot — no
-   staff action needed. Runs once per calendar day (id = today's date, so
-   a same-day write is a no-op rather than a duplicate) right after the
-   normal cloud load finishes; never blocks the UI on it, and any failure
-   here only logs to console rather than interrupting normal use. Snapshot
-   content is identical to the manual "Download backup" file (see
-   snapshotForBackup()), just written to its own table instead of
-   downloaded — a table nothing else in the app ever writes to, so a
-   mistake in the live tables (like the Phase 7/8 incident) can't also
-   damage a backup that was already safely written before the mistake
-   happened.
+   AUTO-BACKUP (27 Aug 2026, Pain Point #1; updated 29 Aug 2026 to two
+   fixed daily times). Replaces "must remember to click Download backup
+   weekly" with automatic snapshots — no staff action needed. Takes one
+   snapshot at 10:30am and another at 6pm every day (local device time),
+   rather than the original "once per day, whenever first loaded" — each
+   time slot gets its own id (date + slot suffix) so a same-slot write is
+   a no-op rather than a duplicate, same idempotent-by-id pattern as
+   before, just checked for two slots instead of one.
+   IMPORTANT LIMITATION: there's no server-side scheduler behind this —
+   it's purely a check that runs whenever the dashboard is open (once
+   right after load, then every minute — see the setInterval below). If
+   nobody has the dashboard open in a browser at or shortly after 10:30am
+   or 6pm on a given day, that day's snapshot for that slot simply
+   won't get taken (there's nothing running to take it). This is the same
+   trade-off the "once per day" version always had, just narrowed to two
+   specific times instead of "whenever first loaded that day" — if
+   guaranteed backups regardless of whether anyone has the app open ever
+   become necessary, that needs a real server-side scheduled job (e.g. a
+   Supabase Edge Function + pg_cron), which is a different, bigger piece
+   of infrastructure than this client-only check.
+   Never blocks the UI on it, and any failure here only logs to console
+   rather than interrupting normal use. Snapshot content is identical to
+   the manual "Download backup" file (see snapshotForBackup()), just
+   written to its own table instead of downloaded — a table nothing else
+   in the app ever writes to, so a mistake in the live tables (like the
+   Phase 7/8 incident) can't also damage a backup that was already safely
+   written before the mistake happened.
    ========================================================= */
+const AUTO_BACKUP_SLOTS = [ { hour:10, minute:30, suffix:'-1030' }, { hour:18, minute:0, suffix:'-1800' } ];
 async function maybeRunAutoBackup(){
   if(!cloudEnabled) return;
   try{
+    const now = new Date();
     const today = todayStr();
-    const { data: existing, error: checkErr } = await sb.from('backup_snapshots').select('id').eq('id', today).maybeSingle();
-    if(checkErr){ console.error('Auto-backup check failed:', checkErr); return; }
-    if(existing) return; // already have today's snapshot
-    const { error: insErr } = await sb.from('backup_snapshots').insert({ id: today, data: snapshotForBackup() });
-    if(insErr){ console.error('Auto-backup save failed:', insErr); return; }
+    for(const slot of AUTO_BACKUP_SLOTS){
+      const slotPassed = now.getHours() > slot.hour || (now.getHours() === slot.hour && now.getMinutes() >= slot.minute);
+      if(!slotPassed) continue;
+      const id = today + slot.suffix;
+      const { data: existing, error: checkErr } = await sb.from('backup_snapshots').select('id').eq('id', id).maybeSingle();
+      if(checkErr){ console.error('Auto-backup check failed:', checkErr); continue; }
+      if(existing) continue; // already have this slot's snapshot for today
+      const { error: insErr } = await sb.from('backup_snapshots').insert({ id, data: snapshotForBackup() });
+      if(insErr){ console.error('Auto-backup save failed:', insErr); continue; }
+    }
     await pruneOldAutoBackups();
   }catch(err){ console.error('Auto-backup failed:', err); }
 }
-/* Keeps only the most recent 30 daily snapshots so the table doesn't grow
-   forever — same reasoning as Archiving itself. 30 days of daily recovery
-   points is already far more coverage than the old weekly manual backup
-   ever gave. */
+/* Keeps only the most recent 60 snapshots (~30 days at two slots/day —
+   same real-world coverage the original once-a-day version gave at 30)
+   so the table doesn't grow forever — same reasoning as Archiving itself.
+   String-sorting by `id` descending still groups each date's slots
+   together with the most recent date first, since the date prefix
+   dominates the sort before the time-slot suffix is ever compared. */
 async function pruneOldAutoBackups(){
   const { data: rows, error } = await sb.from('backup_snapshots').select('id').order('id', {ascending:false});
   if(error){ console.error('Auto-backup prune check failed:', error); return; }
-  const toDelete = (rows||[]).slice(30).map(r=>r.id);
+  const toDelete = (rows||[]).slice(60).map(r=>r.id);
   if(!toDelete.length) return;
   const { error: delErr } = await sb.from('backup_snapshots').delete().in('id', toDelete);
   if(delErr) console.error('Auto-backup prune failed:', delErr);
@@ -7380,7 +7421,7 @@ async function openBackupModal(){
       <button class="btn btn-primary" id="downloadNowBtn" style="width:100%;margin-bottom:18px;">Download backup now</button>
       <div style="font-weight:700;font-size:13px;margin-bottom:6px;">Backup history</div>
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:14px;">
-        One automatic snapshot per day, kept for the last 30 days — written the first time the dashboard is opened each day, no action needed. Click Download on any date to get that day's exact backup file.
+        One automatic snapshot at 10:30am and another at 6pm every day, kept for the last 30 days — no action needed, as long as the dashboard is open in a browser at or shortly after those times. Click Download on any entry to get that exact backup file.
       </div>
       <div id="backupHistoryList" style="font-size:13px;color:var(--ink-soft);">Loading…</div>
     </div>
@@ -7397,12 +7438,22 @@ async function openBackupModal(){
   });
   const listBox = document.getElementById('backupHistoryList');
   if(!cloudEnabled){ listBox.innerHTML = `<div>Backup history needs an active cloud connection.</div>`; return; }
+  // Slot ids look like "2026-08-29-1730" — split off the date for fmtDate()
+  // and turn the suffix into a readable time, falling back to the id as-is
+  // for any older snapshot still using the original plain-date id (from
+  // before the two-times-a-day change).
+  const SLOT_LABELS = { '1030':'10:30am', '1800':'6pm' };
+  function describeBackupId(id){
+    const m = /^(\d{4}-\d{2}-\d{2})-(\d{4})$/.exec(id);
+    if(!m) return fmtDate(id);
+    return `${fmtDate(m[1])} · ${SLOT_LABELS[m[2]] || m[2]}`;
+  }
   try{
     const { data: rows, error } = await sb.from('backup_snapshots').select('id, created_at').order('id', {ascending:false});
     if(error) throw error;
-    if(!rows || !rows.length){ listBox.innerHTML = `<div>No automatic backups yet — the first one is written next time the dashboard loads.</div>`; return; }
+    if(!rows || !rows.length){ listBox.innerHTML = `<div>No automatic backups yet — the first one is written the next time the dashboard is open at or after 10:30am.</div>`; return; }
     listBox.innerHTML = rows.map(r=>
-      `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(fmtDate(r.id))}</div><div class="today-card-sub">Saved ${esc(new Date(r.created_at).toLocaleString())}</div></div><button class="btn btn-sm" data-download-backup="${r.id}">Download</button></div>`
+      `<div class="today-card" style="cursor:default;"><div class="today-card-main"><div class="today-card-pet">${esc(describeBackupId(r.id))}</div><div class="today-card-sub">Saved ${esc(new Date(r.created_at).toLocaleString())}</div></div><button class="btn btn-sm" data-download-backup="${r.id}">Download</button></div>`
     ).join('');
     listBox.querySelectorAll('[data-download-backup]').forEach(btn=>{
       btn.addEventListener('click', async ()=>{
@@ -7570,10 +7621,15 @@ async function openStaffModal(){
    customer. Reads live rates/surcharges/holidays from state so it's always in
    sync with Rates & Holidays, but never creates or saves anything anywhere. */
 function openEnquiryModal(){
-  let roomKind = 'dogdeluxe'; // 'dogdeluxe' | 'Suite room' | 'Royal Suite' | 'Cat Deluxe'
-  let pets = [{ size:'S' }]; // pets[0] = main pet (room rate only); rest pay sharing surcharge
+  // One entry per room — each room has its own type and its own list of
+  // pets sharing it (pets[0] pays that room's rate, the rest pay that
+  // room's sharing surcharge by their own size). Lets a customer with,
+  // say, two dogs sharing a Dog Deluxe room AND a cat needing a separate
+  // Cat Deluxe room get one combined quote instead of running the
+  // calculator twice and adding the numbers up by hand.
+  let rooms = [{ roomKind:'dogdeluxe', pets:[{ size:'S' }] }];
 
-  function petRowHtml(p, i){
+  function petRowHtml(ri, p, i){
     return `<div class="pet-row" data-prow="${i}" style="display:flex;align-items:center;gap:8px;padding:7px 0;${i>0?'border-top:1px solid var(--line-soft);':''}">
       <span style="font-size:12px;color:var(--ink-soft);white-space:nowrap;min-width:112px;">${i===0?'Pet 1 (room rate)':`Pet ${i+1} (+surcharge)`}</span>
       <select data-p-size style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
@@ -7581,6 +7637,24 @@ function openEnquiryModal(){
       </select>
       ${i>0?`<button type="button" class="mini-remove" data-p-remove="${i}">✕</button>`:''}
     </div>`;
+  }
+  function roomBlockHtml(room, ri){
+    return `<fieldset data-room="${ri}" style="margin-bottom:12px;">
+      <legend>Room ${ri+1}${rooms.length>1?` <span style="font-weight:400;color:var(--ink-soft);">— pets sharing this room, size determines rate and any sharing surcharge</span>`:` <span style="font-weight:400;color:var(--ink-soft);">— pets sharing this room</span>`}</legend>
+      <div class="form-grid">
+        <div class="field span2"><label>Room type</label>
+          <select data-r-kind>
+            <option value="dogdeluxe" ${room.roomKind==='dogdeluxe'?'selected':''}>Dog Deluxe</option>
+            <option value="Suite room" ${room.roomKind==='Suite room'?'selected':''}>Suite room</option>
+            <option value="Royal Suite" ${room.roomKind==='Royal Suite'?'selected':''}>Royal Suite</option>
+            <option value="Cat Deluxe" ${room.roomKind==='Cat Deluxe'?'selected':''}>Cat Deluxe</option>
+          </select>
+        </div>
+        ${rooms.length>1?`<div class="field" style="align-self:end;"><button type="button" class="btn btn-sm btn-danger" data-remove-room="${ri}">Remove this room</button></div>`:''}
+      </div>
+      <div data-petrows>${room.pets.map((p,i)=>petRowHtml(ri,p,i)).join('')}</div>
+      <button type="button" class="add-line" data-add-pet="${ri}">+ Add another pet sharing this room</button>
+    </fieldset>`;
   }
 
   openModal(`
@@ -7592,20 +7666,9 @@ function openEnquiryModal(){
       <div class="form-grid">
         <div class="field"><label>Check-in</label>${dateOverlayHtml('enq_checkin', todayStr())}</div>
         <div class="field"><label>Check-out</label>${dateOverlayHtml('enq_checkout', addDays(todayStr(),1))}</div>
-        <div class="field span2"><label>Room type</label>
-          <select id="enq_room">
-            <option value="dogdeluxe">Dog Deluxe</option>
-            <option value="Suite room">Suite room</option>
-            <option value="Royal Suite">Royal Suite</option>
-            <option value="Cat Deluxe">Cat Deluxe</option>
-          </select>
-        </div>
       </div>
-      <fieldset>
-        <legend>Pets sharing this room <span style="font-weight:400;color:var(--ink-soft);">— size determines rate (Dog Deluxe) and any sharing surcharge</span></legend>
-        <div id="enqPetRows">${pets.map(petRowHtml).join('')}</div>
-        <button type="button" class="add-line" id="enqAddPet">+ Add another pet sharing</button>
-      </fieldset>
+      <div id="enqRoomsContainer">${rooms.map((room,ri)=>roomBlockHtml(room,ri)).join('')}</div>
+      <button type="button" class="add-line" id="enqAddRoom">+ Add another room <span style="font-weight:400;color:var(--ink-soft);">— e.g. a cat needing its own room, separate from the dogs</span></button>
       <div id="enqResult"></div>
     </div>
     <div class="modal-foot">
@@ -7616,25 +7679,32 @@ function openEnquiryModal(){
   wireDateOverlay('enq_checkin');
   wireDateOverlay('enq_checkout');
 
-  function refreshPetRows(){
-    document.getElementById('enqPetRows').innerHTML = pets.map(petRowHtml).join('');
-    wirePetRows();
+  function refreshRooms(){
+    document.getElementById('enqRoomsContainer').innerHTML = rooms.map((room,ri)=>roomBlockHtml(room,ri)).join('');
+    wireRooms();
     calc();
   }
-  function wirePetRows(){
-    document.querySelectorAll('#enqPetRows [data-prow]').forEach(row=>{
-      const i = +row.dataset.prow;
-      row.querySelector('[data-p-size]').addEventListener('change', e=>{ pets[i].size = e.target.value; calc(); });
-    });
-    document.querySelectorAll('[data-p-remove]').forEach(btn=>{
-      btn.addEventListener('click', ()=>{ pets.splice(+btn.dataset.pRemove,1); refreshPetRows(); });
+  function wireRooms(){
+    document.querySelectorAll('#enqRoomsContainer [data-room]').forEach(block=>{
+      const ri = +block.dataset.room;
+      block.querySelector('[data-r-kind]').addEventListener('change', e=>{ rooms[ri].roomKind = e.target.value; calc(); });
+      block.querySelectorAll('[data-prow]').forEach(row=>{
+        const i = +row.dataset.prow;
+        row.querySelector('[data-p-size]').addEventListener('change', e=>{ rooms[ri].pets[i].size = e.target.value; calc(); });
+      });
+      block.querySelectorAll('[data-p-remove]').forEach(btn=>{
+        btn.addEventListener('click', ()=>{ rooms[ri].pets.splice(+btn.dataset.pRemove,1); refreshRooms(); });
+      });
+      const addPetBtn = block.querySelector('[data-add-pet]');
+      if(addPetBtn) addPetBtn.addEventListener('click', ()=>{ rooms[ri].pets.push({ size:'S' }); refreshRooms(); });
+      const removeRoomBtn = block.querySelector('[data-remove-room]');
+      if(removeRoomBtn) removeRoomBtn.addEventListener('click', ()=>{ rooms.splice(+removeRoomBtn.dataset.removeRoom,1); refreshRooms(); });
     });
   }
-  document.getElementById('enqAddPet').addEventListener('click', ()=>{
-    pets.push({ size:'S' });
-    refreshPetRows();
+  document.getElementById('enqAddRoom').addEventListener('click', ()=>{
+    rooms.push({ roomKind:'dogdeluxe', pets:[{ size:'S' }] });
+    refreshRooms();
   });
-  document.getElementById('enq_room').addEventListener('change', e=>{ roomKind = e.target.value; calc(); });
   document.getElementById('enq_checkin').addEventListener('change', calc);
   document.getElementById('enq_checkout').addEventListener('change', calc);
   document.getElementById('enqCloseBtn').addEventListener('click', closeModal);
@@ -7653,8 +7723,9 @@ function openEnquiryModal(){
       return;
     }
 
-    // Rate lookup, mirroring computeStayCost()'s logic exactly.
-    function rateForNight(dateStr){
+    // Rate lookup, mirroring computeStayCost()'s logic exactly — now scoped
+    // to one room's own type/pets rather than the whole enquiry's.
+    function rateForNight(roomKind, pets, dateStr){
       const holiday = isHoliday(dateStr);
       let rate;
       if(roomKind==='dogdeluxe'){
@@ -7667,54 +7738,70 @@ function openEnquiryModal(){
       return { holiday, amount: holiday ? rate.holiday : rate.normal, rate };
     }
 
-    let normalNights=0, holidayNights=0, normalRate=0, holidayRate=0, roomTotal=0;
-    for(let n=0;n<nights;n++){
-      const dateStr = addDays(ci, n);
-      const { holiday, amount, rate } = rateForNight(dateStr);
-      roomTotal += amount;
-      if(holiday){ holidayNights++; holidayRate = rate.holiday; } else { normalNights++; normalRate = rate.normal; }
-    }
+    let grandTotal = 0;
+    let roomSections = '';
+    rooms.forEach((room, ri)=>{
+      const { roomKind, pets } = room;
+      let normalNights=0, holidayNights=0, normalRate=0, holidayRate=0, roomTotal=0;
+      for(let n=0;n<nights;n++){
+        const dateStr = addDays(ci, n);
+        const { holiday, amount, rate } = rateForNight(roomKind, pets, dateStr);
+        roomTotal += amount;
+        if(holiday){ holidayNights++; holidayRate = rate.holiday; } else { normalNights++; normalRate = rate.normal; }
+      }
 
-    // Sharing surcharge — every pet after the first, per night, by its own size.
-    const extraPets = pets.slice(1);
-    let surchargeTotal = 0;
-    const surchargeLines = [];
-    extraPets.forEach((p,i)=>{
-      const isLarge = ['L','XL','XXL'].includes(p.size);
-      const perNight = isLarge ? state.surchargeLXL : state.surchargeSM;
-      const amt = perNight * nights;
-      surchargeTotal += amt;
-      surchargeLines.push(`<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
-        <span>Pet ${i+2} sharing (${p.size}) — RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'}</span>
-        <span>RM ${fmtRM2(amt)}</span>
-      </div>`);
+      // Sharing surcharge — every pet after the first in THIS room, per
+      // night, by its own size.
+      const extraPets = pets.slice(1);
+      let surchargeTotal = 0;
+      const surchargeLines = [];
+      extraPets.forEach((p,i)=>{
+        const isLarge = ['L','XL','XXL'].includes(p.size);
+        const perNight = isLarge ? state.surchargeLXL : state.surchargeSM;
+        const amt = perNight * nights;
+        surchargeTotal += amt;
+        surchargeLines.push(`<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
+          <span>Pet ${i+2} sharing (${p.size}) — RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'}</span>
+          <span>RM ${fmtRM2(amt)}</span>
+        </div>`);
+      });
+
+      const roomGrandTotal = roomTotal + surchargeTotal;
+      grandTotal += roomGrandTotal;
+      const roomLabel = roomKind==='dogdeluxe'
+        ? (pets.some(p=>['L','XL','XXL'].includes(p.size)) ? 'Dog Deluxe L/XL/XXL' : 'Dog Deluxe S/M')
+        : roomKind;
+
+      roomSections += `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line-soft);">
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">${rooms.length>1?`Room ${ri+1} — `:''}${esc(roomLabel)}</div>`;
+      if(normalNights>0){
+        roomSections += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;">
+          <span>Normal RM ${fmtRM(normalRate)}/night × ${normalNights} night${normalNights===1?'':'s'}</span>
+          <span>RM ${fmtRM2(normalRate*normalNights)}</span>
+        </div>`;
+      }
+      if(holidayNights>0){
+        roomSections += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;color:#9c5a1e;">
+          <span>Holiday RM ${fmtRM(holidayRate)}/night × ${holidayNights} night${holidayNights===1?'':'s'}</span>
+          <span>RM ${fmtRM2(holidayRate*holidayNights)}</span>
+        </div>`;
+      }
+      roomSections += surchargeLines.join('');
+      if(rooms.length>1){
+        roomSections += `<div style="display:flex;justify-content:space-between;font-weight:600;font-size:13.5px;padding-top:6px;">
+          <span>Room ${ri+1} subtotal</span><span>RM ${fmtRM2(roomGrandTotal)}</span>
+        </div>`;
+      }
+      roomSections += `</div>`;
     });
 
-    const grandTotal = roomTotal + surchargeTotal;
-    const roomLabel = roomKind==='dogdeluxe'
-      ? (pets.some(p=>['L','XL','XXL'].includes(p.size)) ? 'Dog Deluxe L/XL/XXL' : 'Dog Deluxe S/M')
-      : roomKind;
-
-    let html = `<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line-soft);">
-      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:10px;">
+    let html = `<div>
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px;">
         <span style="font-family:var(--font-display);font-size:26px;font-weight:700;color:var(--teal-dark,#144A87);">${nights}</span>
-        <span style="color:var(--ink-soft);font-size:13px;">night${nights===1?'':'s'} · ${fmtDateSlash(ci)} → ${fmtDateSlash(co)} · ${esc(roomLabel)}</span>
+        <span style="color:var(--ink-soft);font-size:13px;">night${nights===1?'':'s'} · ${fmtDateSlash(ci)} → ${fmtDateSlash(co)}${rooms.length>1?` · ${rooms.length} rooms`:''}</span>
       </div>`;
-
-    if(normalNights>0){
-      html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;">
-        <span>Normal RM ${fmtRM(normalRate)}/night × ${normalNights} night${normalNights===1?'':'s'}</span>
-        <span>RM ${fmtRM2(normalRate*normalNights)}</span>
-      </div>`;
-    }
-    if(holidayNights>0){
-      html += `<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13.5px;padding:4px 0;color:#9c5a1e;">
-        <span>Holiday RM ${fmtRM(holidayRate)}/night × ${holidayNights} night${holidayNights===1?'':'s'}</span>
-        <span>RM ${fmtRM2(holidayRate*holidayNights)}</span>
-      </div>`;
-    }
-    html += surchargeLines.join('');
-    html += `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:16px;padding-top:10px;margin-top:6px;border-top:1px solid var(--line-soft);color:var(--teal-dark,#144A87);">
+    html += roomSections;
+    html += `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:16px;padding-top:10px;margin-top:10px;border-top:1px solid var(--line-soft);color:var(--teal-dark,#144A87);">
         <span>Estimated total</span><span>RM ${fmtRM2(grandTotal)}</span>
       </div>
       <div style="font-size:11.5px;color:var(--ink-soft);margin-top:10px;">Estimate only — promo/custom rates and closed-day fees aren't included. Confirm exact pricing when actually booking the stay.</div>
@@ -7722,7 +7809,7 @@ function openEnquiryModal(){
     box.innerHTML = html;
   }
 
-  wirePetRows();
+  wireRooms();
   calc();
 }
 
