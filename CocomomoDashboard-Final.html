@@ -7110,6 +7110,35 @@ async function runArchive({ stays, grooms, payments }){
   const stayIds = new Set(stays.map(({stay})=>stay.id));
   const groomIds = new Set(grooms.map(({groom})=>groom.id));
   const paymentIds = new Set(payments.map(({pmt})=>pmt.id));
+  // Same "invisible payment" bug the 13 Aug fix closed for manual stay
+  // deletion: a payment split across several stays (a combined bill) only
+  // qualifies for archiving here if EVERY linked stay is old enough
+  // (findArchivableRecords) — so a payment linked to one stay old enough to
+  // archive AND one that isn't is left behind, still live, but with a
+  // stayIds entry pointing at a stay about to be deleted below. Manual
+  // deletion calls unlinkPaymentsFromStay() at delete time and lets the
+  // normal save-diff push the change; that shortcut doesn't work here
+  // because the payments baseline gets reset to match post-archive state a
+  // few lines down, so the *next* scheduleSync() would see no difference
+  // and silently skip pushing the fix. So: unlink now, and push any
+  // surviving (non-archived) payment that actually changed straight to the
+  // cloud before that baseline reset happens.
+  const patchedPayments = [];
+  for(const {stay} of stays){
+    state.customers.forEach(c=>{
+      (c.payments||[]).forEach(p=>{
+        if(paymentIds.has(p.id)) return; // itself being archived & deleted below — no need to patch
+        if(p.stayIds && p.stayIds.includes(stay.id)){
+          unlinkPaymentsFromStay(c, stay.id);
+          if(!patchedPayments.some(x=>x.pmt.id===p.id)) patchedPayments.push({ pmt: p, customerId: c.id });
+        }
+      });
+    });
+  }
+  for(const {pmt, customerId} of patchedPayments){
+    const { error } = await sb.from('payments').upsert(mapPaymentRow(pmt, customerId));
+    if(error) throw error;
+  }
   for(const id of stayIds){ const { error } = await sb.from('stays').delete().eq('id', id); if(error) throw error; }
   for(const id of groomIds){ const { error } = await sb.from('grooming_appointments').delete().eq('id', id); if(error) throw error; }
   for(const id of paymentIds){ const { error } = await sb.from('payments').delete().eq('id', id); if(error) throw error; }
