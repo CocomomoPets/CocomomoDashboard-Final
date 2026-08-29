@@ -5808,6 +5808,28 @@ function findGroomConflict(date, time, bay, excludeId){
   }
   return null;
 }
+/* Live, server-side version of findGroomConflict — pain point #5 follow-up
+   (29 Aug 2026). findGroomConflict() above only checks THIS device's local
+   in-memory copy of the schedule, so two devices booking the same bay/time
+   within moments of each other (before either has reloaded) both pass the
+   local check and create two separate, genuinely double-booked appointment
+   rows — version-safety can't catch this since it only protects concurrent
+   edits to the SAME row, not two different new rows. This queries the live
+   table directly right before the insert actually happens, shrinking that
+   window to the time of one network round-trip instead of "until next page
+   load". Returns the conflicting row (or null) — never throws on its own;
+   a query failure is treated as "couldn't confirm, proceed" so a network
+   hiccup here doesn't block booking entirely (cloudEnabled implies the
+   version-safe insert IS still guaranteed unique on id — this is purely an
+   extra guard against duplicate bookings, not the sole line of defense). */
+async function findGroomConflictLive(date, time, bay, excludeId){
+  if(!cloudEnabled) return null;
+  let q = sb.from('grooming_appointments').select('id').eq('date', date).eq('time', time).eq('bay', bay);
+  if(excludeId) q = q.neq('id', excludeId);
+  const { data, error } = await q;
+  if(error){ console.error('Live grooming conflict check failed:', error); return null; }
+  return (data && data.length) ? data[0] : null;
+}
 
 /* Loyalty reward: dogs boarding 7+ nights earn 1 free Basic grooming per every
    7 nights, floor-rounded (e.g. 17 nights -> 2 free groomings). Rather than
@@ -9060,7 +9082,7 @@ function openFullBookingModal(prefTime, prefBay){
   refreshCustOptions('');
   document.getElementById('b_cust_search').focus();
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const cust = getCustomer(document.getElementById('b_cust').value);
     const pet = cust ? getPet(cust, document.getElementById('b_pet').value) : null;
     if(!cust || !pet){ toast('Please pick a customer with a pet'); return; }
@@ -9071,6 +9093,18 @@ function openFullBookingModal(prefTime, prefBay){
     if(apptTypes.length===0){ toast('Please pick at least one appointment type'); return; }
     if(isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
     if(findGroomConflict(date,time,bay,null)){ toast(`${bay} is already booked at ${time} on that date`); return; }
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
+    // Re-check against the LIVE table right before committing — closes the
+    // window where another device booked this exact slot moments ago and
+    // this device hasn't reloaded yet (see findGroomConflictLive above).
+    const liveConflict = await findGroomConflictLive(date, time, bay, null);
+    saveBtn.disabled = false; saveBtn.textContent = 'Save';
+    if(liveConflict){
+      toast(`${bay} was just booked at ${time} on that date by another device — pick a different slot`);
+      refreshBBay();
+      return;
+    }
     if(!confirmIfNearbyGroom(pet, date, null)) return;
     const addons = getBAddons();
     pet.groomingHistory.push({
