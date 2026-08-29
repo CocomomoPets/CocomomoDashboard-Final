@@ -607,6 +607,22 @@ let _lastSyncError = null;
 let sbSession = null;
 let _agreementPollStarted = false;
 
+/* Multi-device conflict safety (pain point #5, phase-by-phase rollout).
+   Thrown when a conditional update/delete affects 0 rows — meaning
+   someone else's save already changed or removed that row since this
+   device last loaded it. Callers catch this SEPARATELY from ordinary
+   errors: no retry (retrying would just fail again, or worse, clobber
+   the other device's newer save), just refetch and tell the person to
+   redo their edit. `entityLabel` is a human-readable name for the
+   toast (e.g. `Staff member "Aisyah"`). */
+class SyncConflictError extends Error{
+  constructor(entityLabel){
+    super(`${entityLabel} was changed on another device since you opened this — showing the latest version. Please redo your edit.`);
+    this.isConflict = true;
+    this.entityLabel = entityLabel;
+  }
+}
+
 /* Wraps a promise with a hard timeout so a stuck network call (very common
    right after a phone/tablet wakes from sleep or a backgrounded tab resumes,
    before the connection re-establishes) can never hang the app forever —
@@ -6037,8 +6053,8 @@ async function loadStaffFromTables(){
   const { data: leaveRows, error: e2 } = await sb.from('staff_leaves').select('*').order('start_date');
   if(e2){ console.error('Staff leaves load failed:', e2); toast('Staff leave data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
   state.staff = (staffRows||[]).map(s=>({
-    id: s.id, name: s.name,
-    leaves: (leaveRows||[]).filter(l=>l.staff_id===s.id).map(l=>({ id:l.id, start:l.start_date, end:l.end_date, note:l.note||'' })),
+    id: s.id, name: s.name, version: s.version,
+    leaves: (leaveRows||[]).filter(l=>l.staff_id===s.id).map(l=>({ id:l.id, start:l.start_date, end:l.end_date, note:l.note||'', version:l.version })),
   }));
 }
 /* Diffs `original` (staff as loaded from the tables when the modal opened)
@@ -6047,13 +6063,22 @@ async function loadStaffFromTables(){
    edited ones, deletes for removed ones — rather than rewriting everything.
    This is the actual thing being proven: a save here costs proportionally
    to what changed, not to the size of the whole dataset. */
+/* Conflict-safe as of pain point #5, phase 1 (28 Aug 2026 plan): every
+   update/delete of a row that already existed is conditioned on
+   `version` still matching what this device saw when the modal opened
+   (see openStaffModal, which now refetches fresh before building the
+   form). A 0-row result means someone else's save landed first —
+   throws SyncConflictError rather than silently overwriting. New rows
+   (inserts) always succeed regardless of version; nothing existed to
+   conflict with. */
 async function syncStaffToTables(original, working){
   const origById = new Map(original.map(s=>[s.id, s]));
   const workIds = new Set(working.map(s=>s.id));
   for(const s of original){
     if(!workIds.has(s.id)){
-      const { error } = await sb.from('staff').delete().eq('id', s.id); // cascades to staff_leaves
+      const { data, error } = await sb.from('staff').delete().eq('id', s.id).eq('version', s.version).select(); // cascades to staff_leaves
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`Staff member "${s.name}"`);
     }
   }
   for(const s of working){
@@ -6064,16 +6089,19 @@ async function syncStaffToTables(original, working){
       if(error) throw error;
       realId = data.id;
     } else if(origById.get(s.id).name !== s.name){
-      const { error } = await sb.from('staff').update({ name: s.name }).eq('id', s.id);
+      const ol = origById.get(s.id);
+      const { data, error } = await sb.from('staff').update({ name: s.name }).eq('id', s.id).eq('version', ol.version).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`Staff member "${ol.name}"`);
     }
     const origLeaves = isNewStaff ? [] : (origById.get(s.id).leaves||[]);
     const origLeaveById = new Map(origLeaves.map(l=>[l.id, l]));
     const workLeaveIds = new Set((s.leaves||[]).map(l=>l.id));
     for(const l of origLeaves){
       if(!workLeaveIds.has(l.id)){
-        const { error } = await sb.from('staff_leaves').delete().eq('id', l.id);
+        const { data, error } = await sb.from('staff_leaves').delete().eq('id', l.id).eq('version', l.version).select();
         if(error) throw error;
+        if(!data || !data.length) throw new SyncConflictError(`A leave date for "${s.name}"`);
       }
     }
     for(const l of (s.leaves||[])){
@@ -6084,8 +6112,9 @@ async function syncStaffToTables(original, working){
       } else {
         const ol = origLeaveById.get(l.id);
         if(ol.start!==l.start || ol.end!==l.end || (ol.note||'')!==(l.note||'')){
-          const { error } = await sb.from('staff_leaves').update({ start_date:l.start, end_date:l.end, note:l.note||'' }).eq('id', l.id);
+          const { data, error } = await sb.from('staff_leaves').update({ start_date:l.start, end_date:l.end, note:l.note||'' }).eq('id', l.id).eq('version', ol.version).select();
           if(error) throw error;
+          if(!data || !data.length) throw new SyncConflictError(`A leave date for "${s.name}"`);
         }
       }
     }
@@ -7076,7 +7105,15 @@ async function openBackupModal(){
    workingStaff before any add/remove so in-progress typing isn't lost when
    a row is added or removed (mirrors the holiday/closed-day pattern above,
    but safer against losing unsaved edits). */
-function openStaffModal(){
+/* Refetches fresh from the tables before building the form (rather than
+   trusting whatever's already sitting in local memory) — shrinks the
+   conflict window in the first place, since two staff would now need to
+   open this SAME modal within the same short refetch-to-save gap to hit
+   a real conflict at all. Kept fire-and-forget from callers (a click
+   handler that doesn't await this is fine — the modal just opens a beat
+   later). */
+async function openStaffModal(){
+  await loadStaffFromTables();
   const originalStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
   let workingStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
 
@@ -7181,6 +7218,16 @@ function openStaffModal(){
       setSyncStatus('ok','Synced');
       closeModal(); render(); toast('Staff saved');
     } catch(err){
+      if(err && err.isConflict){
+        // Someone else's save already landed — don't retry, don't overwrite
+        // it. Refetch the real current state and send the person back to
+        // redo their edit against it.
+        await loadStaffFromTables();
+        setSyncStatus('ok','Synced');
+        closeModal(); render();
+        toast(err.message);
+        return;
+      }
       const msg = describeSupabaseError(err);
       console.error('Staff save failed:', msg, err);
       setSyncStatus('error','Save failed — tap for details');
