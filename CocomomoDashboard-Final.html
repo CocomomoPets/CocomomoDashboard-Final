@@ -1050,46 +1050,56 @@ async function saveToCloudNow(){
 
 async function attemptSaveWithRetry(units, attempt){
   setSyncStatus('saving', attempt===0 ? 'Saving…' : `Saving… (retry ${attempt}/${SAVE_RETRY_DELAYS_MS.length})`);
-  try{
-    // Every sync function here uses upsert()/delete(), both idempotent, so
-    // redoing an already-succeeded unit on retry (below) is harmless —
-    // that's what makes it safe to just re-run everything that changed
-    // rather than track partial progress across attempts.
-    for(const u of units){
-      if(u.changed) await u.run();
+  // BUGFIX 29 Aug 2026: previously this ran every changed unit inside ONE
+  // try/catch and only committed baselines after the WHOLE loop finished —
+  // so a conflict on any single unit (e.g. Stays, which sits earlier in
+  // `units` than Payments) stopped the loop dead, meaning a later unit in
+  // the SAME batch (e.g. a payment unlinked from that same stay) never
+  // even got attempted, and nothing in the batch — not even units that had
+  // already succeeded — got its baseline committed. That's what let a
+  // payment silently fail to unlink whenever its save happened to share a
+  // batch with a stay conflict. Now every changed unit is attempted and
+  // committed independently: a conflict on one unit no longer blocks any
+  // other unit in the same pass, and a real (non-conflict) error on one
+  // unit is collected rather than aborting units after it.
+  const conflicts = [];
+  let hardError = null;
+  for(const u of units){
+    if(!u.changed) continue;
+    try{
+      await u.run();
+      u.commit();
+    } catch(error){
+      if(error && error.isConflict){ conflicts.push(error); }
+      else if(!hardError){ hardError = error; } // keep the first; still let every other unit get its own attempt
     }
-    // Deep clone baselines — a shallow one (spreading a customer/pet but
-    // leaving nested arrays like stays/payments as the same in-memory
-    // reference) meant a later in-place push silently mutated the
-    // "baseline" too, so the next diff always saw zero difference and
-    // skipped saving — found 18 Aug 2026. JSON.parse(JSON.stringify(...))
-    // in each unit's commit() avoids that.
-    units.forEach(u=>{ if(u.changed) u.commit(); });
-    _lastSyncError = null;
-    setSyncStatus('ok','Synced');
-  } catch(error){
-    if(error && error.isConflict){
-      // Version conflict — retrying with the same stale version would just
-      // fail again, or land right after someone else's newer save and
-      // clobber it. Refetch the real current data instead and stop this
-      // pass; whatever else is still locally changed picks up again on the
-      // next debounced save.
-      await error.reload();
-      render();
-      setSyncStatus('ok','Synced');
-      toast(error.message);
-      return;
-    }
+  }
+  if(hardError){
     if(attempt < SAVE_RETRY_DELAYS_MS.length){
       await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
       return attemptSaveWithRetry(units, attempt+1);
     }
-    const msg = describeSupabaseError(error);
-    console.error('Supabase save failed after retries:', msg, error);
+    const msg = describeSupabaseError(hardError);
+    console.error('Supabase save failed after retries:', msg, hardError);
     _lastSyncError = msg;
     setSyncStatus('error','Save failed — tap for details');
     toast('Save failed: ' + msg);
+    return;
   }
+  _lastSyncError = null;
+  if(conflicts.length){
+    // Version conflict(s) — retrying with the same stale version would just
+    // fail again, or land right after someone else's newer save and
+    // clobber it. Refetch the real current data for each instead. Units
+    // that succeeded in this same pass are already committed above, so
+    // they're unaffected by another unit's conflict.
+    for(const c of conflicts) await c.reload();
+    render();
+    setSyncStatus('ok','Synced');
+    toast(conflicts.length===1 ? conflicts[0].message : `${conflicts.length} records were changed on another device — showing the latest version. Please redo those edits.`);
+    return;
+  }
+  setSyncStatus('ok','Synced');
 }
 
 /* Live co-editing (Realtime auto-refresh + "someone's editing this" badges)
@@ -2826,7 +2836,16 @@ function renderCustomersMain(){
           ${cust.payments.length ? `<span class="payments-total">Total across all stays: RM ${cust.payments.reduce((s,p)=>s+(+p.amount||0),0).toFixed(2)}</span>` : ''}
           <button class="btn btn-sm" id="addPaymentBtn">+ Add payment</button>
         </div>
-        ${(() => { const unlinked = cust.payments.filter(p=>!(p.stayIds&&p.stayIds.length)); return unlinked.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No general payments — payments linked to a stay now show on that stay's card in the Boarding tab.</div>` :
+        ${(() => {
+          // A payment counts as "general" if it has no linked stays at all,
+          // OR if every stay it WAS linked to has since been deleted —
+          // otherwise a payment whose only link points at a now-gone stay
+          // becomes genuinely invisible: not here (stayIds isn't empty) and
+          // not on any stay card either (the stay doesn't exist to show it
+          // on). Found 29 Aug 2026 after a stale-batch bug (now fixed, see
+          // attemptSaveWithRetry) let exactly this happen to a real payment.
+          const unlinked = cust.payments.filter(p=>!(p.stayIds&&p.stayIds.length) || !p.stayIds.some(id=>findStayById(id)));
+          return unlinked.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No general payments — payments linked to a stay now show on that stay's card in the Boarding tab.</div>` :
           unlinked.slice().sort((a,b)=>b.date.localeCompare(a.date)).map(p=>`
             <div class="payment-row" data-edit-payment="${p.id}" style="cursor:pointer;">
               <span class="badge ${p.type==='Full payment'?'badge-active':'badge-past'}">${esc(p.type)}</span>
