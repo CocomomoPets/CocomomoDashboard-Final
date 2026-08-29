@@ -580,6 +580,7 @@ let _customerVersions = new Map(); // pain point #5, phase 3 (29 Aug 2026) — i
 let _petVersions = new Map(); // same as _customerVersions, keyed by pet id
 let _lastSyncedStaysJSON = null; // 18 Aug 2026 migration — stays tracked separately too, see syncStaysToTables()
 let _staysBaseline = []; // last-known flattened stays list as reflected in the stays table
+let _stayVersions = new Map(); // pain point #5, phase 4 (29 Aug 2026) — id -> version this device last saw for each stay; kept OUTSIDE the stay objects, same reasoning as _customerVersions/_petVersions (phase 3)
 let _lastSyncedGroomsJSON = null; // 23 Aug 2026 migration — grooming tracked separately too, see syncGroomsToTables()
 let _groomsBaseline = []; // last-known flattened grooming list as reflected in the grooming_appointments table
 let _lastSyncedPaymentsJSON = null; // 23 Aug 2026 migration — payments tracked separately too, see syncPaymentsToTables()
@@ -6233,26 +6234,46 @@ async function migrateCustomersPetsFromBlobIfNeeded(blobCustomers){
    then normalizes it through the usual normalizeCustomer/normalizePet
    defaults — so nothing else in the app needs to know this changed. Also
    resets `_customersBaseline` to match, so the next save only sends
-   whatever changes from here. */
+   whatever changes from here.
+   Preserves each customer's `payments` and each pet's `stays`/
+   `groomingHistory` from whatever's already in state, rather than reading
+   them off these rows (BUGFIX 29 Aug 2026, pain point #5 phase 3
+   incident) — those three live in their OWN tables (payments, stays,
+   grooming_appointments) and the customers/pets columns for them are
+   ALWAYS written empty (see mapCustomerRow/mapPetRow). Reading them from
+   here used to be "safe" only because normal boot always immediately
+   re-ran loadStaysFromTables()/loadGroomsFromTables()/
+   loadPaymentsFromTables() right after — a hidden ordering dependency
+   that broke the moment this function got called on its own (as the
+   `reload` on a customer/pet version conflict), silently wiping real
+   data to empty locally, which the next save then persisted as real
+   deletions. Preserving local values here removes that dependency for
+   good — this function is now safe to call by itself, from anywhere. */
 async function loadCustomersPetsFromTables(){
   const { data: custRows, error: e1 } = await sb.from('customers').select('*').order('created_at');
   if(e1){ console.error('Customers load failed:', e1); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
   const { data: petRows, error: e2 } = await sb.from('pets').select('*').order('created_at');
   if(e2){ console.error('Pets load failed:', e2); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  const existingCustById = new Map(state.customers.map(c=>[c.id, c]));
+  const existingPetById = new Map();
+  state.customers.forEach(c=>(c.pets||[]).forEach(p=>existingPetById.set(p.id, p)));
   state.customers = (custRows||[]).map(c=>normalizeCustomer({
     id: c.id, name: c.name, icPassport: c.ic_passport, phone: c.phone, gender: c.gender, dob: c.dob,
     emergencyName: c.emergency_name, emergencyPhone: c.emergency_phone,
     customerTypes: c.customer_types || [], pointsHistory: c.points_history || [],
     authorizedPickups: c.authorized_pickups || [], agreement: c.agreement || null,
     agreementToken: c.agreement_token || null, colorOverride: c.color_override || null,
-    payments: c.payments || [],
-    pets: (petRows||[]).filter(p=>p.customer_id===c.id).map(p=>({
-      id: p.id, name: p.name, type: p.type, breed: p.breed, colour: p.colour, gender: p.gender, dob: p.dob,
-      boardingSize: p.boarding_size, groomingSize: p.grooming_size, spayed: p.spayed,
-      lastVax: p.last_vax, lastTick: p.last_tick, medical: p.medical, personality: p.personality, special: p.special,
-      riskFlags: p.risk_flags || [], photo: p.photo || null, vetClinic: p.vet_clinic || '', vetPhone: p.vet_phone || '',
-      stays: p.stays || [], groomingHistory: p.grooming_history || [],
-    })),
+    payments: (existingCustById.get(c.id)||{}).payments || [],
+    pets: (petRows||[]).filter(p=>p.customer_id===c.id).map(p=>{
+      const ex = existingPetById.get(p.id);
+      return {
+        id: p.id, name: p.name, type: p.type, breed: p.breed, colour: p.colour, gender: p.gender, dob: p.dob,
+        boardingSize: p.boarding_size, groomingSize: p.grooming_size, spayed: p.spayed,
+        lastVax: p.last_vax, lastTick: p.last_tick, medical: p.medical, personality: p.personality, special: p.special,
+        riskFlags: p.risk_flags || [], photo: p.photo || null, vetClinic: p.vet_clinic || '', vetPhone: p.vet_phone || '',
+        stays: ex ? (ex.stays||[]) : [], groomingHistory: ex ? (ex.groomingHistory||[]) : [],
+      };
+    }),
   }));
   // Tracked OUTSIDE state.customers (pain point #5, phase 3) rather than as
   // a field on each customer/pet — state.customers is diffed elsewhere by
@@ -6435,29 +6456,46 @@ async function loadStaysFromTables(){
     (stayById[s.primary_pet_id] = stayById[s.primary_pet_id] || []).push(stay);
   });
   state.customers.forEach(c=>c.pets.forEach(p=>{ p.stays = stayById[p.id] || []; }));
+  _stayVersions = new Map((stayRows||[]).map(s=>[s.id, s.version]));
   const flatNow = flattenAllStays(state.customers);
   _lastSyncedStaysJSON = JSON.stringify(flatNow);
   _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
 }
 /* Diffs `baseline` against `current` (both flattened lists) and writes
-   only the stays that actually changed — upsert for new/changed, delete
-   for removed. upsert() makes this safe to blindly retry on failure. */
+   only the stays that actually changed. New stays still go through
+   upsert() (retry-safe). Existing stays that changed use a conditional
+   update instead (WHERE id = X AND version = <last seen in
+   _stayVersions>) — pain point #5, phase 4: 0 rows affected means another
+   device saved this same stay since this device last loaded it, so this
+   throws SyncConflictError instead of overwriting. Deletes are
+   conditioned the same way. Every successful write updates
+   _stayVersions immediately, same reasoning as the customers/pets phase —
+   so the next save's condition checks against what THIS save just
+   produced. */
 async function syncStaysToTables(baseline, current){
   const baseById = new Map(baseline.map(x=>[x.stay.id, x]));
   const curIds = new Set(current.map(x=>x.stay.id));
   for(const {stay} of baseline){
     if(!curIds.has(stay.id)){
-      const { error } = await sb.from('stays').delete().eq('id', stay.id);
+      const { data, error } = await sb.from('stays').delete().eq('id', stay.id).eq('version', _stayVersions.get(stay.id)).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A stay`, loadStaysFromTables);
+      _stayVersions.delete(stay.id);
     }
   }
   for(const {stay, primaryPetId, customerId} of current){
     const old = baseById.get(stay.id);
     const row = mapStayRow(stay, primaryPetId, customerId);
     const oldRow = old ? mapStayRow(old.stay, old.primaryPetId, old.customerId) : null;
-    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
-      const { error } = await sb.from('stays').upsert(row);
+    if(!old){
+      const { data, error } = await sb.from('stays').upsert(row).select().single();
       if(error) throw error;
+      _stayVersions.set(stay.id, data.version);
+    } else if(JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { data, error } = await sb.from('stays').update(row).eq('id', stay.id).eq('version', _stayVersions.get(stay.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A stay`, loadStaysFromTables);
+      _stayVersions.set(stay.id, data[0].version);
     }
   }
 }
@@ -7040,11 +7078,12 @@ async function restoreArchivedRecord(kind, id){
         charges: row.charges || [], pets: row.pets || [], dropoff: row.dropoff || null, pickup: row.pickup || null,
         paidThrough: row.paid_through || null, remindersSent: row.reminders_sent || {checkin:[],checkout:[]},
       });
-      const { error: upErr } = await sb.from('stays').upsert(mapStayRow(stay, pet.id, row.customer_id));
+      const { data, error: upErr } = await sb.from('stays').upsert(mapStayRow(stay, pet.id, row.customer_id)).select().single();
       if(upErr) throw upErr;
       const { error: delErr } = await sb.from('stays_archive').delete().eq('id', id);
       if(delErr) throw delErr;
       pet.stays = [...(pet.stays||[]), stay];
+      _stayVersions.set(stay.id, data.version);
       const staysFlatNow = flattenAllStays(state.customers);
       _lastSyncedStaysJSON = JSON.stringify(staysFlatNow); _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
     } else if(kind==='groom'){
