@@ -587,6 +587,7 @@ let _changeLogBaseline = []; // last-known state.changeLog as reflected in the c
 let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — cancellations tracked separately too, see syncCancellationsToTables()
 let _cancellationsBaseline = []; // last-known state.cancellations as reflected in the cancellations table
 let _lastSyncedShopConfigJSON = null; // 27 Aug 2026 migration (Phase 8) — shop config tracked separately too, see the shop_config unit in saveToCloudNow()
+let _lastSyncedShopConfigVersion = null; // pain point #5, phase 2 (29 Aug 2026) — the version this device last saw for the singleton shop_config row; null means no row has been loaded yet (fresh workspace), so the next save is a plain insert with nothing to conflict against
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
@@ -614,12 +615,16 @@ let _agreementPollStarted = false;
    errors: no retry (retrying would just fail again, or worse, clobber
    the other device's newer save), just refetch and tell the person to
    redo their edit. `entityLabel` is a human-readable name for the
-   toast (e.g. `Staff member "Aisyah"`). */
+   toast (e.g. `Staff member "Aisyah"`). `reload`, if given, is an async
+   function that refetches the real current data for whatever conflicted
+   — lets a single generic catch (e.g. attemptSaveWithRetry's) recover
+   without needing to know which entity threw. */
 class SyncConflictError extends Error{
-  constructor(entityLabel){
+  constructor(entityLabel, reload){
     super(`${entityLabel} was changed on another device since you opened this — showing the latest version. Please redo your edit.`);
     this.isConflict = true;
     this.entityLabel = entityLabel;
+    this.reload = reload || (()=>Promise.resolve());
   }
 }
 
@@ -991,12 +996,32 @@ async function saveToCloudNow(){
       commit: ()=>{ _lastSyncedCancellationsJSON = cancellationsJson; _cancellationsBaseline = JSON.parse(cancellationsJson); } },
     { changed: shopConfigJson !== _lastSyncedShopConfigJSON,
       run: async ()=>{
-        const result = await withTimeout(
-          sb.from('shop_config').upsert(mapShopConfigRow(JSON.parse(shopConfigJson))),
-          10000, 'timeout'
-        );
-        if(result === 'timeout') throw new Error('Connection timed out');
-        if(result.error) throw result.error;
+        const payload = mapShopConfigRow(JSON.parse(shopConfigJson));
+        if(_lastSyncedShopConfigVersion == null){
+          // No row has been loaded yet (fresh workspace, or this session
+          // never saw one) — nothing exists to conflict with, so a plain
+          // upsert is safe here same as before.
+          const result = await withTimeout(
+            sb.from('shop_config').upsert(payload).select().maybeSingle(),
+            10000, 'timeout'
+          );
+          if(result === 'timeout') throw new Error('Connection timed out');
+          if(result.error) throw result.error;
+          if(result.data) _lastSyncedShopConfigVersion = result.data.version;
+        } else {
+          // Row already exists — conditional update guards against another
+          // device having saved shop settings since this device last loaded
+          // them. Singleton table, so `id` alone would always match; the
+          // `version` check is what makes this actually conditional.
+          const result = await withTimeout(
+            sb.from('shop_config').update(payload).eq('id', WORKSPACE_ID).eq('version', _lastSyncedShopConfigVersion).select(),
+            10000, 'timeout'
+          );
+          if(result === 'timeout') throw new Error('Connection timed out');
+          if(result.error) throw result.error;
+          if(!result.data || !result.data.length) throw new SyncConflictError('Shop settings', loadShopConfigFromTables);
+          _lastSyncedShopConfigVersion = result.data[0].version;
+        }
       },
       commit: ()=>{ _lastSyncedShopConfigJSON = shopConfigJson; } },
     { changed: json !== _lastSyncedJSON,
@@ -1039,6 +1064,18 @@ async function attemptSaveWithRetry(units, attempt){
     _lastSyncError = null;
     setSyncStatus('ok','Synced');
   } catch(error){
+    if(error && error.isConflict){
+      // Version conflict — retrying with the same stale version would just
+      // fail again, or land right after someone else's newer save and
+      // clobber it. Refetch the real current data instead and stop this
+      // pass; whatever else is still locally changed picks up again on the
+      // next debounced save.
+      await error.reload();
+      render();
+      setSyncStatus('ok','Synced');
+      toast(error.message);
+      return;
+    }
     if(attempt < SAVE_RETRY_DELAYS_MS.length){
       await new Promise(res=>setTimeout(res, SAVE_RETRY_DELAYS_MS[attempt]));
       return attemptSaveWithRetry(units, attempt+1);
@@ -6705,6 +6742,7 @@ async function loadShopConfigFromTables(){
     if(typeof row.large_normal === 'number') LARGE.normal = row.large_normal;
     if(typeof row.large_holiday === 'number') LARGE.holiday = row.large_holiday;
   }
+  _lastSyncedShopConfigVersion = row ? row.version : null;
   _lastSyncedShopConfigJSON = JSON.stringify(snapshotShopConfig());
 }
 /* =========================================================
