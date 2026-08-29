@@ -8023,17 +8023,37 @@ function buildBoardingBlock(stay, sp){
   // Sharing composition line(s) — "RM60 (1x S/M size dog 1x room) + RM50
   // (Additional 1x L size dog in same room) = RM110 per night". Grouped by
   // size so e.g. two S/M extras show as "2x S/M size dog", not two lines.
+  // Species (dog/cat) is read straight off the pets involved rather than
+  // hardcoded, and sizing is shown differently by species/room (29 Aug
+  // 2026): dogs' size only ever changes the base per-night rate in a
+  // Deluxe room (LARGE vs normal — Suite room/Royal Suite charge the same
+  // regardless of dog size), so the size only appears on the primary "1x
+  // ... room" part there; the sharing-surcharge "Additional" part does
+  // differ by size everywhere for dogs (surchargeSM vs surchargeLXL) so it
+  // always shows size for dogs. Cats only ever board in Cat Deluxe and
+  // don't have a size-driven rate tier at all, so neither part shows a
+  // size for cats — just a plain count.
   function sharingLine(rows){
     const sample = rows[0];
     const baseRate = sample.baseRate;
-    const sizeCounts = {};
-    sample.extrasTonight.forEach(p=>{
-      const lbl = sizeGroupLabel(p.boardingSize);
-      sizeCounts[lbl] = (sizeCounts[lbl]||0)+1;
-    });
-    const extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
+    const primaryPet = pets[0];
+    const isCat = primaryPet && primaryPet.type === 'Cat';
+    const speciesWord = isCat ? 'cat' : 'dog';
+    const showPrimarySize = !isCat && roomLabel === 'Deluxe room';
+    const primaryDescr = showPrimarySize ? `${sizeGroupLabel(primaryPet.boardingSize)} size ${speciesWord}` : speciesWord;
+    let extraDescr;
+    if(isCat){
+      extraDescr = `${sample.extrasTonight.length}x cat`;
+    } else {
+      const sizeCounts = {};
+      sample.extrasTonight.forEach(p=>{
+        const lbl = sizeGroupLabel(p.boardingSize);
+        sizeCounts[lbl] = (sizeCounts[lbl]||0)+1;
+      });
+      extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
+    }
     const perNight = baseRate + sample.surchargeAmt;
-    return { text: `RM ${fmtRM(baseRate)} (1x dog/cat 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
+    return { text: `RM ${fmtRM(baseRate)} (1x ${primaryDescr} 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
   }
 
   if(nightRows.length===0){
