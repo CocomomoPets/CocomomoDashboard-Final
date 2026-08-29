@@ -589,8 +589,10 @@ let _paymentsBaseline = []; // last-known flattened payments list as reflected i
 let _paymentVersions = new Map(); // pain point #5, phase 6 (29 Aug 2026) — id -> version this device last saw for each payment; kept OUTSIDE the payment objects, same reasoning as _groomVersions (phase 5)
 let _lastSyncedChangeLogJSON = null; // 27 Aug 2026 migration (Phase 7) — change log tracked separately too, see syncChangeLogToTables()
 let _changeLogBaseline = []; // last-known state.changeLog as reflected in the change_log table
+let _changeLogVersions = new Map(); // pain point #5, phase 7 (29 Aug 2026) — id -> version this device last saw for each change-log entry; kept OUTSIDE the entry objects, same reasoning as every prior phase
 let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — cancellations tracked separately too, see syncCancellationsToTables()
 let _cancellationsBaseline = []; // last-known state.cancellations as reflected in the cancellations table
+let _cancellationsVersions = new Map(); // pain point #5, phase 7 — id -> version this device last saw for each cancellation entry
 let _lastSyncedShopConfigJSON = null; // 27 Aug 2026 migration (Phase 8) — shop config tracked separately too, see the shop_config unit in saveToCloudNow()
 let _lastSyncedShopConfigVersion = null; // pain point #5, phase 2 (29 Aug 2026) — the version this device last saw for the singleton shop_config row; null means no row has been loaded yet (fresh workspace), so the next save is a plain insert with nothing to conflict against
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
@@ -6852,30 +6854,44 @@ async function loadChangeLogFromTables(){
     id: r.id, ts: r.ts, entityType: r.entity_type, ref: r.ref || {}, entityLabel: r.entity_label || '',
     field: r.field, fieldLabel: r.field_label || r.field, oldValue: r.old_value, newValue: r.new_value, undone: !!r.undone,
   }));
+  _changeLogVersions = new Map((rows||[]).map(r=>[r.id, r.version]));
   _lastSyncedChangeLogJSON = JSON.stringify(state.changeLog);
   _changeLogBaseline = JSON.parse(_lastSyncedChangeLogJSON);
 }
 /* Diffs `baseline` against `current` (both the flat state.changeLog list)
    and writes only the entries that actually changed — new entries get
-   inserted, an undone entry's `undone` flip gets upserted, and anything
-   that dropped off the in-memory 300-cap gets deleted to match. Same
-   upsert/delete pattern as everywhere else — safe to blindly retry. */
+   inserted, an undone entry's `undone` flip gets updated, and anything
+   that dropped off the in-memory 300-cap gets deleted to match. New
+   entries still go through upsert() (retry-safe). Existing entries that
+   changed use a conditional update instead (WHERE id = X AND version =
+   <last seen in _changeLogVersions>) — pain point #5, phase 7: 0 rows
+   affected means another device saved this same entry (e.g. undid it)
+   since this device last loaded it, so this throws SyncConflictError
+   instead of overwriting. Deletes are conditioned the same way. */
 async function syncChangeLogToTables(baseline, current){
   const baseById = new Map(baseline.map(e=>[e.id, e]));
   const curIds = new Set(current.map(e=>e.id));
   for(const e of baseline){
     if(!curIds.has(e.id)){
-      const { error } = await sb.from('change_log').delete().eq('id', e.id);
+      const { data, error } = await sb.from('change_log').delete().eq('id', e.id).eq('version', _changeLogVersions.get(e.id)).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A change-log entry`, loadChangeLogFromTables);
+      _changeLogVersions.delete(e.id);
     }
   }
   for(const e of current){
     const old = baseById.get(e.id);
     const row = mapChangeLogRow(e);
     const oldRow = old ? mapChangeLogRow(old) : null;
-    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
-      const { error } = await sb.from('change_log').upsert(row);
+    if(!old){
+      const { data, error } = await sb.from('change_log').upsert(row).select().single();
       if(error) throw error;
+      _changeLogVersions.set(e.id, data.version);
+    } else if(JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { data, error } = await sb.from('change_log').update(row).eq('id', e.id).eq('version', _changeLogVersions.get(e.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A change-log entry`, loadChangeLogFromTables);
+      _changeLogVersions.set(e.id, data[0].version);
     }
   }
 }
@@ -6906,6 +6922,7 @@ async function loadCancellationsFromTables(){
     id: r.id, type: r.type, reason: r.reason || '', note: r.note || '', cancelledAt: r.cancelled_at,
     customerId: r.customer_id || null, customerName: r.customer_name || '', petName: r.pet_name || '', summary: r.summary || '',
   }));
+  _cancellationsVersions = new Map((rows||[]).map(r=>[r.id, r.version]));
   _lastSyncedCancellationsJSON = JSON.stringify(state.cancellations);
   _cancellationsBaseline = JSON.parse(_lastSyncedCancellationsJSON);
 }
@@ -6913,23 +6930,35 @@ async function loadCancellationsFromTables(){
    list) and writes only what changed — in practice this log is
    append-only (nothing ever edits or removes a past cancellation), so this
    will almost always just be inserts, but the same generic diff pattern is
-   kept for consistency and safety. */
+   kept for consistency and safety. New entries still go through upsert()
+   (retry-safe). Existing entries that changed use a conditional update
+   instead (WHERE id = X AND version = <last seen in
+   _cancellationsVersions>) — pain point #5, phase 7, same reasoning as the
+   change log just above. */
 async function syncCancellationsToTables(baseline, current){
   const baseById = new Map(baseline.map(c=>[c.id, c]));
   const curIds = new Set(current.map(c=>c.id));
   for(const c of baseline){
     if(!curIds.has(c.id)){
-      const { error } = await sb.from('cancellations').delete().eq('id', c.id);
+      const { data, error } = await sb.from('cancellations').delete().eq('id', c.id).eq('version', _cancellationsVersions.get(c.id)).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A cancellation entry`, loadCancellationsFromTables);
+      _cancellationsVersions.delete(c.id);
     }
   }
   for(const c of current){
     const old = baseById.get(c.id);
     const row = mapCancellationRow(c);
     const oldRow = old ? mapCancellationRow(old) : null;
-    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
-      const { error } = await sb.from('cancellations').upsert(row);
+    if(!old){
+      const { data, error } = await sb.from('cancellations').upsert(row).select().single();
       if(error) throw error;
+      _cancellationsVersions.set(c.id, data.version);
+    } else if(JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { data, error } = await sb.from('cancellations').update(row).eq('id', c.id).eq('version', _cancellationsVersions.get(c.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A cancellation entry`, loadCancellationsFromTables);
+      _cancellationsVersions.set(c.id, data[0].version);
     }
   }
 }
