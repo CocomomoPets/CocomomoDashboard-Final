@@ -583,6 +583,7 @@ let _staysBaseline = []; // last-known flattened stays list as reflected in the 
 let _stayVersions = new Map(); // pain point #5, phase 4 (29 Aug 2026) — id -> version this device last saw for each stay; kept OUTSIDE the stay objects, same reasoning as _customerVersions/_petVersions (phase 3)
 let _lastSyncedGroomsJSON = null; // 23 Aug 2026 migration — grooming tracked separately too, see syncGroomsToTables()
 let _groomsBaseline = []; // last-known flattened grooming list as reflected in the grooming_appointments table
+let _groomVersions = new Map(); // pain point #5, phase 5 (29 Aug 2026) — id -> version this device last saw for each grooming appointment; kept OUTSIDE the groom objects, same reasoning as _stayVersions (phase 4)
 let _lastSyncedPaymentsJSON = null; // 23 Aug 2026 migration — payments tracked separately too, see syncPaymentsToTables()
 let _paymentsBaseline = []; // last-known flattened payments list as reflected in the payments table
 let _lastSyncedChangeLogJSON = null; // 27 Aug 2026 migration (Phase 7) — change log tracked separately too, see syncChangeLogToTables()
@@ -6563,29 +6564,45 @@ async function loadGroomsFromTables(){
     (byPet[g.pet_id] = byPet[g.pet_id] || []).push(groom);
   });
   state.customers.forEach(c=>c.pets.forEach(p=>{ p.groomingHistory = byPet[p.id] || []; }));
+  _groomVersions = new Map((rows||[]).map(g=>[g.id, g.version]));
   const flatNow = flattenAllGrooms(state.customers);
   _lastSyncedGroomsJSON = JSON.stringify(flatNow);
   _groomsBaseline = JSON.parse(_lastSyncedGroomsJSON);
 }
 /* Diffs `baseline` against `current` (both flattened lists) and writes
-   only the appointments that actually changed. Same upsert/delete pattern
-   as syncStaysToTables — safe to blindly retry. */
+   only the appointments that actually changed. New appointments still go
+   through upsert() (retry-safe). Existing appointments that changed use a
+   conditional update instead (WHERE id = X AND version = <last seen in
+   _groomVersions>) — pain point #5, phase 5: 0 rows affected means
+   another device saved this same appointment since this device last
+   loaded it, so this throws SyncConflictError instead of overwriting.
+   Deletes are conditioned the same way. Every successful write updates
+   _groomVersions immediately, same reasoning as the stays phase — so the
+   next save's condition checks against what THIS save just produced. */
 async function syncGroomsToTables(baseline, current){
   const baseById = new Map(baseline.map(x=>[x.groom.id, x]));
   const curIds = new Set(current.map(x=>x.groom.id));
   for(const {groom} of baseline){
     if(!curIds.has(groom.id)){
-      const { error } = await sb.from('grooming_appointments').delete().eq('id', groom.id);
+      const { data, error } = await sb.from('grooming_appointments').delete().eq('id', groom.id).eq('version', _groomVersions.get(groom.id)).select();
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A grooming appointment`, loadGroomsFromTables);
+      _groomVersions.delete(groom.id);
     }
   }
   for(const {groom, petId, customerId} of current){
     const old = baseById.get(groom.id);
     const row = mapGroomRow(groom, petId, customerId);
     const oldRow = old ? mapGroomRow(old.groom, old.petId, old.customerId) : null;
-    if(!oldRow || JSON.stringify(oldRow) !== JSON.stringify(row)){
-      const { error } = await sb.from('grooming_appointments').upsert(row);
+    if(!old){
+      const { data, error } = await sb.from('grooming_appointments').upsert(row).select().single();
       if(error) throw error;
+      _groomVersions.set(groom.id, data.version);
+    } else if(JSON.stringify(oldRow) !== JSON.stringify(row)){
+      const { data, error } = await sb.from('grooming_appointments').update(row).eq('id', groom.id).eq('version', _groomVersions.get(groom.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`A grooming appointment`, loadGroomsFromTables);
+      _groomVersions.set(groom.id, data[0].version);
     }
   }
 }
@@ -7099,11 +7116,12 @@ async function restoreArchivedRecord(kind, id){
         groomColor: row.groom_color || null, reminderSent: !!row.reminder_sent,
         customerId: row.customer_id, petId: row.pet_id,
       });
-      const { error: upErr } = await sb.from('grooming_appointments').upsert(mapGroomRow(groom, pet.id, row.customer_id));
+      const { data, error: upErr } = await sb.from('grooming_appointments').upsert(mapGroomRow(groom, pet.id, row.customer_id)).select().single();
       if(upErr) throw upErr;
       const { error: delErr } = await sb.from('grooming_archive').delete().eq('id', id);
       if(delErr) throw delErr;
       pet.groomingHistory = [...(pet.groomingHistory||[]), groom];
+      _groomVersions.set(groom.id, data.version);
       const groomsFlatNow = flattenAllGrooms(state.customers);
       _lastSyncedGroomsJSON = JSON.stringify(groomsFlatNow); _groomsBaseline = JSON.parse(_lastSyncedGroomsJSON);
     } else if(kind==='payment'){
