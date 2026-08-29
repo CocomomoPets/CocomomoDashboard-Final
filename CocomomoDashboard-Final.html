@@ -7892,10 +7892,29 @@ function fmtRM2(n){
   const [intPart, decPart] = fixed.split('.');
   return `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${decPart}`;
 }
-// Groups a sorted list of yyyy-mm-dd strings into consecutive-run ranges,
-// e.g. ["08-08","08-09","08-14"] -> "8/8 - 9/8, 14/8" — matches how the
-// normal-rate nights either side of a holiday block are shown together.
-function groupDateRangesForMessage(dateStrs){
+// "2026-08-10" -> "10/8/26" (no leading zeros on day/month, 2-digit year) —
+// used in the holiday/normal rate headers so the range reads unambiguously
+// even when the stay crosses a year boundary (e.g. New Year's).
+function fmtDateShortYY(s){
+  const d = new Date(s+'T00:00:00');
+  return `${d.getDate()}/${d.getMonth()+1}/${String(d.getFullYear()).slice(2)}`;
+}
+// Groups a sorted list of yyyy-mm-dd strings (each one a *night* of the
+// stay, i.e. the date the guest is present, not the date they leave) into
+// consecutive-run ranges, e.g. ["08-08","08-09","08-14"] -> "8/8/26 -
+// 9/8/26, 14/8/26" — matches how the normal-rate nights either side of a
+// holiday block are shown together. `overallCheckOut` (optional,
+// yyyy-mm-dd) is the actual stay checkout date: when the LAST run in the
+// list ends on the night immediately before it (i.e. this run covers the
+// nights right up to departure), a ", <day>th check out" note is appended
+// after that run's own range — so a normal-rate block running 27-29 Dec
+// with checkout on the 30th reads "27/12/26 - 29/12/26, 30th check out",
+// keeping the range itself as the nights actually charged while still
+// surfacing the real departure date. A run that hands off to another rate
+// block mid-stay (e.g. holiday nights immediately followed by normal-rate
+// nights) gets no such note, since the very next date is already covered
+// by the following block's own range.
+function groupDateRangesForMessage(dateStrs, overallCheckOut){
   if(dateStrs.length===0) return '';
   const sorted = dateStrs.slice().sort();
   const ranges = [];
@@ -7907,7 +7926,14 @@ function groupDateRangesForMessage(dateStrs){
     start = d; prev = d;
   }
   ranges.push([start, prev]);
-  return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
+  return ranges.map(([a,b], idx) => {
+    const base = a===b ? fmtDateShortYY(a) : `${fmtDateShortYY(a)} - ${fmtDateShortYY(b)}`;
+    if(overallCheckOut && idx===ranges.length-1 && addDays(b,1)===overallCheckOut){
+      const coDay = new Date(overallCheckOut+'T00:00:00').getDate();
+      return `${base}, ${coDay}${ordinalSuffix(coDay)} check out`;
+    }
+    return base;
+  }).join(', ');
 }
 
 /* Computes everything for ONE room booking (one stay.pets row) up through
@@ -8035,20 +8061,22 @@ function buildBoardingBlock(stay, sp){
     } else {
       let holidayPerNight = holidayRows[0].baseRate;
       let normalPerNight = normalRows[0].baseRate;
+      const holidayRange = groupDateRangesForMessage(holidayRows.map(r=>r.dateStr), checkOut);
+      const normalRange = groupDateRangesForMessage(normalRows.map(r=>r.dateStr), checkOut);
       if(hasSharing){
-        lines.push('_Holiday rate_');
+        lines.push(`_Holiday rate (${holidayRange})_`);
         const hs = sharingLine(holidayRows);
         holidayPerNight = hs.perNight;
         lines.push(hs.text);
         const holidayTotal = holidayPerNight * holidayRows.length;
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
         lines.push('');
-        lines.push('_Normal rate_');
+        lines.push(`_Normal rate (${normalRange})_`);
         const ns = sharingLine(normalRows);
         normalPerNight = ns.perNight;
         lines.push(ns.text);
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
@@ -8056,11 +8084,11 @@ function buildBoardingBlock(stay, sp){
       } else {
         const holidayTotal = holidayPerNight * holidayRows.length;
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push('_Holiday rate_');
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push(`_Holiday rate (${holidayRange})_`);
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
         lines.push('');
-        lines.push('_Normal rate_');
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push(`_Normal rate (${normalRange})_`);
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
