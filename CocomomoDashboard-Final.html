@@ -757,6 +757,7 @@ function hydrateStateFromRemote(remote, opts){
   state.rates = remote.rates ?? state.rates;
   state.surchargeSM = remote.surchargeSM ?? state.surchargeSM;
   state.surchargeLXL = remote.surchargeLXL ?? state.surchargeLXL;
+  state.daycareRates = remote.daycareRates ?? state.daycareRates;
   state.holidays = remote.holidays ?? state.holidays;
   state.closedDates = remote.closedDates ?? state.closedDates;
   state.closedWeekdays = remote.closedWeekdays ?? state.closedWeekdays;
@@ -902,6 +903,7 @@ function snapshotShopConfig(){
   return {
     shopName: state.shopName, rates: state.rates,
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL,
+    daycareRates: state.daycareRates,
     holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
@@ -1133,6 +1135,12 @@ let state = {
   rates: defaultRates(),
   surchargeSM: 30,   // additional pet surcharge — S/M size dog (RM per pet, per night)
   surchargeLXL: 50,  // additional pet surcharge — L/XL/XXL size dog (RM per pet, per night)
+  // Daycare — a stay where check-in and check-out fall on the same date is
+  // automatically treated as daycare (see isDaycareStay) instead of normal
+  // per-night boarding. Flat rate by pet size, editable centrally here and
+  // always overridable per-stay (stay.daycareRate) since a customer might
+  // want a different/upgraded room for the day.
+  daycareRates: { SM: 40, LXL: 60 },
   holidays: [
     {id:'h1', name:'Hari Raya', start:'2026-08-10', end:'2026-08-13'},
     {id:'h2', name:'School holidays', start:'2026-08-20', end:'2026-08-30'},
@@ -2498,6 +2506,12 @@ function normalizeStay(s){
     // marker — never subtracted again from the balance (that's already
     // reflected in a recorded Payment). null/unset = not marked either way.
     paidThrough: s?.paidThrough || null,
+    // Flat one-time override for a daycare visit's price (a stay where
+    // checkIn===checkOut, see isDaycareStay) — null means use the default
+    // computed from state.daycareRates by each pet's size. Kept separate
+    // from customRate/customRateMode above since those are an explicit
+    // per-NIGHT boarding override and don't apply to a same-day visit.
+    daycareRate: (s?.daycareRate === '' || s?.daycareRate == null) ? null : +s.daycareRate,
     // Explicit "combine into one bill" grouping — set by the "Merge into
     // one bill" action so staff can see one combined total across several
     // stays (on each of their own cards) even before any payment exists.
@@ -3359,8 +3373,8 @@ function stayCardHtml(cust, pet, stay){
     <div class="card-head ${isOpen?'open':''}" data-toggle-stay="${stay.id}">
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
-        <div class="card-head-title">${fmtDateWithDay(outerWindow.checkIn || stay.checkIn)} → ${fmtDateWithDay(outerWindow.checkOut || stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${stay.status==='Active'&&myCheckedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
-        <div class="card-head-sub">${nights} night${nights===1?'':'s'} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(mySlot.room):'—'}</div>
+        <div class="card-head-title">${fmtDateWithDay(outerWindow.checkIn || stay.checkIn)} → ${fmtDateWithDay(outerWindow.checkOut || stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${isDaycareStay(stay)?' <span class="badge badge-active" style="background:#E0873C;">🐾 Daycare</span>':''}${stay.status==='Active'&&myCheckedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
+        <div class="card-head-sub">${isDaycareStay(stay)?'Daycare (same-day)':`${nights} night${nights===1?'':'s'}`} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(mySlot.room):'—'}</div>
       </div>
       <div class="card-head-actions">
         ${stay.status==='Active' && !myCheckedIn ? `<button class="btn btn-sm" data-act="checkin-stay" data-stay="${stay.id}" data-pet="${pet.id}">Check in</button>` : ''}
@@ -3418,6 +3432,7 @@ function stayCardHtml(cust, pet, stay){
         ${stay.status==='Active' ? chargeAddRowHtml(stay) : ''}
       </div>
       <div class="charges-section" style="margin-top:14px;">
+        ${!isDaycareStay(stay) ? `
         <span style="color:var(--ink-soft);font-weight:600;font-size:12.5px;">Nights paid</span>
         <div style="margin-top:4px;font-size:12.5px;display:flex;align-items:center;flex-wrap:wrap;gap:8px;">
           <span>${nightsSplit.paidThrough
@@ -3426,6 +3441,7 @@ function stayCardHtml(cust, pet, stay){
           ${stay.status==='Active' ? `<button type="button" class="btn btn-sm" data-edit-paid-through="${stay.id}">${nightsSplit.paidThrough?'Edit':'Mark nights paid'}</button>` : ''}
           ${nightsSplit.paidThrough && stay.status==='Active' ? `<button type="button" class="btn btn-sm btn-ghost" data-clear-paid-through="${stay.id}">Clear</button>` : ''}
         </div>
+        ` : ''}
       </div>
       <div class="payments-section" style="margin-top:14px;">
         <div class="payments-head" style="margin-bottom:6px;">
@@ -3446,7 +3462,7 @@ function stayCardHtml(cust, pet, stay){
           `).join('')}
       </div>
       <div class="cost-box">
-        <div>Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
+        <div>${cost.isDaycare ? `🐾 Daycare rate${stay.daycareRate!=null?' (custom for this visit)':''}` : `Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}`}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
         ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${fmtRM2(cost.paidChargesTotal)} of the additional charges above is marked paid.</div>` : ''}
         <div class="cost-total">Estimated total: RM ${fmtRM2(cost.total)}</div>
         ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -3580,7 +3596,40 @@ function allStaysForPet(cust, pet){
   return out;
 }
 
+/* A stay where check-in and check-out fall on the SAME date is
+   automatically treated as daycare instead of normal overnight boarding —
+   no separate flag to toggle or get out of sync, just derived from the
+   dates every time. */
+function isDaycareStay(stay){
+  return !!stay.checkIn && stay.checkIn === stay.checkOut;
+}
+/* Default daycare total: each attending pet (the row's own pet AND any
+   sharing partners, same "who's actually in this booking" logic as
+   boarding) charged its own size-tier flat rate — no sharing surcharge
+   concept here, every pet just pays for its own day. Overridden per-stay
+   by stay.daycareRate when set (e.g. customer wants a different/upgraded
+   room for the day). */
+function defaultDaycareTotal(stay){
+  const petIds = new Set();
+  stay.pets.forEach(sp=>{
+    petIds.add(sp.petId);
+    (sp.sharingWith||[]).forEach(id=>petIds.add(id));
+  });
+  let total = 0;
+  petIds.forEach(id=>{
+    const p = findPetById(id);
+    const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
+    total += isLarge ? (state.daycareRates.LXL||0) : (state.daycareRates.SM||0);
+  });
+  return total;
+}
 function computeStayCost(stay){
+  if(isDaycareStay(stay)){
+    const daycareBase = stay.daycareRate != null ? +stay.daycareRate : defaultDaycareTotal(stay);
+    const chargesTotal = (stay.charges||[]).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
+    const paidChargesTotal = (stay.charges||[]).filter(c=>c.paid).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
+    return { total: daycareBase+chargesTotal, holidayUsed:false, extraCount:0, surchargeTotal:0, surchargeByPet:{}, chargesTotal, paidChargesTotal, usingCustomRate:false, isDaycare:true, daycareBase };
+  }
   // group pets by room — includes pets added via "Sharing with" checkboxes too,
   // since they're also physically occupying the room even though they don't
   // get their own stay.pets row. Each occupant carries its OWN checkIn/checkOut
@@ -3661,7 +3710,7 @@ function computeStayCost(stay){
   const chargesTotal = (stay.charges||[]).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
   const paidChargesTotal = (stay.charges||[]).filter(c=>c.paid).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
   total += chargesTotal;
-  return { total, holidayUsed, extraCount, surchargeTotal, surchargeByPet, chargesTotal, paidChargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0 };
+  return { total, holidayUsed, extraCount, surchargeTotal, surchargeByPet, chargesTotal, paidChargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0, isDaycare:false };
 }
 
 /* A payment can now be linked to more than one stay at once — a "combined
@@ -5058,7 +5107,7 @@ function openClosedApptEditModal(stay, kind, onSaved){
 
 function openStayModal(cust, primaryPet, existing, afterSave){
   const onSaved = afterSave || (()=>renderPetSubContent(cust, primaryPet));
-  const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: addDays(todayStr(),2), status:'Active', notes:'',
+  const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: todayStr(), status:'Active', notes:'',
     pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[], dates:{} }] };
   let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings], dates:{...(sp.dates||{})}}));
   const rows = workingPets.map((sp,idx)=> stayPetRowHtml(cust, sp, idx)).join('');
@@ -5070,9 +5119,8 @@ function openStayModal(cust, primaryPet, existing, afterSave){
         <div class="field"><label>Stay status</label>
           <select id="s_status"><option ${s.status==='Active'?'selected':''}>Active</option><option ${s.status==='Past'?'selected':''}>Past</option></select>
         </div>
-        <div class="field">
-          <label>Special rate (promo/custom, per night)</label>
-          ${customRateFieldHtml('s_rate', s.customRate, s.customRateMode)}
+        <div class="field" id="s_rateFieldWrap">
+          ${rateFieldSectionHtml()}
         </div>
         <div class="field span3"><label>General stay notes</label><textarea id="s_notes">${esc(s.notes)}</textarea></div>
       </div>
@@ -5090,6 +5138,21 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     </div>
   `, {wide:true});
 
+  function rateFieldSectionHtml(){
+    const checkIn = document.getElementById('s_in')?.value || s.checkIn;
+    const checkOut = document.getElementById('s_out')?.value || s.checkOut;
+    if(checkIn && checkIn === checkOut){
+      const defaultTotal = defaultDaycareTotal({pets: workingPets});
+      const val = s.daycareRate != null ? s.daycareRate : defaultTotal;
+      return `<label>🐾 Daycare rate (RM, flat for this visit)</label>
+        <input type="number" step="0.01" min="0" id="s_daycare_rate" value="${val}">
+        <div style="font-size:11px;color:var(--ink-soft);margin-top:4px;">Same-day check-in/out — treated as daycare, not overnight boarding. Default from Rates &amp; Staff for the pet(s) here: RM ${fmtRM(defaultTotal)}. Edit if this visit needs a different price.</div>`;
+    }
+    return `<label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('s_rate', s.customRate, s.customRateMode)}`;
+  }
+  function refreshRateFieldWrap(){
+    document.getElementById('s_rateFieldWrap').innerHTML = rateFieldSectionHtml();
+  }
   let workingDropoff = s.dropoff ? {...s.dropoff} : {time: closedDateFor(s.checkIn) ? '09:00' : '', contactName:'', contactPhone:''};
   let workingPickup = s.pickup ? {...s.pickup} : {time: closedDateFor(s.checkOut) ? '17:00' : '', contactName:'', contactPhone:''};
   function closedApptSectionHtml(){
@@ -5143,6 +5206,8 @@ function openStayModal(cust, primaryPet, existing, afterSave){
   document.getElementById('s_out').addEventListener('change', refreshStayRows);
   document.getElementById('s_in').addEventListener('change', refreshClosedApptWrap);
   document.getElementById('s_out').addEventListener('change', refreshClosedApptWrap);
+  document.getElementById('s_in').addEventListener('change', refreshRateFieldWrap);
+  document.getElementById('s_out').addEventListener('change', refreshRateFieldWrap);
   document.getElementById('s_in').addEventListener('change', (e)=>{ document.getElementById('s_in_wd').textContent = fmtDateSlashDay(e.target.value); });
   document.getElementById('s_out').addEventListener('change', (e)=>{ document.getElementById('s_out_wd').textContent = fmtDateSlashDay(e.target.value); });
   document.getElementById('addStayPetBtn').addEventListener('click', ()=>{
@@ -5311,9 +5376,17 @@ function openStayModal(cust, primaryPet, existing, afterSave){
       const wPet = findPetAcrossStay(cust, w.petId);
       if(wPet && !confirmIfNearbyStay(wPet, checkIn, existing?.id)) return;
     }
-    const { customRate, customRateMode } = readCustomRate('s_rate');
+    const isDaycareNow = checkIn === checkOut;
+    let customRate = null, customRateMode = 'flat', daycareRate = null;
+    if(isDaycareNow){
+      const dayInput = document.getElementById('s_daycare_rate');
+      daycareRate = (dayInput && dayInput.value !== '') ? +dayInput.value : null;
+    } else {
+      const cr = readCustomRate('s_rate');
+      customRate = cr.customRate; customRateMode = cr.customRateMode;
+    }
     const payload = {
-      checkIn, checkOut, status:document.getElementById('s_status').value, notes:document.getElementById('s_notes').value, customRate, customRateMode, pets:workingPets,
+      checkIn, checkOut, status:document.getElementById('s_status').value, notes:document.getElementById('s_notes').value, customRate, customRateMode, daycareRate, pets:workingPets,
       dropoff: inClosed ? {...workingDropoff} : normalizeClosedAppt({time:workingDropoff.time, contactName:'', contactPhone:''}),
       pickup: outClosed ? {...workingPickup} : normalizeClosedAppt({time:workingPickup.time, contactName:'', contactPhone:''}),
     };
@@ -5330,8 +5403,8 @@ function openStayModal(cust, primaryPet, existing, afterSave){
           });
         });
         logFieldChanges('Stay', {stayId: existing.id}, primaryPet.name, existing, payload,
-          ['checkIn','checkOut','customRate','notes'],
-          {checkIn:'Check-in date', checkOut:'Check-out date', customRate:'Special rate', notes:'Notes'});
+          ['checkIn','checkOut','customRate','daycareRate','notes'],
+          {checkIn:'Check-in date', checkOut:'Check-out date', customRate:'Special rate', daycareRate:'Daycare rate', notes:'Notes'});
         Object.assign(existing, payload);
         // Re-check FBG entitlement after an edit — e.g. checkout pushed later
         // and the stay now crosses another 7-night threshold. Reconciles
@@ -6185,6 +6258,7 @@ function mapStayRow(s, primaryPetId, customerId){
     custom_rate_mode: s.customRateMode || 'flat', charges: s.charges || [], pets: s.pets || [],
     dropoff: s.dropoff || null, pickup: s.pickup || null, paid_through: s.paidThrough || null,
     billing_group_id: s.billingGroupId || null,
+    daycare_rate: s.daycareRate == null ? null : +s.daycareRate,
     reminders_sent: s.remindersSent || {checkin:[],checkout:[]},
   };
 }
@@ -6234,6 +6308,7 @@ async function loadStaysFromTables(){
       charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
       paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
       billingGroupId: s.billing_group_id || null,
+      daycareRate: s.daycare_rate,
     });
     (stayById[s.primary_pet_id] = stayById[s.primary_pet_id] || []).push(stay);
   });
@@ -6556,6 +6631,7 @@ function mapShopConfigRow(cfg){
   return {
     id: WORKSPACE_ID, shop_name: cfg.shopName, rates: cfg.rates,
     surcharge_sm: cfg.surchargeSM, surcharge_lxl: cfg.surchargeLXL,
+    daycare_rates: cfg.daycareRates,
     holidays: cfg.holidays, closed_dates: cfg.closedDates, closed_weekdays: cfg.closedWeekdays,
     policy_text: cfg.policyText, large_normal: cfg.LARGE_normal, large_holiday: cfg.LARGE_holiday,
     updated_at: new Date().toISOString(),
@@ -6574,6 +6650,7 @@ async function migrateShopConfigFromBlobIfNeeded(blobData){
   const cfg = {
     shopName: blobData.shopName, rates: blobData.rates,
     surchargeSM: blobData.surchargeSM, surchargeLXL: blobData.surchargeLXL,
+    daycareRates: blobData.daycareRates || { SM: 40, LXL: 60 },
     holidays: blobData.holidays, closedDates: blobData.closedDates, closedWeekdays: blobData.closedWeekdays,
     policyText: blobData.policyText, LARGE_normal: blobData.LARGE_normal, LARGE_holiday: blobData.LARGE_holiday,
   };
@@ -6591,6 +6668,7 @@ async function loadShopConfigFromTables(){
     state.rates = row.rates ?? state.rates;
     state.surchargeSM = row.surcharge_sm ?? state.surchargeSM;
     state.surchargeLXL = row.surcharge_lxl ?? state.surchargeLXL;
+    state.daycareRates = row.daycare_rates ?? state.daycareRates;
     state.holidays = row.holidays ?? state.holidays;
     state.closedDates = row.closed_dates ?? state.closedDates;
     state.closedWeekdays = row.closed_weekdays ?? state.closedWeekdays;
@@ -7354,7 +7432,23 @@ function buildBoardingBlock(stay, sp){
   const checkIn = win.checkIn, checkOut = win.checkOut;
   const nights = nightsBetween(checkIn, checkOut);
   const namesLabel = pets.map(p=>p.name).join(' & ');
-  if(nights<=0) return { namesLabel, roomLabel, pets, lines: ['Check-out must be after check-in — please fix the dates on this stay first.'], boardingTotal: 0, lastLineIsCombine: false, charges: [], chargesTotal: 0, fbgCount: 0, checkIn, checkOut };
+  if(checkOut < checkIn) return { namesLabel, roomLabel, pets, lines: ['Check-out must be after check-in — please fix the dates on this stay first.'], boardingTotal: 0, lastLineIsCombine: false, charges: [], chargesTotal: 0, fbgCount: 0, checkIn, checkOut };
+
+  const lines = [];
+  let boardingTotal = 0;
+  let lastLineIsCombine = false; // true when the last boarding line already ends in "X + Y = Z" (holiday split)
+
+  if(nights===0){
+    // Daycare — checkIn===checkOut, a flat one-time charge instead of the
+    // per-night math below (see isDaycareStay/computeStayCost).
+    const daycareBase = stay.daycareRate != null ? +stay.daycareRate : defaultDaycareTotal(stay);
+    const dClosed = closedDateFor(checkIn);
+    const dTime = (stay.dropoff && stay.dropoff.time) || (stay.pickup && stay.pickup.time);
+    lines.push(`Daycare - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(dClosed && dTime) ? ` _(${dTime})_` : ''}`);
+    lines.push('');
+    boardingTotal = daycareBase;
+    lines.push(`Daycare rate = RM ${fmtRM(boardingTotal)}`);
+  } else {
 
   // Nights already marked paid (stay.paidThrough, see "Nights paid" on the
   // stay card) are skipped entirely from the quote below — only the
@@ -7391,8 +7485,6 @@ function buildBoardingBlock(stay, sp){
     nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight });
   }
 
-  const lines = [];
-
   const coClosed = closedDateFor(checkOut);
   const pickupTime = stay.pickup && stay.pickup.time;
   // If some nights are already marked paid, this quote starts from the
@@ -7425,9 +7517,6 @@ function buildBoardingBlock(stay, sp){
     const perNight = baseRate + sample.surchargeAmt;
     return { text: `RM ${fmtRM(baseRate)} (1x dog/cat 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
   }
-
-  let boardingTotal = 0;
-  let lastLineIsCombine = false; // true when the last boarding line already ends in "X + Y = Z" (holiday split)
 
   if(nightRows.length===0){
     lines.push('All nights for this stay have already been paid — nothing new to quote for boarding.');
@@ -7486,6 +7575,7 @@ function buildBoardingBlock(stay, sp){
         lastLineIsCombine = true;
       }
     }
+  }
   }
 
   // Additional charges — stay-level. Free basic grooming (FBG) appointments
@@ -7816,6 +7906,12 @@ function openRatesModal(){
         <div class="rate-row"><span class="rname">Additional pet — L/XL/XXL dog (per pet/night)</span>
           <input type="number" id="r_sur_lxl" value="${state.surchargeLXL}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
         </div>
+        <div class="rate-row"><span class="rname">Daycare — S/M size (flat, per visit)</span>
+          <input type="number" id="r_day_sm" value="${state.daycareRates.SM}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
+        </div>
+        <div class="rate-row"><span class="rname">Daycare — L/XL/XXL size (flat, per visit)</span>
+          <input type="number" id="r_day_lxl" value="${state.daycareRates.LXL}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
+        </div>
       </fieldset>
       <fieldset>
         <legend>Holiday periods</legend>
@@ -7899,6 +7995,7 @@ function openRatesModal(){
     state.rates['Cat Deluxe'] = {label:'Cat Deluxe', normal:+document.getElementById('r_cat_n').value, holiday:+document.getElementById('r_cat_h').value};
     state.surchargeSM = +document.getElementById('r_sur_sm').value;
     state.surchargeLXL = +document.getElementById('r_sur_lxl').value;
+    state.daycareRates = { SM: +document.getElementById('r_day_sm').value, LXL: +document.getElementById('r_day_lxl').value };
     // read latest field values from DOM before closing
     document.querySelectorAll('#holidayRows [data-hrow]').forEach(row=>{
       const id = row.dataset.hrow;
@@ -8261,7 +8358,7 @@ function openCalendarCellModal(roomId, dateStr){
 function openCalendarNewBookingModal(prefRoomId, prefDate){
   if(state.customers.length===0){ toast('Add a customer first'); return; }
   const initialCheckIn = prefDate || todayStr();
-  const initialCheckOut = addDays(initialCheckIn, 2);
+  const initialCheckOut = initialCheckIn;
   const cbSharingIds = [];
   const cbSharingDates = {};
   openModal(`
@@ -8278,7 +8375,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
         <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="cb_out" value="${initialCheckOut}"><span class="date-overlay-label" id="cb_out_day"></span></div></div>
         <div class="field"><label>Room assignment</label><select id="cb_room"></select></div>
         ${sharingPickerHtml('cb_share', cbSharingIds, 'field span3', cbSharingDates)}
-        <div class="field span3"><label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('cb_rate', null, 'flat')}</div>
+        <div class="field span3" id="cb_rateFieldWrap"><label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('cb_rate', null, 'flat')}</div>
         <div class="field span3"><label>Feeding instructions</label><textarea id="cb_feeding"></textarea></div>
       </div>
       <div id="cbClosedApptWrap"></div>
@@ -8339,6 +8436,23 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   }
   cbRefreshClosedApptWrap();
 
+  function cbRateFieldSectionHtml(){
+    const checkIn = document.getElementById('cb_in')?.value || initialCheckIn;
+    const checkOut = document.getElementById('cb_out')?.value || initialCheckOut;
+    if(checkIn && checkIn === checkOut){
+      const petId = document.getElementById('cb_pet')?.value;
+      const pseudoStay = { pets: [{ petId, sharingWith: cbSharingIds }] };
+      const defaultTotal = defaultDaycareTotal(pseudoStay);
+      return `<label>🐾 Daycare rate (RM, flat for this visit)</label>
+        <input type="number" step="0.01" min="0" id="cb_daycare_rate" value="${defaultTotal}">
+        <div style="font-size:11px;color:var(--ink-soft);margin-top:4px;">Same-day check-in/out — treated as daycare, not overnight boarding. Default from Rates &amp; Staff for the pet(s) here: RM ${fmtRM(defaultTotal)}. Edit if this visit needs a different price.</div>`;
+    }
+    return `<label>Special rate (promo/custom, per night)</label>${customRateFieldHtml('cb_rate', null, 'flat')}`;
+  }
+  function cbRefreshRateFieldWrap(){
+    document.getElementById('cb_rateFieldWrap').innerHTML = cbRateFieldSectionHtml();
+  }
+
   function refreshRoomOptions(){
     const cust = getCustomer(document.getElementById('cb_cust').value);
     const pet = cust ? getPet(cust, document.getElementById('cb_pet').value) : null;
@@ -8391,6 +8505,9 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   document.getElementById('cb_out').addEventListener('change', refreshInOutDayHints);
   document.getElementById('cb_in').addEventListener('change', cbRefreshClosedApptWrap);
   document.getElementById('cb_out').addEventListener('change', cbRefreshClosedApptWrap);
+  document.getElementById('cb_in').addEventListener('change', cbRefreshRateFieldWrap);
+  document.getElementById('cb_out').addEventListener('change', cbRefreshRateFieldWrap);
+  document.getElementById('cb_pet').addEventListener('change', cbRefreshRateFieldWrap);
   refreshInOutDayHints();
   refreshCustOptions('');
   document.getElementById('cb_cust_search').focus();
@@ -8426,10 +8543,18 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
     const rowWindow = spRoomWindow({checkIn, checkOut}, stayPet);
     if(!isRoomAvailable(room, rowWindow.checkIn, rowWindow.checkOut, null)){ toast(`${room} is already booked for these dates`); return; }
     if(!confirmIfNearbyStay(pet, checkIn, null)) return;
-    const { customRate, customRateMode } = readCustomRate('cb_rate');
+    const isDaycareNow = checkIn === checkOut;
+    let customRate = null, customRateMode = 'flat', daycareRate = null;
+    if(isDaycareNow){
+      const dayInput = document.getElementById('cb_daycare_rate');
+      daycareRate = (dayInput && dayInput.value !== '') ? +dayInput.value : null;
+    } else {
+      const cr = readCustomRate('cb_rate');
+      customRate = cr.customRate; customRateMode = cr.customRateMode;
+    }
     const doSave = ()=>{
       const newStay = {
-        id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, charges:[],
+        id: uid('stay'), checkIn, checkOut, status:'Active', notes:'', customRate, customRateMode, daycareRate, charges:[],
         pets: [stayPet],
         dropoff: inClosed ? {...cbWorkingDropoff} : normalizeClosedAppt({time:cbWorkingDropoff.time, contactName:'', contactPhone:''}),
         pickup: outClosed ? {...cbWorkingPickup} : normalizeClosedAppt({time:cbWorkingPickup.time, contactName:'', contactPhone:''}),
