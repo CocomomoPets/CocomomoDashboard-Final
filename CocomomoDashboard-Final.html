@@ -576,6 +576,8 @@ let _syncTimer = null;
 let _lastSyncedJSON = null;
 let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
 let _customersBaseline = []; // last-known state of state.customers as reflected in the customers/pets tables — used to diff on save
+let _customerVersions = new Map(); // pain point #5, phase 3 (29 Aug 2026) — id -> version this device last saw for each customer row; kept OUTSIDE state.customers, see loadCustomersPetsFromTables
+let _petVersions = new Map(); // same as _customerVersions, keyed by pet id
 let _lastSyncedStaysJSON = null; // 18 Aug 2026 migration — stays tracked separately too, see syncStaysToTables()
 let _staysBaseline = []; // last-known flattened stays list as reflected in the stays table
 let _lastSyncedGroomsJSON = null; // 23 Aug 2026 migration — grooming tracked separately too, see syncGroomsToTables()
@@ -6252,6 +6254,14 @@ async function loadCustomersPetsFromTables(){
       stays: p.stays || [], groomingHistory: p.grooming_history || [],
     })),
   }));
+  // Tracked OUTSIDE state.customers (pain point #5, phase 3) rather than as
+  // a field on each customer/pet — state.customers is diffed elsewhere by
+  // plain JSON equality (including the very change-detection this save
+  // loop uses), and a version number that bumps on every save but isn't a
+  // real user edit would make that comparison see a phantom "change" every
+  // cycle. Kept as side maps instead, same spirit as _customersBaseline.
+  _customerVersions = new Map((custRows||[]).map(c=>[c.id, c.version]));
+  _petVersions = new Map((petRows||[]).map(p=>[p.id, p.version]));
   // Deep clone (see the matching fix/comment in attemptSaveWithRetry above) —
   // shallow would let a later in-place mutation of e.g. pet.stays silently
   // "update" this baseline too, breaking the next save's diff.
@@ -6264,37 +6274,83 @@ async function loadCustomersPetsFromTables(){
    the text primary key, which also makes this safe to blindly retry on
    failure without risking a duplicate-key error on the parts that already
    succeeded. Deletes are separate since upsert can't express "remove". */
+/* Diffs `baseline` against `current` and writes only the customer/pet rows
+   that actually changed (deep-compared via the same row-mapping functions
+   used everywhere else here). New rows still go through upsert() (retry-
+   safe — nothing exists yet to conflict with, and re-running an upsert on
+   a flaky-network retry is harmless). Existing rows that changed use a
+   conditional update instead (WHERE id = X AND version = <last seen>) —
+   pain point #5, phase 3: 0 rows affected means another device saved this
+   same customer/pet since this device last loaded it, so this throws
+   SyncConflictError instead of overwriting. Deletes are conditioned the
+   same way. Known trade-off shared with shop_config's phase: if a
+   conditional update actually succeeds server-side but the response is
+   lost to a network drop, a same-device auto-retry will see its own bumped
+   version as a mismatch and surface a conflict — rare in practice (would
+   need the response, not just the request, to be lost) and the same
+   "refetch and redo" recovery path handles it safely either way. */
+/* Diffs `baseline` against `current` and writes only the customer/pet rows
+   that actually changed (deep-compared via the same row-mapping functions
+   used everywhere else here). New rows still go through upsert() (retry-
+   safe — nothing exists yet to conflict with, and re-running an upsert on
+   a flaky-network retry is harmless). Existing rows that changed use a
+   conditional update instead (WHERE id = X AND version = <last seen>,
+   tracked in _customerVersions/_petVersions) — pain point #5, phase 3: 0
+   rows affected means another device saved this same customer/pet since
+   this device last loaded it, so this throws SyncConflictError instead of
+   overwriting. Deletes are conditioned the same way. Every successful
+   write updates the matching version map entry immediately from the row
+   Supabase hands back, so the NEXT save's condition checks against the
+   version this save just produced — not the stale pre-save one — which is
+   what keeps a normal two-edits-in-a-row-from-the-same-device sequence
+   from misfiring as a false conflict against itself. */
 async function syncCustomersAndPetsToTables(baseline, current){
   const baseById = new Map(baseline.map(c=>[c.id, c]));
   const curIds = new Set(current.map(c=>c.id));
   for(const c of baseline){
     if(!curIds.has(c.id)){
-      const { error } = await sb.from('customers').delete().eq('id', c.id); // cascades to pets
+      const { data, error } = await sb.from('customers').delete().eq('id', c.id).eq('version', _customerVersions.get(c.id)).select(); // cascades to pets
       if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`Customer "${c.name||''}"`, loadCustomersPetsFromTables);
+      _customerVersions.delete(c.id);
     }
   }
   for(const c of current){
     const old = baseById.get(c.id);
     const custRow = mapCustomerRow(c);
-    if(!old || JSON.stringify(mapCustomerRow(old)) !== JSON.stringify(custRow)){
-      const { error } = await sb.from('customers').upsert(custRow);
+    if(!old){
+      const { data, error } = await sb.from('customers').upsert(custRow).select().single();
       if(error) throw error;
+      _customerVersions.set(c.id, data.version);
+    } else if(JSON.stringify(mapCustomerRow(old)) !== JSON.stringify(custRow)){
+      const { data, error } = await sb.from('customers').update(custRow).eq('id', c.id).eq('version', _customerVersions.get(c.id)).select();
+      if(error) throw error;
+      if(!data || !data.length) throw new SyncConflictError(`Customer "${c.name||old.name||''}"`, loadCustomersPetsFromTables);
+      _customerVersions.set(c.id, data[0].version);
     }
     const oldPets = old ? (old.pets||[]) : [];
     const oldPetById = new Map(oldPets.map(p=>[p.id, p]));
     const curPetIds = new Set((c.pets||[]).map(p=>p.id));
     for(const p of oldPets){
       if(!curPetIds.has(p.id)){
-        const { error } = await sb.from('pets').delete().eq('id', p.id);
+        const { data, error } = await sb.from('pets').delete().eq('id', p.id).eq('version', _petVersions.get(p.id)).select();
         if(error) throw error;
+        if(!data || !data.length) throw new SyncConflictError(`Pet "${p.name||''}"`, loadCustomersPetsFromTables);
+        _petVersions.delete(p.id);
       }
     }
     for(const p of (c.pets||[])){
       const op = oldPetById.get(p.id);
       const petRow = mapPetRow(p, c.id);
-      if(!op || JSON.stringify(mapPetRow(op, c.id)) !== JSON.stringify(petRow)){
-        const { error } = await sb.from('pets').upsert(petRow);
+      if(!op){
+        const { data, error } = await sb.from('pets').upsert(petRow).select().single();
         if(error) throw error;
+        _petVersions.set(p.id, data.version);
+      } else if(JSON.stringify(mapPetRow(op, c.id)) !== JSON.stringify(petRow)){
+        const { data, error } = await sb.from('pets').update(petRow).eq('id', p.id).eq('version', _petVersions.get(p.id)).select();
+        if(error) throw error;
+        if(!data || !data.length) throw new SyncConflictError(`Pet "${p.name||op.name||''}"`, loadCustomersPetsFromTables);
+        _petVersions.set(p.id, data[0].version);
       }
     }
   }
