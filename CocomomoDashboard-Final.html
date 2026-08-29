@@ -5712,7 +5712,7 @@ function openGroomModal(cust, pet, existing, opts){
     wireDateOverlay('g_repeat_until');
   }
   document.getElementById('cancelBtn').addEventListener('click', ()=>{ if(opts.onCancel) opts.onCancel(); else closeModal(); });
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const date = document.getElementById('g_date').value;
     const time = document.getElementById('g_time').value;
     const bay = document.getElementById('g_bay').value;
@@ -5721,6 +5721,19 @@ function openGroomModal(cust, pet, existing, opts){
     if(!existing && isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
     const conflict = findGroomConflict(date, time, bay, existing?.id);
     if(conflict){ toast(`${bay} is already booked at ${time} on that date`); return; }
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
+    // Re-check against the LIVE table right before committing — same
+    // reasoning as the grid's "Book grooming" modal (see
+    // findGroomConflictLive) — this modal is a separate code path (opened
+    // from the pet's own card) that had the same local-only-check gap.
+    const liveConflict = await findGroomConflictLive(date, time, bay, existing?.id);
+    saveBtn.disabled = false; saveBtn.textContent = 'Save';
+    if(liveConflict){
+      toast(`${bay} was just booked at ${time} on that date by another device — pick a different slot`);
+      refreshGBay();
+      return;
+    }
     if(!confirmIfNearbyGroom(pet, date, existing?.id)) return;
     const addons = getGAddons();
     const basePayload = {
@@ -5749,14 +5762,16 @@ function openGroomModal(cust, pet, existing, opts){
     // frequency up to (and including) the "repeat until" date. Each occurrence
     // keeps the same time/bay/details — dates where that bay/time is already
     // taken are skipped rather than overwritten, and reported back so staff
-    // can manually place those few instead.
+    // can manually place those few instead. Each iteration also re-checks
+    // LIVE (not just local) — same double-booking gap as a single booking,
+    // just repeated per date in the series.
     const step = repeatMode==='weekly' ? (d)=>addDays(d,7) : repeatMode==='biweekly' ? (d)=>addDays(d,14) : (d)=>addMonths(d,1);
     let cursor = date;
     let booked = 0, skipped = [], skippedClosed = [];
     while(cursor <= repeatUntil){
       if(isClosedDate(cursor)){
         skippedClosed.push(cursor);
-      } else if(findGroomConflict(cursor, time, bay, null)){
+      } else if(findGroomConflict(cursor, time, bay, null) || await findGroomConflictLive(cursor, time, bay, null)){
         skipped.push(cursor);
       } else {
         pet.groomingHistory.push({ id:uid('groom'), photos:[], date:cursor, ...basePayload });
