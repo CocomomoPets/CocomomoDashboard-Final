@@ -2195,12 +2195,22 @@ function computeReminders(dateStr){
             const owner = memberCust || cust;
             if(w.checkIn === dateStr && !seenCheckin.has(`${stay.id}:${id}`)){
               seenCheckin.add(`${stay.id}:${id}`);
-              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
+              // Closed-day check-in uses the drop-off appointment wording
+              // instead of the normal reminder — the pet isn't just showing
+              // up during regular hours, so the owner needs to know to call
+              // ahead instead (30 Aug 2026).
+              const message = closedDateFor(dateStr)
+                ? `Hello! Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, appointment times ${fmtTimeAMPM(stay.dropoff && stay.dropoff.time)}, please come on time and phone call this number (Do Not Whatsapp Call) while you've arrive tomorrow, after receiving your call we will inform our caretaker to assist for the check in, thank you and have a nice day ahead!`
+                : `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
               checkinItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkin||[]).includes(id), kind:'checkin', stayId:stay.id, petId:id });
             }
             if(w.checkOut === dateStr && !seenCheckout.has(`${stay.id}:${id}`)){
               seenCheckout.add(`${stay.id}:${id}`);
-              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
+              // Closed-day check-out — same reasoning as check-in above, using
+              // the pick-up appointment's own arranged time.
+              const message = closedDateFor(dateStr)
+                ? `Hello! Update for ${memberPet.name} today ☺️ \nJust a gentle reminder that ${memberPet.name} are checking out tomorrow (${fmtDateSlash(dateStr)}), appointment time *${fmtTimeAMPM(stay.pickup && stay.pickup.time)}*, please come on time and phone call this number (Do Not Whatsapp Call) while you've arrive tomorrow, after receiving your call we will inform our caretaker to assist for the check out, thank you and have a nice day ahead!`
+                : `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
               checkoutItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkout||[]).includes(id), kind:'checkout', stayId:stay.id, petId:id });
             }
           });
