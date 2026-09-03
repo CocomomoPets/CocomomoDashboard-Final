@@ -2195,22 +2195,12 @@ function computeReminders(dateStr){
             const owner = memberCust || cust;
             if(w.checkIn === dateStr && !seenCheckin.has(`${stay.id}:${id}`)){
               seenCheckin.add(`${stay.id}:${id}`);
-              // Closed-day check-in uses the drop-off appointment wording
-              // instead of the normal reminder — the pet isn't just showing
-              // up during regular hours, so the owner needs to know to call
-              // ahead instead (30 Aug 2026).
-              const message = closedDateFor(dateStr)
-                ? `Hello! Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, appointment times ${fmtTimeAMPM(stay.dropoff && stay.dropoff.time)}, please come on time and phone call this number (Do Not Whatsapp Call) while you've arrive tomorrow, after receiving your call we will inform our caretaker to assist for the check in, thank you and have a nice day ahead!`
-                : `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
+              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
               checkinItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkin||[]).includes(id), kind:'checkin', stayId:stay.id, petId:id });
             }
             if(w.checkOut === dateStr && !seenCheckout.has(`${stay.id}:${id}`)){
               seenCheckout.add(`${stay.id}:${id}`);
-              // Closed-day check-out — same reasoning as check-in above, using
-              // the pick-up appointment's own arranged time.
-              const message = closedDateFor(dateStr)
-                ? `Hello! Update for ${memberPet.name} today ☺️ \nJust a gentle reminder that ${memberPet.name} are checking out tomorrow (${fmtDateSlash(dateStr)}), appointment time *${fmtTimeAMPM(stay.pickup && stay.pickup.time)}*, please come on time and phone call this number (Do Not Whatsapp Call) while you've arrive tomorrow, after receiving your call we will inform our caretaker to assist for the check out, thank you and have a nice day ahead!`
-                : `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
+              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
               checkoutItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkout||[]).includes(id), kind:'checkout', stayId:stay.id, petId:id });
             }
           });
@@ -4058,12 +4048,16 @@ function petGroomingHtml(cust, pet){
   return `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div class="section-title" style="margin:0;">Grooming history</div>
-      <button class="btn btn-primary btn-sm" data-act="new-groom">+ New appointment</button>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-sm" data-act="send-upcoming-grooms">Copy upcoming appointments</button>
+        <button class="btn btn-primary btn-sm" data-act="new-groom">+ New appointment</button>
+      </div>
     </div>
     ${all.length===0 ? `<div class="placeholder" style="height:140px;"><b>No grooming sessions yet</b><div>Book ${esc(pet.name)}'s first appointment.</div></div>` : `
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);">
-        <label class="check-pill" style="cursor:pointer;"><input type="checkbox" id="groomSelectAll" ${selCount>0 && selCount===all.length?'checked':''}> Select all</label>
+        <label class="check-pill" style="cursor:pointer;"><input type="checkbox" id="groomSelectAll" ${selCount>0 && selCount===upcoming.length && upcoming.every(g=>_groomSelection.has(g.id))?'checked':''}> Select all upcoming</label>
         <span style="font-size:12.5px;color:var(--ink-soft);">${selCount} selected</span>
+        ${selCount>0 ? `<button type="button" class="btn btn-sm" id="groomDeselectAll" style="padding:3px 8px;">Deselect all</button>` : ''}
         ${selCount>0 ? `
         <span style="width:1px;height:20px;background:var(--line);"></span>
         <select id="bulkGroomStatus" style="padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${GROOM_STATUSES.map(s=>`<option>${esc(s)}</option>`).join('')}</select>
@@ -4492,6 +4486,18 @@ function wireSubContentEvents(cust, pet){
 
   const newGroomBtn = root.querySelector('[data-act="new-groom"]');
   if(newGroomBtn) newGroomBtn.addEventListener('click', ()=>openGroomModal(cust, pet, null));
+  const sendUpcomingBtn = root.querySelector('[data-act="send-upcoming-grooms"]');
+  if(sendUpcomingBtn){
+    sendUpcomingBtn.addEventListener('click', async ()=>{
+      const today = todayStr();
+      const upcoming = pet.groomingHistory.filter(g=>g.date>=today).sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+      if(!upcoming.length){ toast(`${pet.name} has no upcoming grooming appointments to send`); return; }
+      const lines = upcoming.map((g,i)=>`${i+1}. ${fmtDateOrdinalShort(g.date)} (${weekdayShort(g.date)}) ${fmtTimeAMPM(g.time)}`);
+      const message = `${pet.name}'s upcoming grooming appointment${upcoming.length>1?'s':''} :\n${lines.join('\n')}`;
+      try{ await navigator.clipboard.writeText(message); toast('Message copied'); }
+      catch(e){ toast('Could not copy — clipboard access blocked'); }
+    });
+  }
   root.querySelectorAll('[data-toggle-groom]').forEach(el=>{
     el.addEventListener('click', ()=>{
       const id = el.dataset.toggleGroom;
@@ -4516,10 +4522,19 @@ function wireSubContentEvents(cust, pet){
   const selectAllCb = root.querySelector('#groomSelectAll');
   if(selectAllCb){
     selectAllCb.addEventListener('change', ()=>{
-      if(selectAllCb.checked){ pet.groomingHistory.forEach(g=>_groomSelection.add(g.id)); }
-      else { _groomSelection.clear(); }
+      // "Select all" only grabs present/upcoming appointments — past ones
+      // are still individually selectable via their own checkbox, just not
+      // swept in by this shortcut, since bulk-editing past appointments is
+      // rarely what's wanted here.
+      const today = todayStr();
+      if(selectAllCb.checked){ pet.groomingHistory.forEach(g=>{ if(g.date >= today) _groomSelection.add(g.id); }); }
+      else { pet.groomingHistory.forEach(g=>{ if(g.date >= today) _groomSelection.delete(g.id); }); }
       renderPetSubContent(cust, pet);
     });
+  }
+  const deselectAllBtn = root.querySelector('#groomDeselectAll');
+  if(deselectAllBtn){
+    deselectAllBtn.addEventListener('click', ()=>{ _groomSelection.clear(); renderPetSubContent(cust, pet); });
   }
   const bulkApplyStatusBtn = root.querySelector('#bulkApplyStatusBtn');
   if(bulkApplyStatusBtn){
@@ -7120,35 +7135,6 @@ async function runArchive({ stays, grooms, payments }){
   const stayIds = new Set(stays.map(({stay})=>stay.id));
   const groomIds = new Set(grooms.map(({groom})=>groom.id));
   const paymentIds = new Set(payments.map(({pmt})=>pmt.id));
-  // Same "invisible payment" bug the 13 Aug fix closed for manual stay
-  // deletion: a payment split across several stays (a combined bill) only
-  // qualifies for archiving here if EVERY linked stay is old enough
-  // (findArchivableRecords) — so a payment linked to one stay old enough to
-  // archive AND one that isn't is left behind, still live, but with a
-  // stayIds entry pointing at a stay about to be deleted below. Manual
-  // deletion calls unlinkPaymentsFromStay() at delete time and lets the
-  // normal save-diff push the change; that shortcut doesn't work here
-  // because the payments baseline gets reset to match post-archive state a
-  // few lines down, so the *next* scheduleSync() would see no difference
-  // and silently skip pushing the fix. So: unlink now, and push any
-  // surviving (non-archived) payment that actually changed straight to the
-  // cloud before that baseline reset happens.
-  const patchedPayments = [];
-  for(const {stay} of stays){
-    state.customers.forEach(c=>{
-      (c.payments||[]).forEach(p=>{
-        if(paymentIds.has(p.id)) return; // itself being archived & deleted below — no need to patch
-        if(p.stayIds && p.stayIds.includes(stay.id)){
-          unlinkPaymentsFromStay(c, stay.id);
-          if(!patchedPayments.some(x=>x.pmt.id===p.id)) patchedPayments.push({ pmt: p, customerId: c.id });
-        }
-      });
-    });
-  }
-  for(const {pmt, customerId} of patchedPayments){
-    const { error } = await sb.from('payments').upsert(mapPaymentRow(pmt, customerId));
-    if(error) throw error;
-  }
   for(const id of stayIds){ const { error } = await sb.from('stays').delete().eq('id', id); if(error) throw error; }
   for(const id of groomIds){ const { error } = await sb.from('grooming_appointments').delete().eq('id', id); if(error) throw error; }
   for(const id of paymentIds){ const { error } = await sb.from('payments').delete().eq('id', id); if(error) throw error; }
@@ -7902,29 +7888,10 @@ function fmtRM2(n){
   const [intPart, decPart] = fixed.split('.');
   return `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${decPart}`;
 }
-// "2026-08-10" -> "10/8/26" (no leading zeros on day/month, 2-digit year) —
-// used in the holiday/normal rate headers so the range reads unambiguously
-// even when the stay crosses a year boundary (e.g. New Year's).
-function fmtDateShortYY(s){
-  const d = new Date(s+'T00:00:00');
-  return `${d.getDate()}/${d.getMonth()+1}/${String(d.getFullYear()).slice(2)}`;
-}
-// Groups a sorted list of yyyy-mm-dd strings (each one a *night* of the
-// stay, i.e. the date the guest is present, not the date they leave) into
-// consecutive-run ranges, e.g. ["08-08","08-09","08-14"] -> "8/8/26 -
-// 9/8/26, 14/8/26" — matches how the normal-rate nights either side of a
-// holiday block are shown together. `overallCheckOut` (optional,
-// yyyy-mm-dd) is the actual stay checkout date: when the LAST run in the
-// list ends on the night immediately before it (i.e. this run covers the
-// nights right up to departure), a ", <day>th check out" note is appended
-// after that run's own range — so a normal-rate block running 27-29 Dec
-// with checkout on the 30th reads "27/12/26 - 29/12/26, 30th check out",
-// keeping the range itself as the nights actually charged while still
-// surfacing the real departure date. A run that hands off to another rate
-// block mid-stay (e.g. holiday nights immediately followed by normal-rate
-// nights) gets no such note, since the very next date is already covered
-// by the following block's own range.
-function groupDateRangesForMessage(dateStrs, overallCheckOut){
+// Groups a sorted list of yyyy-mm-dd strings into consecutive-run ranges,
+// e.g. ["08-08","08-09","08-14"] -> "8/8 - 9/8, 14/8" — matches how the
+// normal-rate nights either side of a holiday block are shown together.
+function groupDateRangesForMessage(dateStrs){
   if(dateStrs.length===0) return '';
   const sorted = dateStrs.slice().sort();
   const ranges = [];
@@ -7936,14 +7903,7 @@ function groupDateRangesForMessage(dateStrs, overallCheckOut){
     start = d; prev = d;
   }
   ranges.push([start, prev]);
-  return ranges.map(([a,b], idx) => {
-    const base = a===b ? fmtDateShortYY(a) : `${fmtDateShortYY(a)} - ${fmtDateShortYY(b)}`;
-    if(overallCheckOut && idx===ranges.length-1 && addDays(b,1)===overallCheckOut){
-      const coDay = new Date(overallCheckOut+'T00:00:00').getDate();
-      return `${base}, ${coDay}${ordinalSuffix(coDay)} check out`;
-    }
-    return base;
-  }).join(', ');
+  return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
 }
 
 /* Computes everything for ONE room booking (one stay.pets row) up through
@@ -8033,37 +7993,17 @@ function buildBoardingBlock(stay, sp){
   // Sharing composition line(s) — "RM60 (1x S/M size dog 1x room) + RM50
   // (Additional 1x L size dog in same room) = RM110 per night". Grouped by
   // size so e.g. two S/M extras show as "2x S/M size dog", not two lines.
-  // Species (dog/cat) is read straight off the pets involved rather than
-  // hardcoded, and sizing is shown differently by species/room (29 Aug
-  // 2026): dogs' size only ever changes the base per-night rate in a
-  // Deluxe room (LARGE vs normal — Suite room/Royal Suite charge the same
-  // regardless of dog size), so the size only appears on the primary "1x
-  // ... room" part there; the sharing-surcharge "Additional" part does
-  // differ by size everywhere for dogs (surchargeSM vs surchargeLXL) so it
-  // always shows size for dogs. Cats only ever board in Cat Deluxe and
-  // don't have a size-driven rate tier at all, so neither part shows a
-  // size for cats — just a plain count.
   function sharingLine(rows){
     const sample = rows[0];
     const baseRate = sample.baseRate;
-    const primaryPet = pets[0];
-    const isCat = primaryPet && primaryPet.type === 'Cat';
-    const speciesWord = isCat ? 'cat' : 'dog';
-    const showPrimarySize = !isCat && roomLabel === 'Deluxe room';
-    const primaryDescr = showPrimarySize ? `${sizeGroupLabel(primaryPet.boardingSize)} size ${speciesWord}` : speciesWord;
-    let extraDescr;
-    if(isCat){
-      extraDescr = `${sample.extrasTonight.length}x cat`;
-    } else {
-      const sizeCounts = {};
-      sample.extrasTonight.forEach(p=>{
-        const lbl = sizeGroupLabel(p.boardingSize);
-        sizeCounts[lbl] = (sizeCounts[lbl]||0)+1;
-      });
-      extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
-    }
+    const sizeCounts = {};
+    sample.extrasTonight.forEach(p=>{
+      const lbl = sizeGroupLabel(p.boardingSize);
+      sizeCounts[lbl] = (sizeCounts[lbl]||0)+1;
+    });
+    const extraDescr = Object.entries(sizeCounts).map(([lbl,count])=>`${count}x ${lbl} size dog`).join(' + ');
     const perNight = baseRate + sample.surchargeAmt;
-    return { text: `RM ${fmtRM(baseRate)} (1x ${primaryDescr} 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
+    return { text: `RM ${fmtRM(baseRate)} (1x dog/cat 1x room) + RM ${fmtRM(sample.surchargeAmt)} (Additional ${extraDescr} in same room) = RM ${fmtRM(perNight)} per night`, perNight };
   }
 
   if(nightRows.length===0){
@@ -8091,22 +8031,20 @@ function buildBoardingBlock(stay, sp){
     } else {
       let holidayPerNight = holidayRows[0].baseRate;
       let normalPerNight = normalRows[0].baseRate;
-      const holidayRange = groupDateRangesForMessage(holidayRows.map(r=>r.dateStr), checkOut);
-      const normalRange = groupDateRangesForMessage(normalRows.map(r=>r.dateStr), checkOut);
       if(hasSharing){
-        lines.push(`_Holiday rate (${holidayRange})_`);
+        lines.push('_Holiday rate_');
         const hs = sharingLine(holidayRows);
         holidayPerNight = hs.perNight;
         lines.push(hs.text);
         const holidayTotal = holidayPerNight * holidayRows.length;
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
         lines.push('');
-        lines.push(`_Normal rate (${normalRange})_`);
+        lines.push('_Normal rate_');
         const ns = sharingLine(normalRows);
         normalPerNight = ns.perNight;
         lines.push(ns.text);
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
@@ -8114,11 +8052,11 @@ function buildBoardingBlock(stay, sp){
       } else {
         const holidayTotal = holidayPerNight * holidayRows.length;
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push(`_Holiday rate (${holidayRange})_`);
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
+        lines.push('_Holiday rate_');
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
         lines.push('');
-        lines.push(`_Normal rate (${normalRange})_`);
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
+        lines.push('_Normal rate_');
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
