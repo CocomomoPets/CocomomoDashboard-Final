@@ -7996,7 +7996,15 @@ function buildBoardingBlock(stay, sp){
       rateObj = room ? state.rates[room.type] : {normal:0, holiday:0};
     }
     if(!rateObj) rateObj = {normal:0, holiday:0};
-    const baseRate = holiday ? rateObj.holiday : rateObj.normal;
+    const standardRate = holiday ? rateObj.holiday : rateObj.normal;
+    // Special/promo/custom rate override (per-stay, set on the booking) —
+    // mirrors computeStayCost()'s own logic exactly: 'percent' takes X% off
+    // whatever the standard rate for that night would have been (holiday or
+    // normal), 'flat' replaces it outright with the fixed RM/night figure.
+    const usingCustomRate = stay.customRate != null && stay.customRate >= 0;
+    const baseRate = usingCustomRate
+      ? (stay.customRateMode === 'percent' ? standardRate * (1 - Math.min(stay.customRate,100)/100) : stay.customRate)
+      : standardRate;
     const extrasTonight = presentIds.slice(1).map(id=>findPetById(id)).filter(Boolean);
     const surchargeAmt = extrasTonight.reduce((sum,p)=>{
       const isLarge = ['L','XL','XXL'].includes(p.boardingSize);
@@ -8044,7 +8052,12 @@ function buildBoardingBlock(stay, sp){
     const hasSharing = nightRows.some(r=>r.extrasTonight.length>0);
     const holidayRows = nightRows.filter(r=>r.holiday);
     const normalRows = nightRows.filter(r=>!r.holiday);
-    const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0;
+    // Only worth splitting the message into "Holiday rate" / "Normal rate"
+    // blocks when they actually price differently — a flat custom/promo
+    // rate override makes every night the same price regardless of the
+    // calendar, so showing two identical-priced blocks would just be
+    // confusing to the customer.
+    const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0 && holidayRows[0].baseRate !== normalRows[0].baseRate;
     const quotedNights = nightRows.length;
 
     if(!hasHolidaySplit){
