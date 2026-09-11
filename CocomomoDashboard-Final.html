@@ -8151,16 +8151,24 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
     .filter(p => p.type==='Deposit' && (p.stayIds||[]).includes(stay.id))
     .reduce((s,p)=>s+(+p.amount||0), 0);
 
-  const hasExtra = charges.length>0 || fbgCount>0 || depositTotal>0;
+  // A free-grooming note isn't a charge — it doesn't need its own restated
+  // "RM X = Total RM X" addends step, it can fold straight into the
+  // boarding line's bolded total. Only actual charges or a deposit justify
+  // that separate combine step.
+  const hasChargesOrDeposit = charges.length>0 || depositTotal>0;
 
-  if(!hasExtra){
-    // Nothing to add on — just bold the final total in place.
+  if(!hasChargesOrDeposit){
+    // Nothing but boarding (± free grooming) — bold the total in place on
+    // the boarding line itself, folding the FBG note (if any) into the
+    // bolded total. Target the "= RM X" at the end specifically (not a
+    // bare "RM X"), since on a 1-night stay the per-night rate and the
+    // total are the same number and a bare match would grab the per-night
+    // part instead of the total.
     const lastIdx = out.length-1;
-    out[lastIdx] = out[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
+    out[lastIdx] = out[lastIdx].replace(`= RM ${fmtRM(boardingTotal)}`, `= *Total RM ${fmtRM(boardingTotal)}${fbgNote}*`);
   } else {
     // Tag the boarding-only subtotal so it's clear what it covers, then add
-    // a combine step bringing in charges/grooming/deposit, bold on the
-    // final line only.
+    // a combine step bringing in charges/deposit, bold on the final line only.
     if(lastLineIsCombine){
       const lastIdx = out.length-1;
       out[lastIdx] = out[lastIdx] + ' (Boarding)';
@@ -8233,10 +8241,12 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
   // single-stay message, where a lone block skips straight to the total)
   // since there's more than one block's worth of numbers to bring together.
   const boardingAddends = blocks.map(({block})=>`RM ${fmtRM(block.boardingTotal)}`).join(' + ');
-  const hasExtra = allCharges.length>0 || fbgCount>0 || depositTotal>0;
-  out.push(`${boardingAddends}${blocks.length>1?` = RM ${fmtRM(boardingTotal)}`:''}${hasExtra?' (Boarding)':''}`);
+  // A free-grooming note isn't a charge — it folds straight into the bolded
+  // total instead of forcing its own restated "RM X = Total RM X" step.
+  const hasChargesOrDeposit = allCharges.length>0 || depositTotal>0;
+  out.push(`${boardingAddends}${blocks.length>1?` = RM ${fmtRM(boardingTotal)}`:''}${hasChargesOrDeposit?' (Boarding)':''}`);
 
-  if(hasExtra){
+  if(hasChargesOrDeposit){
     out.push('');
     const grandTotal = boardingTotal + chargesTotal - depositTotal;
     const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...allCharges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
@@ -8245,11 +8255,17 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
     const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
     out.push(`= *Total RM ${fmtRM(grandTotal)}${balanceNote}${fbgNote}*`);
   } else if(blocks.length===1){
-    // Single block, nothing extra — same shorthand as the single-stay button.
+    // Single block, nothing but boarding (± free grooming) — same shorthand
+    // as the single-stay button: bold the total onto the boarding line
+    // itself, folding in the FBG note. Target "= RM X" specifically (see
+    // note above the equivalent single-stay code) so a 1-night stay's
+    // per-night rate isn't bolded instead of the total.
     const lastIdx = out.length-1;
-    out[lastIdx] = out[lastIdx].replace(`RM ${fmtRM(boardingTotal)}`, `*Total RM ${fmtRM(boardingTotal)}*`);
+    out[lastIdx] = out[lastIdx].replace(`= RM ${fmtRM(boardingTotal)}`, `= *Total RM ${fmtRM(boardingTotal)}${fbgNote}*`);
   } else {
-    out[out.length-1] = out[out.length-1].replace(` = RM ${fmtRM(boardingTotal)}`, ` = *Total RM ${fmtRM(boardingTotal)}*`);
+    // Multiple blocks, nothing but boarding (± free grooming) — fold the
+    // total and FBG note onto this addends line the same way.
+    out[out.length-1] = out[out.length-1].replace(` = RM ${fmtRM(boardingTotal)}`, ` = *Total RM ${fmtRM(boardingTotal)}${fbgNote}*`);
   }
 
   return out.join('\n');
