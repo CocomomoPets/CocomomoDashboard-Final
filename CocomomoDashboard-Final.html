@@ -1309,6 +1309,41 @@ const INCIDENT_SEVERITY_STYLE = {
   Moderate: 'background:var(--amber-tint);color:#8A5A22;',
   Severe: 'background:#FBE4E2;color:#A23B2C;',
 };
+/* Pain point #9: vaccination expiry not flagged at booking. Only the
+   last-vaccination DATE is on file, not an expiry date of its own, so this
+   derives expiry as lastVax + a 1-year validity window (shop policy) and
+   classifies it. Surfaced at booking (stayPetRowHtml), on the pet's own
+   Boarding tab, and on Today's check-in cards. */
+const VAX_VALIDITY_DAYS = 365;
+const VAX_EXPIRING_SOON_DAYS = 14; // heads-up window before it actually expires
+function vaxExpiryInfo(pet){
+  if(!pet.lastVax) return { status:'none', expiry:null, daysLeft:null };
+  const expiry = addDays(pet.lastVax, VAX_VALIDITY_DAYS);
+  const daysLeft = Math.round((new Date(expiry) - new Date(todayStr()))/86400000);
+  if(daysLeft < 0) return { status:'expired', expiry, daysLeft };
+  if(daysLeft <= VAX_EXPIRING_SOON_DAYS) return { status:'expiring', expiry, daysLeft };
+  return { status:'valid', expiry, daysLeft };
+}
+/* Full-line banner — stay-booking modal + Boarding tab's vaccination card.
+   Blank for 'none'/'valid' so nothing shows when there's nothing to flag. */
+function vaxExpiryLineHtml(pet){
+  const info = vaxExpiryInfo(pet);
+  if(info.status==='expired'){
+    return `<div style="margin-top:6px;font-size:12.5px;font-weight:600;color:#A23B2C;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:6px 10px;display:inline-block;">💉 Vaccination expired ${fmtDate(info.expiry)}</div>`;
+  }
+  if(info.status==='expiring'){
+    return `<div style="margin-top:6px;font-size:12.5px;font-weight:600;color:#8A5A22;background:var(--amber-tint);border:1px solid #F0D2AC;border-radius:8px;padding:6px 10px;display:inline-block;">💉 Vaccination expires ${fmtDate(info.expiry)} (${info.daysLeft} day${info.daysLeft===1?'':'s'})</div>`;
+  }
+  return '';
+}
+/* Compact icon+tooltip — Today's check-in cards, same treatment as the
+   risk-flag ⚠️ icon already shown there. */
+function vaxExpiryCompactHtml(pet){
+  const info = vaxExpiryInfo(pet);
+  if(info.status==='expired') return ` <span title="Vaccination expired ${fmtDate(info.expiry)}" style="color:#A23B2C;">💉⚠️</span>`;
+  if(info.status==='expiring') return ` <span title="Vaccination expires ${fmtDate(info.expiry)} (${info.daysLeft}d)" style="color:#8A5A22;">💉</span>`;
+  return '';
+}
 /* Preset grooming prices for the "Additional charges" (Grooming category)
    picker on a stay — Bath/Cut are priced by the pet's own grooming size
    (auto-detected from pet.groomingSize), the rest are flat per-visit fees.
@@ -3320,7 +3355,10 @@ function renderTodayView(){
       const cust = getCustomer(custId);
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
-      if(stay){ stay.status='Past'; renderTodayView(); scheduleSync(); toast('Checked out'); }
+      if(!stay) return;
+      openChecklistModal('Check-out checklist', checkoutChecklistItems(cust, stay), 'Complete check-out', ()=>{
+        stay.status='Past'; renderTodayView(); scheduleSync(); toast('Checked out');
+      });
     });
   });
   main.querySelectorAll('[data-today-checkin]').forEach(btn=>{
@@ -3330,7 +3368,11 @@ function renderTodayView(){
       const cust = getCustomer(custId);
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
-      if(stay){ memberIdsStr.split(',').forEach(id=>setPetCheckedIn(stay, id, true)); renderTodayView(); scheduleSync(); toast('Checked in'); }
+      if(!stay) return;
+      const memberIds = memberIdsStr.split(',');
+      openChecklistModal('Check-in checklist', checkinChecklistItems(cust, stay, memberIds), 'Complete check-in', ()=>{
+        memberIds.forEach(id=>setPetCheckedIn(stay, id, true)); renderTodayView(); scheduleSync(); toast('Checked in');
+      });
     });
   });
   main.querySelectorAll('[data-today-undo-checkin]').forEach(btn=>{
@@ -3343,6 +3385,75 @@ function renderTodayView(){
       if(stay){ memberIdsStr.split(',').forEach(id=>setPetCheckedIn(stay, id, false)); renderTodayView(); scheduleSync(); toast('Check-in undone'); }
     });
   });
+}
+
+/* Pain point #7: check-in/checkout checklist. Belongings/feeding/
+   vaccination/risk-flag confirmation used to rely purely on staff memory —
+   this gates the actual check-in/checkout action behind a checklist that
+   must be fully ticked first (see openChecklistModal). Only surfaces items
+   that actually apply to this stay/pet (no belongings on file = no
+   belongings line) so it never nags with an empty checklist when there's
+   nothing to confirm. */
+function checkinChecklistItems(cust, stay, memberIds){
+  const items = [];
+  memberIds.forEach(id=>{
+    const pet = findPetById(id);
+    if(!pet) return;
+    const sp = (stay.pets||[]).find(x=>x.petId===id);
+    if(sp && sp.belongings && sp.belongings.length){
+      items.push({ key:`belongings-${id}`, label:`${petLabel(pet)} — belongings received: ${sp.belongings.map(b=>esc(b.item)).join(', ')}` });
+    }
+    if(sp && sp.feeding && sp.feeding.trim()){
+      items.push({ key:`feeding-${id}`, label:`${petLabel(pet)} — feeding instructions reviewed: "${esc(sp.feeding.trim())}"` });
+    }
+    const vax = vaxExpiryInfo(pet);
+    if(vax.status==='expired' || vax.status==='expiring'){
+      items.push({ key:`vax-${id}`, label:`${petLabel(pet)} — vaccination ${vax.status==='expired'?'expired':'expiring soon'} (${fmtDate(vax.expiry)}) — owner informed` });
+    }
+    if((pet.riskFlags||[]).length){
+      items.push({ key:`risk-${id}`, label:`${petLabel(pet)} — risk flags reviewed: ${pet.riskFlags.map(esc).join(', ')}` });
+    }
+  });
+  return items;
+}
+function checkoutChecklistItems(cust, stay){
+  const items = [];
+  (stay.pets||[]).forEach(sp=>{
+    const pet = findPetById(sp.petId);
+    if(!pet) return;
+    if(sp.belongings && sp.belongings.length){
+      items.push({ key:`belongings-${sp.petId}`, label:`${petLabel(pet)} — belongings returned: ${sp.belongings.map(b=>esc(b.item)).join(', ')}` });
+    }
+  });
+  items.push({ key:'pickup', label: (cust.authorizedPickups&&cust.authorizedPickups.length)
+    ? `Pickup person verified against ID: ${cust.authorizedPickups.map(a=>esc(a.name)).join(', ')}`
+    : `No authorized pickup persons on file — verified with owner directly` });
+  items.push({ key:'balance', label: 'Outstanding balance checked (see stay card) and settled or otherwise confirmed' });
+  return items;
+}
+/* Generic "must tick every box before continuing" modal — the Confirm
+   button stays disabled until every checkbox is checked. If `items` is
+   empty (nothing applies to this stay/pet) it skips straight to
+   `onConfirm` instead of showing an empty modal. */
+function openChecklistModal(title, items, confirmLabel, onConfirm){
+  if(!items.length){ onConfirm(); return; }
+  openModal(`
+    <div class="modal-head"><h3>${esc(title)}</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Confirm each item before continuing.</div>
+      ${items.map(it=>`<label class="check-pill" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;margin-bottom:6px;cursor:pointer;white-space:normal;"><input type="checkbox" data-checklist-item="${it.key}" style="margin-top:3px;flex-shrink:0;"> <span>${it.label}</span></label>`).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="confirmBtn" disabled>${esc(confirmLabel)}</button>
+    </div>
+  `);
+  function refreshConfirm(){
+    const all = Array.from(document.querySelectorAll('[data-checklist-item]'));
+    document.getElementById('confirmBtn').disabled = !all.every(cb=>cb.checked);
+  }
+  document.querySelectorAll('[data-checklist-item]').forEach(cb=>cb.addEventListener('change', refreshConfirm));
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
 }
 
 function todayDateSectionHtml(sec, checkins, checkouts, grooms){
@@ -3432,12 +3543,13 @@ function todayCardHtml(cust, pet, stay, sp, memberIds, mode, allowCheckout){
   const otherLabels = idsToLabels(ids.filter(id=>id!==pet.id), cust.id);
   const petNameDisplay = otherLabels.length ? `${petLabel(pet)} &amp; ${otherLabels.join(' &amp; ')}` : petLabel(pet);
   const groupRiskFlags = ids.some(id=>((findPetById(id)||{}).riskFlags||[]).length>0);
+  const groupVaxWarn = ids.map(id=>findPetById(id)).filter(Boolean).find(p=>['expired','expiring'].includes(vaxExpiryInfo(p).status));
   const idsKey = ids.join(',');
   return `
   <div class="today-card ${confirmed?'today-card-confirmed':''}" data-today-jump="${key}">
     <div class="avatar" style="${avatarStyle(colorFor(cust.id))}">${initials(cust.name)}</div>
     <div class="today-card-main">
-      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${groupRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
+      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${groupRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''}${mode==='in'&&groupVaxWarn?vaxExpiryCompactHtml(groupVaxWarn):''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
       <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
       ${mode==='in' ? apptTimeLineHtml(stay, 'dropoff') : ''}
       ${mode==='out' ? apptTimeLineHtml(stay, 'pickup') : ''}
@@ -3468,6 +3580,7 @@ function petBoardingHtml(cust, pet){
           <div style="max-width:190px;">${dateOverlayHtml('pet_lastTick', pet.lastTick||'')}</div>
         </div>
       </div>
+      ${vaxExpiryLineHtml(pet)}
     </div>
     <div class="cust-card" style="margin-bottom:12px;">
       <div class="section-title" style="margin:0 0 10px;">🚑 Vet &amp; emergency info</div>
@@ -4447,7 +4560,10 @@ function wireSubContentEvents(cust, pet){
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       const s = findStayById(el.dataset.stay);
-      if(s){ setPetCheckedIn(s, el.dataset.pet, true); scheduleSync(); renderPetSubContent(cust, pet); toast('Checked in'); }
+      if(!s) return;
+      openChecklistModal('Check-in checklist', checkinChecklistItems(cust, s, [el.dataset.pet]), 'Complete check-in', ()=>{
+        setPetCheckedIn(s, el.dataset.pet, true); scheduleSync(); renderPetSubContent(cust, pet); toast('Checked in');
+      });
     });
   });
   root.querySelectorAll('[data-act="undo-checkin-stay"]').forEach(el=>{
@@ -4461,7 +4577,10 @@ function wireSubContentEvents(cust, pet){
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       const s = findStayById(el.dataset.stay);
-      if(s){ s.status='Past'; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked out'); }
+      if(!s) return;
+      openChecklistModal('Check-out checklist', checkoutChecklistItems(cust, s), 'Complete check-out', ()=>{
+        s.status='Past'; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked out');
+      });
     });
   });
   root.querySelectorAll('[data-edit-closed-appt]').forEach(el=>{
@@ -5681,6 +5800,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
       </div>
       ${riskFlagBadgesHtml(pet) ? `<div style="margin-bottom:8px;">${riskFlagBadgesHtml(pet)}</div>` : ''}
       ${vetInfoLineHtml(pet) ? `<div style="margin-bottom:8px;">${vetInfoLineHtml(pet)}</div>` : ''}
+      ${vaxExpiryLineHtml(pet) ? `<div style="margin-bottom:8px;">${vaxExpiryLineHtml(pet)}</div>` : ''}
       ${sharingPickerHtml(`srow_share_${idx}`, sp.sharingWith, null, sp.dates)}
       <div class="field" style="margin-bottom:8px;">
         <label>Feeding instructions (this stay)</label>
