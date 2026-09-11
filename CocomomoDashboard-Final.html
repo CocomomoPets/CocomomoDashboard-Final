@@ -468,6 +468,23 @@
   ::-webkit-scrollbar{ width:9px; height:9px; }
   ::-webkit-scrollbar-thumb{ background:#D8D2C3; border-radius:99px; }
   ::-webkit-scrollbar-track{ background:transparent; }
+
+  /* Pain point #11 — printable same-day fallback. #printScheduleArea is
+     built and filled only when "Print today's schedule" is clicked (see
+     printTodaySchedule); it's invisible on-screen and only appears via the
+     print stylesheet below, which also hides the normal app chrome so the
+     printout is just the schedule, not the whole dashboard UI. */
+  #printScheduleArea{ display:none; }
+  @media print{
+    body > *:not(#printScheduleArea){ display:none !important; }
+    #printScheduleArea{ display:block !important; font-family:var(--font-body, Arial, sans-serif); color:#000; }
+    #printScheduleArea h1{ font-size:20px; margin:0 0 2px; }
+    #printScheduleArea .print-date{ font-size:12px; color:#444; margin-bottom:16px; }
+    #printScheduleArea h2{ font-size:14px; margin:16px 0 6px; border-bottom:1px solid #000; padding-bottom:3px; }
+    #printScheduleArea .print-none{ font-size:12px; color:#555; margin:0 0 8px; }
+    #printScheduleArea .print-table{ width:100%; border-collapse:collapse; font-size:12px; margin-bottom:8px; }
+    #printScheduleArea .print-table td{ border:1px solid #999; padding:5px 7px; vertical-align:top; }
+  }
 </style>
 </head>
 <body>
@@ -2681,6 +2698,11 @@ function normalizeStay(s){
       checkin: Array.isArray(s?.remindersSent?.checkin) ? s.remindersSent.checkin : [],
       checkout: Array.isArray(s?.remindersSent?.checkout) ? s.remindersSent.checkout : [],
     },
+    // Pain point #13 — instant booking confirmation, sent (manually, same
+    // copy-paste-yourself convention as reminders) right at booking time
+    // instead of only the day before. Tracked per pet-room, same shape as
+    // remindersSent, so a multi-pet stay can track each room independently.
+    confirmationSent: Array.isArray(s?.confirmationSent) ? s.confirmationSent : [],
   };
 }
 function normalizeGroom(g){
@@ -3328,7 +3350,8 @@ function renderTodayView(){
     { key:'yesterday', label:'Yesterday', date: addDays(today,-1), primary:false, allowCheckout:true },
   ];
   main.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:flex-end;margin-bottom:14px;">
+    <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:14px;">
+      <button class="btn" id="todayPrintBtn" title="Print a paper backup of today's schedule, in case wifi or the device fails mid-shift">🖨️ Print today's schedule</button>
       <button class="btn btn-primary" id="todayAddCustomerBtn">+ Add customer</button>
     </div>
   ` + sections.map(sec=>{
@@ -3338,6 +3361,7 @@ function renderTodayView(){
   }).join('');
 
   document.getElementById('todayAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
+  document.getElementById('todayPrintBtn').addEventListener('click', printTodaySchedule);
 
   main.querySelectorAll('[data-today-jump]').forEach(el=>{
     el.addEventListener('click', (e)=>{
@@ -3474,6 +3498,63 @@ function openChecklistModal(title, items, confirmLabel, onConfirm){
   document.getElementById('confirmBtn').addEventListener('click', ()=>{ closeModal(); onConfirm(); });
 }
 
+/* Pain point #11: offline/printable fallback. This dashboard is
+   Supabase-backed, so a genuinely offline copy couldn't take new bookings
+   or stay in sync anyway (see the PWA note in the pain-points report) —
+   what actually helps if wifi or the device dies mid-shift is a same-day
+   PAPER backup. This builds a clean, print-only view of today's
+   check-ins/check-outs/grooming (with the operational details staff would
+   actually need on paper — room, feeding, pickup authorization) and hands
+   it to the browser's native print dialog. The #printScheduleArea element
+   only ever becomes visible via the @media print rule, so it's invisible
+   the rest of the time. */
+function printTodaySchedule(){
+  const today = todayStr();
+  const { checkins, checkouts } = collectStaysForDate(today);
+  const grooms = collectGroomingForDate(today);
+  const section = (label, items, renderRow) => `
+    <h2>${esc(label)} (${items.length})</h2>
+    ${items.length===0 ? `<p class="print-none">None</p>` : `<table class="print-table"><tbody>${items.map(renderRow).join('')}</tbody></table>`}
+  `;
+  const html = `
+    <h1>${esc(state.shopName||'Cocomomo')} — Today's Schedule</h1>
+    <div class="print-date">${fmtDateLong(today)} — printed ${new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div>
+    ${section('🏨 Checking in', checkins, item=>{
+      const sp = item.sp;
+      return `<tr>
+        <td><b>${esc(item.pet.name)}</b> (${esc(item.cust.name)})</td>
+        <td>${esc(sp.room)||''}</td>
+        <td>${esc(item.cust.phone)}</td>
+        <td>${esc(sp.feeding)||'—'}</td>
+      </tr>`;
+    })}
+    ${section('🏨 Checking out', checkouts, item=>{
+      const pickups = (item.cust.authorizedPickups||[]).map(a=>`${a.name} (${a.phone})`).join(', ');
+      return `<tr>
+        <td><b>${esc(item.pet.name)}</b> (${esc(item.cust.name)})</td>
+        <td>${esc(item.sp.room)||''}</td>
+        <td>${esc(item.cust.phone)}</td>
+        <td>${esc(pickups)||'None on file — verify with owner'}</td>
+      </tr>`;
+    })}
+    ${section('✂️ Grooming appointments', grooms, item=>`
+      <tr>
+        <td><b>${esc(item.pet.name)}</b> (${esc(item.cust.name)})</td>
+        <td>${esc(item.g.time)}</td>
+        <td>${esc(item.g.bay)}</td>
+        <td>${esc((item.g.apptTypes||[]).join(', '))||'—'}</td>
+      </tr>
+    `)}
+  `;
+  let area = document.getElementById('printScheduleArea');
+  if(!area){
+    area = document.createElement('div');
+    area.id = 'printScheduleArea';
+    document.body.appendChild(area);
+  }
+  area.innerHTML = html;
+  window.print();
+}
 function todayDateSectionHtml(sec, checkins, checkouts, grooms){
   return `
   <div class="today-date-section ${sec.primary?'primary':'muted'}">
@@ -4200,6 +4281,7 @@ async function isRoomAvailableLive(roomId, checkIn, checkOut, excludeStayId){
       notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
       charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
       paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+      confirmationSent: s.confirmation_sent || [],
       billingGroupId: s.billing_group_id || null, daycareRate: s.daycare_rate,
     });
     for(const sp of (stay.pets||[])){
@@ -5918,6 +6000,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     };
     const doSave = async ()=>{
       let freeResult = { assignedCount:0, movedCount:0, assignedList:[] };
+      let createdStay = null;
       if(existing){
         // Snapshot each pet's window as it stood BEFORE this edit (used to
         // widen the search for this stay's own FBG appointments below) —
@@ -5947,18 +6030,24 @@ function openStayModal(cust, primaryPet, existing, afterSave){
       else{
         const newStay = { id:uid('stay'), charges:[], ...payload };
         primaryPet.stays.push(newStay);
+        createdStay = newStay;
         const petWindows = workingPets.flatMap(w => [w.petId, ...(w.sharingWith||[])].filter(Boolean).map(id=>({ petId:id, ...petDatesInStay(newStay, w, id) })));
         freeResult = await assignFreeGroomings(cust, petWindows);
       }
       closeModal(); onSaved(); scheduleSync();
       if(freeResult.assignedCount > 0){
         toast(`Stay ${existing?'updated':'created'} — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
-        openFreeGroomingSummaryModal(freeResult.assignedList);
+        if(!createdStay) openFreeGroomingSummaryModal(freeResult.assignedList);
       } else if(freeResult.movedCount > 0){
         toast(`Stay updated — ${freeResult.movedCount} free grooming${freeResult.movedCount===1?'':'s'} rescheduled to match`);
       } else {
         toast(existing ? 'Stay updated' : 'Stay created');
       }
+      // Pain point #13 — prompt an instant booking confirmation right at
+      // creation time, instead of only the day-before reminder. Shown last
+      // (after the free-grooming toast/summary above) so that info isn't
+      // lost, but always shown for a brand-new stay.
+      if(createdStay) openBookingConfirmationModal(cust, createdStay);
     };
     const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
     if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
@@ -6934,6 +7023,7 @@ function mapStayRow(s, primaryPetId, customerId){
     billing_group_id: s.billingGroupId || null,
     daycare_rate: s.daycareRate == null ? null : +s.daycareRate,
     reminders_sent: s.remindersSent || {checkin:[],checkout:[]},
+    confirmation_sent: s.confirmationSent || [],
   };
 }
 /* Every stay across every pet, flattened to one list — [{stay, primaryPetId,
@@ -6981,6 +7071,7 @@ async function loadStaysFromTables(){
       notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
       charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
       paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+      confirmationSent: s.confirmation_sent || [],
       billingGroupId: s.billing_group_id || null,
       daycareRate: s.daycare_rate,
     });
@@ -7670,6 +7761,7 @@ async function restoreArchivedRecord(kind, id){
         notes: row.notes || '', customRate: row.custom_rate, customRateMode: row.custom_rate_mode || 'flat',
         charges: row.charges || [], pets: row.pets || [], dropoff: row.dropoff || null, pickup: row.pickup || null,
         paidThrough: row.paid_through || null, remindersSent: row.reminders_sent || {checkin:[],checkout:[]},
+        confirmationSent: row.confirmation_sent || [],
       });
       const { data, error: upErr } = await sb.from('stays').upsert(mapStayRow(stay, pet.id, row.customer_id)).select().single();
       if(upErr) throw upErr;
@@ -8665,6 +8757,59 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
   return out.join('\n');
 }
 
+/* Pain point #13 — instant booking confirmation. Auto-opens right after a
+   NEW stay is created (both from the pet's own New stay modal and the
+   calendar's quick booking modal) — same copy-paste-yourself convention as
+   Reminders (see openRemindersModal's note) rather than an auto-send, so
+   staff still review before anything goes out. One card per pet-room,
+   since each has its own message (see buildBoardingWhatsAppMessage). */
+function openBookingConfirmationModal(ownerCust, stay){
+  if(!stay.pets.length) return;
+  openModal(`
+    <div class="modal-head"><h3>Booking confirmation</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12px;color:var(--ink-soft);margin-bottom:12px;">Send this to ${esc(ownerCust.name)} right away to confirm the booking, instead of waiting for the day-before reminder.</div>
+      ${stay.pets.map((sp,idx)=>{
+        const pet = getPet(ownerCust, sp.petId);
+        if(!pet || !sp.room) return '';
+        const message = buildBoardingWhatsAppMessage(stay, sp, ownerCust);
+        const isSent = (stay.confirmationSent||[]).includes(sp.petId);
+        return `
+        <div style="margin-bottom:14px;">
+          <div style="font-weight:700;font-size:13px;margin-bottom:6px;">${petLabel(pet)} — ${esc(sp.room)}${isSent?' <span class="badge badge-active">Sent</span>':''}</div>
+          <div style="white-space:pre-line;font-size:12.5px;line-height:1.55;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:6px;">${esc(message)}</div>
+          <div style="display:flex;gap:6px;">
+            <button type="button" class="btn btn-sm" data-confirm-copy="${sp.petId}">Copy</button>
+            <button type="button" class="btn btn-sm ${isSent?'btn-ghost':'btn-primary'}" data-confirm-toggle-sent="${sp.petId}">${isSent?'Mark unsent':'Mark as sent'}</button>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Done</button>
+    </div>
+  `, {wide:true});
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-confirm-copy]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const sp = stay.pets.find(x=>x.petId===btn.dataset.confirmCopy);
+      const pet = getPet(ownerCust, sp.petId);
+      if(!sp || !pet) return;
+      try{ await navigator.clipboard.writeText(buildBoardingWhatsAppMessage(stay, sp, ownerCust)); toast('Message copied'); }
+      catch(err){ toast('Could not copy — long-press the message text instead'); }
+    });
+  });
+  document.querySelectorAll('[data-confirm-toggle-sent]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const petId = btn.dataset.confirmToggleSent;
+      stay.confirmationSent = stay.confirmationSent || [];
+      if(stay.confirmationSent.includes(petId)) stay.confirmationSent = stay.confirmationSent.filter(id=>id!==petId);
+      else stay.confirmationSent.push(petId);
+      scheduleSync();
+      openBookingConfirmationModal(ownerCust, stay);
+    });
+  });
+}
 function openBoardingWhatsAppModal(stayId, spIndex){
   const stay = findStayById(stayId);
   if(!stay) return;
@@ -9662,10 +9807,11 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       scheduleSync();
       if(freeResult.assignedCount > 0){
         toast(`Booking created — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
-        openFreeGroomingSummaryModal(freeResult.assignedList);
       } else {
         toast('Booking created');
       }
+      // Pain point #13 — instant booking confirmation at creation time.
+      openBookingConfirmationModal(cust, newStay);
     };
     const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
     if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
