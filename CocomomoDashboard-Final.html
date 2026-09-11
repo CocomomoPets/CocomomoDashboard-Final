@@ -7952,7 +7952,7 @@ function buildBoardingBlock(stay, sp){
   const checkIn = win.checkIn, checkOut = win.checkOut;
   const nights = nightsBetween(checkIn, checkOut);
   const namesLabel = pets.map(p=>p.name).join(' & ');
-  if(checkOut < checkIn) return { namesLabel, roomLabel, pets, lines: ['Check-out must be after check-in — please fix the dates on this stay first.'], boardingTotal: 0, lastLineIsCombine: false, charges: [], chargesTotal: 0, fbgCount: 0, checkIn, checkOut };
+  if(checkOut < checkIn) return { namesLabel, roomLabel, pets, lines: ['Check-out must be after check-in — please fix the dates on this stay first.'], boardingTotal: 0, lastLineIsCombine: false, charges: [], chargesTotal: 0, fbgCount: 0, fbgByPet: [], checkIn, checkOut };
 
   const lines = [];
   let boardingTotal = 0;
@@ -8126,28 +8126,52 @@ function buildBoardingBlock(stay, sp){
   }
   const charges = (stay.charges||[]).map(c=>({ label: whatsappChargeLabel(c.description || c.category), amount: (+c.amount||0) * (+c.qty||1) }));
   const chargesTotal = charges.reduce((s,c)=>s+c.amount,0);
-  let fbgCount = 0;
-  pets.forEach(p=>{
+  const fbgByPet = pets.map(p=>({
+    name: p.name,
     // Inclusive of checkOut itself — free groomings are deliberately spaced
     // so the last one lands exactly on the checkout date (see
     // computeFreeGroomingDates), so a strict "< checkOut" here was dropping
     // that appointment entirely — for a 7-13 night stay it's the ONLY FBG,
     // so the note vanished completely instead of just undercounting.
-    fbgCount += (p.groomingHistory||[]).filter(g =>
+    count: (p.groomingHistory||[]).filter(g =>
       (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<=checkOut
-    ).length;
-  });
+    ).length
+  }));
+  const fbgCount = fbgByPet.reduce((s,f)=>s+f.count,0);
 
-  return { namesLabel, roomLabel, pets, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount, checkIn, checkOut };
+  return { namesLabel, roomLabel, pets, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount, fbgByPet, checkIn, checkOut };
+}
+
+/* Turns per-pet FBG counts into the "included ... free basic grooming
+   during stay" note. Single pet (or only one pet actually earned any) keeps
+   the plain "Nx free basic grooming" wording. Multiple pets with the SAME
+   count each say "Nx free basic grooming for each of them" instead of
+   confusingly adding them into one combined number (e.g. 3 pets x 1 each
+   should read as "1x ... for each of them", not "3x ... during stay").
+   Multiple pets with DIFFERING counts fall back to listing each by name. */
+function fbgNoteFromByPet(fbgByPet){
+  const earners = (fbgByPet||[]).filter(f=>f.count>0);
+  if(earners.length===0) return '';
+  if(earners.length===1){
+    const f = earners[0];
+    return ` included ${f.count>1?f.count+'x':'1x'} free basic grooming during stay`;
+  }
+  const sameCount = earners.every(f=>f.count===earners[0].count);
+  if(sameCount){
+    const n = earners[0].count;
+    return ` included ${n>1?n+'x':'1x'} free basic grooming for each of them during stay`;
+  }
+  const parts = earners.map(f=>`${f.count>1?f.count+'x':'1x'} for ${esc(f.name)}`);
+  return ` included free basic grooming during stay (${parts.join(', ')})`;
 }
 
 function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
   const block = buildBoardingBlock(stay, sp);
   if(!block) return '';
-  const { namesLabel, roomLabel, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount } = block;
+  const { namesLabel, roomLabel, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgByPet } = block;
 
   const out = [`${namesLabel}'s ${roomLabel} boarding details :`, '', ...lines];
-  const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
+  const fbgNote = fbgNoteFromByPet(fbgByPet);
 
   // Deposit already paid on the customer's card, linked to this stay —
   // subtracted at the end of the addends line and reflected in the total,
@@ -8222,19 +8246,27 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
   const out = [`${esc(ownerCust.name)}'s boarding details :`, ''];
   let boardingTotal = 0;
   const allCharges = [];
-  let fbgCount = 0;
+  const fbgByPetMap = new Map(); // petId -> { name, count } — summed across all combined stays, since the same pet can appear in more than one block
   blocks.forEach(({block}, i)=>{
     out.push(`— ${block.namesLabel} (${block.roomLabel}) —`);
     out.push(...block.lines);
     if(i < blocks.length-1) out.push('');
     boardingTotal += block.boardingTotal;
     allCharges.push(...block.charges);
-    fbgCount += block.fbgCount;
+    block.pets.forEach((p, idx)=>{
+      const f = (block.fbgByPet||[])[idx];
+      if(!f) return;
+      const existing = fbgByPetMap.get(p.id);
+      if(existing) existing.count += f.count;
+      else fbgByPetMap.set(p.id, { name: f.name, count: f.count });
+    });
   });
   out.push('');
 
   const chargesTotal = allCharges.reduce((s,c)=>s+c.amount,0);
-  const fbgNote = fbgCount>0 ? ` included ${fbgCount>1?fbgCount+'x':'1x'} free basic grooming during stay` : '';
+  const fbgByPet = Array.from(fbgByPetMap.values());
+  const fbgCount = fbgByPet.reduce((s,f)=>s+f.count,0);
+  const fbgNote = fbgNoteFromByPet(fbgByPet);
 
   const includedStayIds = new Set(blocks.map(b=>b.stay.id));
   const depositTotal = ((ownerCust && ownerCust.payments) || [])
