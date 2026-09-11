@@ -342,6 +342,20 @@
   td.cal-free.cal-holiday-col:hover{ background:#F5DFB8; }
   .cal-staffleave-mark{ display:block; font-size:10px; font-weight:700; color:#A23B2C; margin-top:1px; cursor:help; }
   .cal-holiday-badge{ position:absolute; top:3px; right:4px; width:7px; height:7px; border-radius:50%; background:var(--amber); box-shadow:0 0 0 1.5px rgba(255,255,255,.9); }
+  /* Shop-closed marking on the boarding calendar — deliberately NOT a flat
+     background tint like the holiday-rate column, so the two never look
+     like the same thing at a glance (a date can be both a holiday AND
+     closed at once). Closed is shown as: a red bottom border + "Closed"
+     label on the header, a solid left/right red band running down the
+     whole column (works even on occupied cells, whose background colour
+     is owner-driven inline style and can't be overridden by a CSS
+     background rule), plus a small 🔒 badge on cells that need one. */
+  th.cal-closed-col{ border-bottom:3px solid #A23B2C; }
+  .cal-closed-mark{ display:block; font-size:10px; font-weight:700; color:#A23B2C; margin-top:1px; }
+  td.cal-closed-col{ border-left:2px solid #A23B2C; border-right:2px solid #A23B2C; }
+  td.cal-free.cal-closed-col{ background:#FBE4E2; }
+  td.cal-free.cal-closed-col:hover{ background:#F5D0CB; }
+  .cal-closed-badge{ position:absolute; bottom:3px; left:4px; font-size:11px; line-height:1; filter:drop-shadow(0 1px 1px rgba(0,0,0,.35)); }
   .colour-swatch-row{ display:flex; flex-wrap:wrap; gap:7px; }
   .colour-swatch{ width:26px; height:26px; border-radius:7px; border:2px solid transparent; cursor:pointer; padding:0; }
   .colour-swatch:hover{ transform:scale(1.08); }
@@ -8690,6 +8704,7 @@ function renderBoardingCalendar(){
         <span class="legend-chip">Split colour = same-day turnover (O. = out, I. = in)</span>
         <span class="legend-chip">Numbered = same owner's other pets, different room</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--amber-tint);border:1px solid #F0D2AC;"></span>Holiday rate period</span>
+        <span class="legend-chip"><span class="legend-swatch" style="background:#FBE4E2;border:2px solid #A23B2C;"></span>🔒 Shop closed</span>
         <span class="legend-chip">🚫 = staff on leave that day (hover for names)</span>
       </div>
     </div>
@@ -8701,9 +8716,11 @@ function renderBoardingCalendar(){
             <th class="cal-room-head">Room</th>
             ${days.map(d=>{
               const hol = holidayFor(d.dateStr);
+              const closed = closedDateFor(d.dateStr);
               const onLeave = staffOnLeaveFor(d.dateStr);
-              const cls = [d.dateStr===today?'cal-today-col':'', hol?'cal-holiday-col':''].filter(Boolean).join(' ');
-              return `<th class="${cls}" ${hol?`title="${esc(hol.name)}"`:''}>${d.dayNum}<span class="cal-wd">${d.weekday}</span>${onLeave.length?`<span class="cal-staffleave-mark" title="On leave: ${esc(onLeave.map(o=>o.staff.name).join(', '))}">🚫 ${onLeave.length} out</span>`:''}</th>`;
+              const cls = [d.dateStr===today?'cal-today-col':'', hol?'cal-holiday-col':'', closed?'cal-closed-col':''].filter(Boolean).join(' ');
+              const titleParts = [hol?hol.name:'', closed?`Closed: ${closed.name}`:''].filter(Boolean);
+              return `<th class="${cls}" ${titleParts.length?`title="${esc(titleParts.join(' · '))}"`:''}>${d.dayNum}<span class="cal-wd">${d.weekday}</span>${closed?`<span class="cal-closed-mark">🔒 Closed</span>`:''}${onLeave.length?`<span class="cal-staffleave-mark" title="On leave: ${esc(onLeave.map(o=>o.staff.name).join(', '))}">🚫 ${onLeave.length} out</span>`:''}</th>`;
             }).join('')}
           </tr>
         </thead>
@@ -8715,7 +8732,7 @@ function renderBoardingCalendar(){
                 <td class="cal-room-cell">${r.id}</td>
                 ${days.map(d=>{
                   const occ = cellOccupants(r.id, d.dateStr);
-                  return calCellHtml(r.id, d.dateStr, occ, d.dateStr===today, !!holidayFor(d.dateStr));
+                  return calCellHtml(r.id, d.dateStr, occ, d.dateStr===today, !!holidayFor(d.dateStr), !!closedDateFor(d.dateStr));
                 }).join('')}
               </tr>
             `).join('')}
@@ -8775,11 +8792,12 @@ function turnoverLabel(kind){
   return '';
 }
 
-function calCellHtml(roomId, dateStr, occ, isToday, isHol){
+function calCellHtml(roomId, dateStr, occ, isToday, isHol, isClosed){
   const holCls = isHol ? 'cal-holiday-col' : '';
+  const closedCls = isClosed ? 'cal-closed-col' : '';
   const todayCls = isToday ? 'cal-today-col' : '';
   if(occ.length === 0){
-    return `<td class="cal-cell cal-free ${todayCls} ${holCls}" data-cal-cell="${roomId}|${dateStr}"></td>`;
+    return `<td class="cal-cell cal-free ${todayCls} ${holCls} ${closedCls}" data-cal-cell="${roomId}|${dateStr}"></td>`;
   }
   // distinct owner colours present in this cell
   const colours = [...new Set(occ.map(o=>calendarColorFor(o.cust.id)))];
@@ -8806,7 +8824,8 @@ function calCellHtml(roomId, dateStr, occ, isToday, isHol){
     lines = `<div class="cal-cell-line">${idx?`${idx}.`:''}${esc(o.pet.name)}${arrow}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
   }
   const holBadge = isHol ? '<span class="cal-holiday-badge" title="Holiday rate"></span>' : '';
-  return `<td class="cal-cell cal-occupied ${todayCls}" style="background:${bg};color:${textColor};--cal-text-shadow:${textShadow};" data-cal-cell="${roomId}|${dateStr}">${holBadge}${lines}</td>`;
+  const closedBadge = isClosed ? '<span class="cal-closed-badge" title="Shop closed">🔒</span>' : '';
+  return `<td class="cal-cell cal-occupied ${todayCls} ${closedCls}" style="background:${bg};color:${textColor};--cal-text-shadow:${textShadow};" data-cal-cell="${roomId}|${dateStr}">${holBadge}${closedBadge}${lines}</td>`;
 }
 
 function openCalendarCellModal(roomId, dateStr){
