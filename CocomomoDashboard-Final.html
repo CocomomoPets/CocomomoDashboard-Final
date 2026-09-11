@@ -3454,6 +3454,7 @@ function openChecklistModal(title, items, confirmLabel, onConfirm){
   }
   document.querySelectorAll('[data-checklist-item]').forEach(cb=>cb.addEventListener('change', refreshConfirm));
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('confirmBtn').addEventListener('click', ()=>{ closeModal(); onConfirm(); });
 }
 
 function todayDateSectionHtml(sec, checkins, checkouts, grooms){
