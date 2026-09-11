@@ -957,6 +957,7 @@ function snapshotShopConfig(){
     surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL,
     daycareRates: state.daycareRates,
     holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
+    waitlist: state.waitlist,
     policyText: state.policyText,
     LARGE_normal: LARGE.normal, LARGE_holiday: LARGE.holiday,
   };
@@ -1241,6 +1242,10 @@ let state = {
   ],
   closedDates: [], // {id, name, start, end} — days the shop is fully closed: no grooming appointments taken, and any boarding check-in/out landing here needs a scheduled drop-off/pick-up appointment instead
   closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
+  // Waitlist (Pain Point #17) — {id, customerId, petId, desiredCheckIn,
+  // desiredCheckOut, roomType, notes, addedDate}. Shop-wide, so it lives in
+  // shop_config alongside holidays/closedDates rather than per-customer.
+  waitlist: [],
   cancellations: [], // log of deleted grooming appointments & boarding stays — {id, type:'Grooming'|'Boarding', reason, note, cancelledAt, customerName, petName, summary}
   changeLog: [], // log of edits to stay dates/rates, charges, payments, pet notes — {id, ts, entityType, ref, entityLabel, field, fieldLabel, oldValue, newValue, undone}
   staff: [], // {id, name, leaves:[{id, start, end, note}]} — leave shown on Today grid, Boarding calendar, and Grooming availability
@@ -2742,10 +2747,21 @@ function normalizeCustomer(c){
     // Who's allowed to collect this customer's pet(s) — {id, name, phone,
     // note}. Shown on checkout so staff can verify against ID at pickup.
     authorizedPickups: Array.isArray(c?.authorizedPickups) ? c.authorizedPickups.map(a=>({ id:a?.id||uid('pickup'), name:a?.name||'', phone:a?.phone||'', note:a?.note||'' })) : [],
+    // Pain point #25 — a warning flag for a customer with a past serious
+    // issue. Deliberately warning-only, never a hard block: staff always
+    // stay able to complete the booking, they just see why to be cautious.
+    flagged: !!c?.flagged, flagReason: c?.flagReason || '',
   };
 }
 function pointsBalance(cust){
   return (cust.pointsHistory||[]).reduce((s,p)=> s + (p.type==='Deduct' ? -(+p.amount||0) : (+p.amount||0)), 0);
+}
+/* Pain point #25 — warning-only flag banner, reused on the customer's own
+   page header and wherever a customer is being booked (never blocks
+   the action, just surfaces the reason). */
+function customerFlagBannerHtml(cust){
+  if(!cust || !cust.flagged) return '';
+  return `<div style="margin-top:6px;font-size:12.5px;font-weight:600;color:#A23B2C;background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:6px 10px;display:inline-block;">⚠️ Flagged customer${cust.flagReason?`: ${esc(cust.flagReason)}`:''}</div>`;
 }
 function isMembershipCustomer(cust){
   return (cust.customerTypes||[]).some(t=>MEMBERSHIP_TIERS.includes(t));
@@ -2820,7 +2836,7 @@ function renderSidebarOrHide(){
     <div class="customer-item ${c.id===state.selectedCustomerId?'active':''}" data-cust="${c.id}">
       <div class="avatar" style="${avatarStyle(colorFor(c.id))}">${initials(c.name)}</div>
       <div class="cust-meta">
-        <div class="cust-name">${esc(c.name)}</div>
+        <div class="cust-name">${esc(c.name)}${c.flagged?' <span title="Flagged customer — see profile for reason" style="color:#A23B2C;">⚠️</span>':''}</div>
         <div class="cust-sub">${esc(c.phone)} · ${petSummary}</div>
       </div>
       ${membership ? `<span class="sidebar-membership-badge">${esc(membership)}</span>` : ''}
@@ -2899,6 +2915,7 @@ function renderCustomersMain(){
           <div class="cust-card-name">${esc(cust.name)}</div>
           <div class="cust-card-id">Customer ID · ${esc(cust.phone)}</div>
           ${cust.customerTypes && cust.customerTypes.length ? `<div class="cust-type-chips">${cust.customerTypes.map(t=>`<span class="type-chip ${MEMBERSHIP_TIERS.includes(t)?'type-chip-membership':''}">${esc(t)}</span>`).join('')}</div>` : ''}
+          ${customerFlagBannerHtml(cust)}
         </div>
         <div class="cust-card-actions">
           <button class="btn btn-sm" id="editCustBtn">Edit</button>
@@ -5068,7 +5085,7 @@ function goToCustomersAndAddNew(){
 
 /* ---- Customer modal ---- */
 function openCustomerModal(existing){
-  const c = existing || {id:'', name:'', icPassport:'', phone:'', gender:'Female', dob:'', emergencyName:'', emergencyPhone:'', customerTypes:[], pets:[]};
+  const c = existing || {id:'', name:'', icPassport:'', phone:'', gender:'Female', dob:'', emergencyName:'', emergencyPhone:'', customerTypes:[], pets:[], flagged:false, flagReason:''};
   const types = Array.isArray(c.customerTypes) ? c.customerTypes : [];
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit customer':'Add customer'}</h3><button class="modal-close">✕</button></div>
@@ -5092,6 +5109,11 @@ function openCustomerModal(existing){
           </div>
         </fieldset>
       `).join('')}
+      <fieldset ${c.flagged?'style="border-color:#EEB3AC;background:#FBE4E2;"':''}>
+        <legend ${c.flagged?'style="color:#A23B2C;"':''}>⚠️ Flag (Pain Point #25)</legend>
+        <label class="check-pill" style="margin-bottom:8px;"><input type="checkbox" id="f_flagged" ${c.flagged?'checked':''}> Flag this customer — past serious issue</label>
+        <div class="field"><label>Reason (shown as a warning wherever this customer is booked — never blocks the booking)</label><textarea id="f_flagReason" placeholder="e.g. Repeated no-shows, aggressive behaviour toward staff…">${esc(c.flagReason)}</textarea></div>
+      </fieldset>
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Cancel</button>
@@ -5105,6 +5127,8 @@ function openCustomerModal(existing){
     const phone = document.getElementById('f_phone').value.trim();
     if(!name || !phone){ toast('Name and contact number are required'); return; }
     const customerTypes = Array.from(document.querySelectorAll('[data-custtype]:checked')).map(c=>c.value);
+    const flagged = document.getElementById('f_flagged').checked;
+    const flagReason = document.getElementById('f_flagReason').value.trim();
     if(existing){
       const wasMembership = isMembershipCustomer(existing);
       existing.name=name; existing.icPassport=document.getElementById('f_ic').value;
@@ -5113,6 +5137,7 @@ function openCustomerModal(existing){
       existing.emergencyName=document.getElementById('f_ename').value;
       existing.emergencyPhone=document.getElementById('f_ephone').value;
       existing.customerTypes=customerTypes;
+      existing.flagged=flagged; existing.flagReason=flagReason;
       if(existing.id !== phone){ existing.id = phone; }
       closeModal(); render(); scheduleSync();
       if(!wasMembership && isMembershipCustomer(existing)){
@@ -5127,7 +5152,8 @@ function openCustomerModal(existing){
       const nc = { id:phone, name, icPassport:document.getElementById('f_ic').value, phone,
         gender:document.getElementById('f_gender').value, dob:document.getElementById('f_dob').value,
         emergencyName:document.getElementById('f_ename').value, emergencyPhone:document.getElementById('f_ephone').value,
-        customerTypes, payments:[], agreement:null, agreementToken:null, colorOverride:null, pointsHistory:[], pets:[] };
+        customerTypes, payments:[], agreement:null, agreementToken:null, colorOverride:null, pointsHistory:[], pets:[],
+        flagged, flagReason };
       state.customers.push(nc);
       state.selectedCustomerId = nc.id; state.selectedPetId = null;
       closeModal(); render(); scheduleSync(); toast('Customer added');
@@ -5594,6 +5620,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
   const rows = workingPets.map((sp,idx)=> stayPetRowHtml(cust, sp, idx)).join('');
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>    <div class="modal-body">
+      ${customerFlagBannerHtml(cust) ? `<div style="margin-bottom:12px;">${customerFlagBannerHtml(cust)}</div>` : ''}
       <div class="form-grid c3">
         <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="s_in" value="${s.checkIn}"><span class="date-overlay-label" id="s_in_wd">${fmtDateSlashDay(s.checkIn)}</span></div></div>
         <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="s_out" value="${s.checkOut}"><span class="date-overlay-label" id="s_out_wd">${fmtDateSlashDay(s.checkOut)}</span></div></div>
@@ -6684,6 +6711,7 @@ function mapCustomerRow(c){
     // empty here so this column stops carrying duplicate/stale data, same
     // reasoning as stays/grooming_history on the pets table.
     color_override: c.colorOverride || null, payments: [],
+    flagged: !!c.flagged, flag_reason: c.flagReason || null,
   };
 }
 function mapPetRow(p, customerId){
@@ -6764,6 +6792,7 @@ async function loadCustomersPetsFromTables(){
     customerTypes: c.customer_types || [], pointsHistory: c.points_history || [],
     authorizedPickups: c.authorized_pickups || [], agreement: c.agreement || null,
     agreementToken: c.agreement_token || null, colorOverride: c.color_override || null,
+    flagged: c.flagged || false, flagReason: c.flag_reason || '',
     payments: (existingCustById.get(c.id)||{}).payments || [],
     pets: (petRows||[]).filter(p=>p.customer_id===c.id).map(p=>{
       const ex = existingPetById.get(p.id);
@@ -7355,6 +7384,7 @@ function mapShopConfigRow(cfg){
     surcharge_sm: cfg.surchargeSM, surcharge_lxl: cfg.surchargeLXL,
     daycare_rates: cfg.daycareRates,
     holidays: cfg.holidays, closed_dates: cfg.closedDates, closed_weekdays: cfg.closedWeekdays,
+    waitlist: cfg.waitlist,
     policy_text: cfg.policyText, large_normal: cfg.LARGE_normal, large_holiday: cfg.LARGE_holiday,
     updated_at: new Date().toISOString(),
   };
@@ -7394,6 +7424,7 @@ async function loadShopConfigFromTables(){
     state.holidays = row.holidays ?? state.holidays;
     state.closedDates = row.closed_dates ?? state.closedDates;
     state.closedWeekdays = row.closed_weekdays ?? state.closedWeekdays;
+    state.waitlist = row.waitlist ?? state.waitlist;
     state.policyText = row.policy_text ?? state.policyText;
     if(typeof row.large_normal === 'number') LARGE.normal = row.large_normal;
     if(typeof row.large_holiday === 'number') LARGE.holiday = row.large_holiday;
@@ -9009,6 +9040,8 @@ function renderBoardingCalendar(){
       </div>
       <button class="btn" id="calThisMonthBtn" type="button">This month</button>
       <button class="btn btn-amber" id="calNewBookingBtn" type="button">+ New booking</button>
+      <button class="btn" id="calWaitlistAddBtn" type="button">+ Add to waitlist</button>
+      <button class="btn" id="calWaitlistViewBtn" type="button">Waitlist${(state.waitlist||[]).length?` (${state.waitlist.length})`:''}</button>
       <button class="btn btn-primary" id="calAddCustomerBtn" type="button">+ Add customer</button>
       <div class="legend-row">
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>Free</span>
@@ -9069,6 +9102,8 @@ function renderBoardingCalendar(){
     if(todayCol) todayCol.scrollIntoView({ inline:'center', block:'nearest' });
   }
   document.getElementById('calNewBookingBtn').addEventListener('click', ()=>openCalendarNewBookingModal(null, null));
+  document.getElementById('calWaitlistAddBtn').addEventListener('click', ()=>openWaitlistAddModal());
+  document.getElementById('calWaitlistViewBtn').addEventListener('click', ()=>openWaitlistModal());
   document.getElementById('calAddCustomerBtn').addEventListener('click', goToCustomersAndAddNew);
 
   main.querySelectorAll('[data-cal-cell]').forEach(el=>{
@@ -9272,6 +9307,139 @@ function openCalendarCellModal(roomId, dateStr){
 
 /* New boarding booking, insertable directly from the calendar — click a free cell
    (pre-fills that room + date) or use the "+ New booking" toolbar button (blank). */
+/* Pain point #17: waitlist for fully-booked dates. Shop-wide, not tied to
+   a customer, so it's stored in shop_config (see snapshotShopConfig)
+   rather than per-customer. Warning-only flag (#25) is surfaced here too,
+   since a flagged customer waiting for a slot is exactly the kind of
+   booking staff want a heads-up on before converting it. */
+function openWaitlistAddModal(){
+  if(state.customers.length===0){ toast('Add a customer first'); return; }
+  openModal(`
+    <div class="modal-head"><h3>Add to waitlist</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="form-grid c3">
+        <div class="field span3">
+          <label>Search customer by name</label>
+          <input id="wl_cust_search" placeholder="Start typing a name…" autocomplete="off">
+        </div>
+        <div class="field"><label>Customer</label><select id="wl_cust"></select></div>
+        <div class="field span2"><label>Pet</label><select id="wl_pet"></select></div>
+        <div class="field"><label>Desired check-in</label><div class="date-overlay-wrap"><input type="date" id="wl_in" value="${todayStr()}"><span class="date-overlay-label" id="wl_in_wd"></span></div></div>
+        <div class="field"><label>Desired check-out</label><div class="date-overlay-wrap"><input type="date" id="wl_out" value="${todayStr()}"><span class="date-overlay-label" id="wl_out_wd"></span></div></div>
+        <div class="field"><label>Room type preference (optional)</label><input id="wl_roomtype" placeholder="e.g. Deluxe, any"></div>
+        <div class="field span3"><label>Notes</label><textarea id="wl_notes" placeholder="e.g. Flexible ±2 days, prefers ground floor…"></textarea></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">Add to waitlist</button>
+    </div>
+  `, {wide:true});
+
+  function refreshPetOptions(){
+    const cust = getCustomer(document.getElementById('wl_cust').value);
+    document.getElementById('wl_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : '<option value="">No pets</option>';
+  }
+  function refreshCustOptions(filterText){
+    const q = (filterText||'').trim().toLowerCase();
+    const filtered = state.customers.filter(c => !q || c.name.toLowerCase().includes(q) || c.pets.some(p=>p.name.toLowerCase().includes(q))).slice().sort((a,b)=>a.name.localeCompare(b.name));
+    const sel = document.getElementById('wl_cust');
+    const prevVal = sel.value;
+    sel.innerHTML = filtered.length ? filtered.map(c=>`<option value="${c.id}">${esc(c.name)}${c.pets.length?` (${c.pets.map(p=>esc(p.name)).join(', ')})`:''}</option>`).join('') : '<option value="">No matching customers</option>';
+    if(filtered.some(c=>c.id===prevVal)) sel.value = prevVal;
+    refreshPetOptions();
+  }
+  refreshCustOptions('');
+  document.getElementById('wl_in_wd').textContent = fmtDateSlashDay(document.getElementById('wl_in').value);
+  document.getElementById('wl_out_wd').textContent = fmtDateSlashDay(document.getElementById('wl_out').value);
+  document.getElementById('wl_in').addEventListener('change', (e)=>{ document.getElementById('wl_in_wd').textContent = fmtDateSlashDay(e.target.value); });
+  document.getElementById('wl_out').addEventListener('change', (e)=>{ document.getElementById('wl_out_wd').textContent = fmtDateSlashDay(e.target.value); });
+  document.getElementById('wl_cust_search').addEventListener('input', (e)=>refreshCustOptions(e.target.value));
+  document.getElementById('wl_cust').addEventListener('change', refreshPetOptions);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('wl_cust_search').focus();
+
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const custId = document.getElementById('wl_cust').value;
+    const petId = document.getElementById('wl_pet').value;
+    const checkIn = document.getElementById('wl_in').value;
+    const checkOut = document.getElementById('wl_out').value;
+    if(!custId || !petId){ toast('Please pick a customer and pet'); return; }
+    if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid desired dates'); return; }
+    state.waitlist = state.waitlist || [];
+    state.waitlist.push({
+      id: uid('waitlist'), customerId: custId, petId,
+      desiredCheckIn: checkIn, desiredCheckOut: checkOut,
+      roomType: document.getElementById('wl_roomtype').value.trim(),
+      notes: document.getElementById('wl_notes').value.trim(),
+      addedDate: todayStr(),
+    });
+    closeModal(); scheduleSync(); toast('Added to waitlist');
+    if(state.activeTab==='calendar') renderBoardingCalendar();
+  });
+}
+function waitlistEntryCustPet(entry){
+  const cust = getCustomer(entry.customerId);
+  const pet = cust ? getPet(cust, entry.petId) : null;
+  return { cust, pet };
+}
+function openWaitlistModal(){
+  const entries = (state.waitlist||[]).slice().sort((a,b)=> a.desiredCheckIn.localeCompare(b.desiredCheckIn));
+  openModal(`
+    <div class="modal-head"><h3>Waitlist</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;">Customers waiting for a room on a fully-booked date. "Book now" opens a pre-filled New stay — double-check a room's actually free before confirming.</div>
+      ${entries.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">Nothing on the waitlist.</div>` : entries.map(entry=>{
+        const { cust, pet } = waitlistEntryCustPet(entry);
+        if(!cust || !pet) return '';
+        return `
+        <div class="today-card" style="cursor:default;">
+          <div class="today-card-main">
+            <div class="today-card-pet">${petLabel(pet)} — ${esc(cust.name)}${cust.flagged?' <span title="Flagged customer — see profile for reason" style="color:#A23B2C;">⚠️</span>':''}</div>
+            <div class="today-card-sub">Wants ${fmtDateWithDay(entry.desiredCheckIn)} → ${fmtDateWithDay(entry.desiredCheckOut)}${entry.roomType?` · ${esc(entry.roomType)}`:''}</div>
+            ${entry.notes?`<div class="today-card-sub">${esc(entry.notes)}</div>`:''}
+            <div class="today-card-sub">Added ${fmtDate(entry.addedDate)}</div>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-sm btn-primary" data-waitlist-book="${entry.id}">Book now</button>
+            <button class="btn btn-sm btn-danger" data-waitlist-remove="${entry.id}">Remove</button>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-waitlist-remove]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      state.waitlist = (state.waitlist||[]).filter(e=>e.id!==btn.dataset.waitlistRemove);
+      scheduleSync(); toast('Removed from waitlist'); openWaitlistModal();
+    });
+  });
+  document.querySelectorAll('[data-waitlist-book]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const entry = (state.waitlist||[]).find(e=>e.id===btn.dataset.waitlistBook);
+      if(!entry) return;
+      const { cust, pet } = waitlistEntryCustPet(entry);
+      if(!cust || !pet){ toast('That customer or pet no longer exists'); return; }
+      closeModal();
+      openStayModal(cust, pet, null, ()=>{
+        state.waitlist = (state.waitlist||[]).filter(e=>e.id!==entry.id);
+        scheduleSync();
+        if(state.activeTab==='calendar') renderBoardingCalendar(); else render();
+      });
+      // Pre-fill the desired dates/notes onto the just-opened New stay modal —
+      // dispatching 'change' so the date-overlay labels, rate field, and
+      // closed-day section all refresh exactly as if typed in by hand.
+      const inEl = document.getElementById('s_in'), outEl = document.getElementById('s_out'), notesEl = document.getElementById('s_notes');
+      if(inEl){ inEl.value = entry.desiredCheckIn; inEl.dispatchEvent(new Event('change')); }
+      if(outEl){ outEl.value = entry.desiredCheckOut; outEl.dispatchEvent(new Event('change')); }
+      if(notesEl && entry.notes) notesEl.value = entry.notes;
+    });
+  });
+}
 function openCalendarNewBookingModal(prefRoomId, prefDate){
   if(state.customers.length===0){ toast('Add a customer first'); return; }
   const initialCheckIn = prefDate || todayStr();
@@ -9286,7 +9454,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
           <label>Search customer by name</label>
           <input id="cb_cust_search" placeholder="Start typing a name…" autocomplete="off">
         </div>
-        <div class="field"><label>Customer</label><select id="cb_cust"></select></div>
+        <div class="field"><label>Customer</label><select id="cb_cust"></select><div id="cb_flagWrap"></div></div>
         <div class="field span2"><label>Pet</label><select id="cb_pet"></select></div>
         <div class="field"><label>Check-in date</label><div class="date-overlay-wrap"><input type="date" id="cb_in" value="${initialCheckIn}"><span class="date-overlay-label" id="cb_in_day"></span></div></div>
         <div class="field"><label>Check-out date</label><div class="date-overlay-wrap"><input type="date" id="cb_out" value="${initialCheckOut}"><span class="date-overlay-label" id="cb_out_day"></span></div></div>
@@ -9393,6 +9561,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       const matchedPet = cust.pets.find(p=>p.name.toLowerCase().includes(query));
       if(matchedPet) document.getElementById('cb_pet').value = matchedPet.id;
     }
+    document.getElementById('cb_flagWrap').innerHTML = customerFlagBannerHtml(cust);
     refreshRoomOptions();
   }
   function refreshCustOptions(filterText){
