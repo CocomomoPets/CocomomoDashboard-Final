@@ -522,7 +522,7 @@
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn" title="Room rates, surcharges, holidays &amp; closed dates — plus Staff &amp; leave">Rates &amp; Staff</button>
     <button class="btn" id="scheduleBtn" title="Reminders for tomorrow's appointments/checkouts, and the monthly revenue/occupancy report">Reminders &amp; Reports</button>
-    <button class="btn" id="historyBtn" title="Recent edits (with undo) and the log of cancelled appointments/stays">Change log &amp; Cancellations</button>
+    <button class="btn" id="historyBtn" title="Recent edits (with undo), the log of cancelled appointments/stays, and the incident/injury log">Change log &amp; Cancellations</button>
     <button class="btn" id="archiveBtn" title="Move old finished records out of the main tables — plus daily automatic Backups">Archive &amp; Backup</button>
   </div>
 
@@ -733,7 +733,7 @@ function applySavedNavSelection(){
   }
   if(nav){
     if(['customers','today','calendar','grooming'].includes(nav.activeTab)) state.activeTab = nav.activeTab;
-    if(['info','boarding','grooming'].includes(nav.subTab)) _subTab = nav.subTab;
+    if(['info','boarding','grooming','incidents'].includes(nav.subTab)) _subTab = nav.subTab;
     if(nav.groomingDate) state.groomingDate = nav.groomingDate;
     if(nav.calendarMonth) state.calendarMonth = nav.calendarMonth;
     if(nav.openStays && typeof nav.openStays==='object') state.openStays = nav.openStays;
@@ -1296,6 +1296,19 @@ const PET_SIZES = ['S','M','L','XL','XXL'];
    at a glance (pet header, Today grid, booking), instead of relying on
    someone reading through free-typed medical/personality/special-request text. */
 const RISK_FLAGS = ['Aggressive','Bite history','Escape risk','Allergy','Reactive to other pets','Anxious/fearful','Other'];
+/* Pain point #19: incident/injury log — bites, escapes, illness, injuries
+   with nowhere dedicated to be recorded. Kept intentionally simple (no
+   real-table conflict-safety versioning beyond what the shared save funnel
+   already gives every pet-nested list) since incidents are logged well
+   after the fact, not fought over in real time the way a booking slot is. */
+const INCIDENT_TYPES = ['Bite','Escape','Illness','Injury','Property damage','Other'];
+const INCIDENT_SEVERITIES = ['Minor','Moderate','Severe'];
+const NOTIFY_METHODS = ['Phone call','WhatsApp','In person','Other'];
+const INCIDENT_SEVERITY_STYLE = {
+  Minor: 'background:var(--teal-tint);color:var(--teal-dark);',
+  Moderate: 'background:var(--amber-tint);color:#8A5A22;',
+  Severe: 'background:#FBE4E2;color:#A23B2C;',
+};
 /* Preset grooming prices for the "Additional charges" (Grooming category)
    picker on a stay — Bath/Cut are priced by the pet's own grooming size
    (auto-detected from pet.groomingSize), the rest are flat per-visit fees.
@@ -1743,7 +1756,7 @@ function openChangeLogModal(){
   openModal(`
     <div class="modal-head"><h3>Change log</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      ${subTabRowHtml('histTabs', [{label:'Change log', active:true}, {label:'Cancellations', active:false, onClick:()=>openCancellationsModal()}])}
+      ${subTabRowHtml('histTabs', [{label:'Change log', active:true}, {label:'Cancellations', active:false, onClick:()=>openCancellationsModal()}, {label:'Incidents', active:false, onClick:()=>openIncidentsLogModal()}])}
       <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;">Recent edits to stay dates/rates, charges, payments, and pet notes — most recent first. Undo writes the old value back (and logs that as a new entry, so nothing is silently erased).</div>
       ${list.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No changes logged yet.</div>` : list.map(e=>`
         <div class="today-card" style="cursor:default;">
@@ -1760,7 +1773,7 @@ function openChangeLogModal(){
       <button class="btn btn-primary" id="cancelBtn">Close</button>
     </div>
   `);
-  wireSubTabRow('histTabs', [{active:true}, {active:false, onClick:()=>openCancellationsModal()}]);
+  wireSubTabRow('histTabs', [{active:true}, {active:false, onClick:()=>openCancellationsModal()}, {active:false, onClick:()=>openIncidentsLogModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.querySelectorAll('[data-undo-change]').forEach(btn=>{
     btn.addEventListener('click', ()=> undoChange(btn.dataset.undoChange));
@@ -1809,7 +1822,7 @@ function openCancellationsModal(minCount){
   openModal(`
     <div class="modal-head"><h3>Cancellations</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      ${subTabRowHtml('histTabs', [{label:'Change log', active:false, onClick:()=>openChangeLogModal()}, {label:'Cancellations', active:true}])}
+      ${subTabRowHtml('histTabs', [{label:'Change log', active:false, onClick:()=>openChangeLogModal()}, {label:'Cancellations', active:true}, {label:'Incidents', active:false, onClick:()=>openIncidentsLogModal()}])}
       <div style="font-weight:700;font-size:13px;margin-bottom:6px;">🔁 Repeat cancellers (last ${cancelMonths} months)</div>
       <div style="display:flex;gap:6px;margin-bottom:12px;">
         ${[2,3,5].map(n=>`<button class="btn btn-sm ${n===minCount?'btn-primary':''}" data-cancel-threshold="${n}">${n}+ cancellations</button>`).join('')}
@@ -1838,7 +1851,7 @@ function openCancellationsModal(minCount){
       <button class="btn btn-primary" id="cancelBtn">Close</button>
     </div>
   `);
-  wireSubTabRow('histTabs', [{active:false, onClick:()=>openChangeLogModal()}, {active:true}]);
+  wireSubTabRow('histTabs', [{active:false, onClick:()=>openChangeLogModal()}, {active:true}, {active:false, onClick:()=>openIncidentsLogModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.querySelectorAll('[data-cancel-threshold]').forEach(btn=>{
     btn.addEventListener('click', ()=> openCancellationsModal(+btn.dataset.cancelThreshold));
@@ -2638,12 +2651,28 @@ function normalizeGroom(g){
   if(!GROOM_STATUSES.includes(merged.status)) merged.status = 'Not arrived';
   return merged;
 }
+function normalizeIncident(inc){
+  return {
+    id: inc?.id || uid('incident'),
+    date: inc?.date || todayStr(),
+    types: Array.isArray(inc?.types) ? inc.types : [],
+    description: inc?.description || '',
+    staffInvolved: Array.isArray(inc?.staffInvolved) ? inc.staffInvolved : [],
+    severity: INCIDENT_SEVERITIES.includes(inc?.severity) ? inc.severity : 'Minor',
+    followUp: inc?.followUp || '',
+    ownerNotified: !!inc?.ownerNotified,
+    notifiedMethod: inc?.notifiedMethod || '',
+    notifiedNote: inc?.notifiedNote || '',
+  };
+}
 function normalizePet(p){
   return {
     ...p,
     photo: p?.photo || null,
     stays: Array.isArray(p?.stays) ? p.stays.map(normalizeStay) : [],
     groomingHistory: Array.isArray(p?.groomingHistory) ? p.groomingHistory.map(normalizeGroom) : [],
+    // Incidents/injuries (Pain Point #19) — see normalizeIncident.
+    incidents: Array.isArray(p?.incidents) ? p.incidents.map(normalizeIncident) : [],
     // Risk flags — surfaced prominently (pet header, Today grid, booking
     // modals) instead of being buried in free-typed medical/special-request
     // text, so staff see them automatically rather than having to remember
@@ -2933,6 +2962,7 @@ function renderCustomersMain(){
         <button class="subtab-btn ${curSub()==='info'?'active':''}" data-sub="info">Info</button>
         <button class="subtab-btn ${curSub()==='boarding'?'active':''}" data-sub="boarding">Boarding</button>
         <button class="subtab-btn ${curSub()==='grooming'?'active':''}" data-sub="grooming">Grooming</button>
+        <button class="subtab-btn ${curSub()==='incidents'?'active':''}" data-sub="incidents">Incidents${(pet.incidents||[]).length?` (${pet.incidents.length})`:''}</button>
       </div>
       <div id="petSubContent"></div>
     ` : `<div class="placeholder" style="height:220px;"><b>No pets yet</b><div>Add this customer's first pet.</div></div>`}
@@ -3101,7 +3131,8 @@ function renderPetSubContent(cust, pet){
   const el = document.getElementById('petSubContent');
   if(curSub()==='info') el.innerHTML = petInfoHtml(pet);
   else if(curSub()==='boarding') el.innerHTML = petBoardingHtml(cust, pet);
-  else el.innerHTML = petGroomingHtml(cust, pet);
+  else if(curSub()==='grooming') el.innerHTML = petGroomingHtml(cust, pet);
+  else el.innerHTML = petIncidentsHtml(cust, pet);
   wireSubContentEvents(cust, pet);
   saveNavState();
   scheduleSync();
@@ -4133,6 +4164,144 @@ function groomCardHtml(g){
   </div>`;
 }
 
+/* Pain point #19: incident/injury log. Lives on the pet's own page (this
+   tab) AND is aggregated shop-wide (see computeAllIncidents/
+   openIncidentsLogModal) — the same data, two views, per the "both" request. */
+function petIncidentsHtml(cust, pet){
+  const all = (pet.incidents||[]).slice().sort((a,b)=> b.date.localeCompare(a.date));
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <div class="section-title" style="margin:0;">Incident / injury log</div>
+      <button class="btn btn-primary btn-sm" data-act="new-incident">+ Log incident</button>
+    </div>
+    ${all.length===0 ? `<div class="placeholder" style="height:140px;"><b>No incidents logged</b><div>Bites, escapes, illness, or injuries involving ${esc(pet.name)} get recorded here.</div></div>` : all.map(inc=>incidentCardHtml(inc)).join('')}
+  `;
+}
+function incidentCardHtml(inc){
+  return `
+  <div class="today-card" style="cursor:default;">
+    <div class="today-card-main">
+      <div class="today-card-pet">${fmtDateWithDay(inc.date)} <span class="badge" style="${INCIDENT_SEVERITY_STYLE[inc.severity]||''}">${esc(inc.severity)}</span>${inc.types.map(t=>` <span class="badge badge-past">${esc(t)}</span>`).join('')}</div>
+      <div class="today-card-sub">${esc(inc.description)||'—'}</div>
+      ${inc.staffInvolved.length?`<div class="today-card-sub">Staff involved: ${inc.staffInvolved.map(esc).join(', ')}</div>`:''}
+      ${inc.followUp?`<div class="today-card-sub">Follow-up: ${esc(inc.followUp)}</div>`:''}
+      <div class="today-card-sub">${inc.ownerNotified ? `✅ Owner notified${inc.notifiedMethod?` (${esc(inc.notifiedMethod)})`:''}${inc.notifiedNote?` — ${esc(inc.notifiedNote)}`:''}` : '⚠️ Owner not yet notified'}</div>
+    </div>
+    <div style="display:flex;gap:6px;">
+      <button class="btn btn-sm" data-act="edit-incident" data-incident="${inc.id}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-act="delete-incident" data-incident="${inc.id}">Delete</button>
+    </div>
+  </div>`;
+}
+function openIncidentModal(cust, pet, existing){
+  const inc = existing || normalizeIncident({});
+  openModal(`
+    <div class="modal-head"><h3>${existing?'Edit incident':'Log incident'} — ${petLabel(pet)}</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div class="form-grid c3">
+        <div class="field"><label>Date</label><div class="date-overlay-wrap"><input type="date" id="inc_date" value="${inc.date}"><span class="date-overlay-label" id="inc_date_wd">${fmtDateSlashDay(inc.date)}</span></div></div>
+        <div class="field span2"><label>Severity</label>
+          <select id="inc_severity">${INCIDENT_SEVERITIES.map(s=>`<option ${s===inc.severity?'selected':''}>${esc(s)}</option>`).join('')}</select>
+        </div>
+        ${multiSelectFieldHtml('inc_type', 'Type', INCIDENT_TYPES)}
+        <div class="field span3"><label>What happened</label><textarea id="inc_desc" placeholder="Describe what happened">${esc(inc.description)}</textarea></div>
+        ${multiSelectFieldHtml('inc_staff', 'Staff involved', (state.staff||[]).map(s=>s.name))}
+        <div class="field span3"><label>Follow-up action taken</label><textarea id="inc_followup" placeholder="e.g. Applied first aid, isolated from other pets, monitored overnight">${esc(inc.followUp)}</textarea></div>
+        <div class="field span3">
+          <label class="check-pill" style="cursor:pointer;display:inline-flex;"><input type="checkbox" id="inc_notified" ${inc.ownerNotified?'checked':''} style="margin-right:4px;"> Owner notified</label>
+        </div>
+        <div class="field" id="inc_notified_method_wrap" style="${inc.ownerNotified?'':'display:none;'}"><label>How</label>
+          <select id="inc_notified_method">${NOTIFY_METHODS.map(m=>`<option ${m===inc.notifiedMethod?'selected':''}>${esc(m)}</option>`).join('')}</select>
+        </div>
+        <div class="field span2" id="inc_notified_note_wrap" style="${inc.ownerNotified?'':'display:none;'}"><label>Notes (optional)</label><input id="inc_notified_note" value="${esc(inc.notifiedNote)}"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="saveBtn">${existing?'Save changes':'Log incident'}</button>
+    </div>
+  `, {wide:true});
+  document.getElementById('inc_date').addEventListener('change', (e)=>{ document.getElementById('inc_date_wd').textContent = fmtDateSlashDay(e.target.value); });
+  const getTypes = wireMultiSelectEditor('inc_type', INCIDENT_TYPES, inc.types||[]);
+  const getStaff = wireMultiSelectEditor('inc_staff', (state.staff||[]).map(s=>s.name), inc.staffInvolved||[]);
+  const notifiedCb = document.getElementById('inc_notified');
+  notifiedCb.addEventListener('change', ()=>{
+    document.getElementById('inc_notified_method_wrap').style.display = notifiedCb.checked?'':'none';
+    document.getElementById('inc_notified_note_wrap').style.display = notifiedCb.checked?'':'none';
+  });
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('saveBtn').addEventListener('click', ()=>{
+    const description = document.getElementById('inc_desc').value.trim();
+    if(!description){ toast('Please describe what happened'); return; }
+    const payload = {
+      date: document.getElementById('inc_date').value,
+      types: getTypes(),
+      description,
+      staffInvolved: getStaff(),
+      severity: document.getElementById('inc_severity').value,
+      followUp: document.getElementById('inc_followup').value.trim(),
+      ownerNotified: notifiedCb.checked,
+      notifiedMethod: notifiedCb.checked ? document.getElementById('inc_notified_method').value : '',
+      notifiedNote: notifiedCb.checked ? document.getElementById('inc_notified_note').value.trim() : '',
+    };
+    if(existing){
+      Object.assign(existing, payload);
+      toast('Incident updated');
+    } else {
+      pet.incidents = pet.incidents || [];
+      pet.incidents.push({ id: uid('incident'), ...payload });
+      toast('Incident logged');
+    }
+    closeModal();
+    if(state.activeTab==='customers') renderPetSubContent(cust, pet); else render();
+    scheduleSync();
+  });
+}
+/* Shop-wide aggregation across every pet — see openIncidentsLogModal. */
+function computeAllIncidents(){
+  const out = [];
+  state.customers.forEach(cust=>cust.pets.forEach(pet=>{
+    (pet.incidents||[]).forEach(inc=>out.push({ inc, cust, pet }));
+  }));
+  out.sort((a,b)=> b.inc.date.localeCompare(a.inc.date));
+  return out;
+}
+function openIncidentsLogModal(){
+  const all = computeAllIncidents();
+  openModal(`
+    <div class="modal-head"><h3>Incidents</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      ${subTabRowHtml('histTabs', [{label:'Change log', active:false, onClick:()=>openChangeLogModal()}, {label:'Cancellations', active:false, onClick:()=>openCancellationsModal()}, {label:'Incidents', active:true}])}
+      <div style="font-size:12px;color:var(--ink-soft);margin-bottom:10px;">Every logged bite, escape, illness, or injury across all pets — newest first. Click a card to open that pet's own Incidents tab.</div>
+      ${all.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);">No incidents logged yet.</div>` : all.map(({inc,cust,pet})=>`
+        <div class="today-card" data-jump-incident="${cust.id}|${pet.id}" style="cursor:pointer;">
+          <div class="today-card-main">
+            <div class="today-card-pet">${fmtDateWithDay(inc.date)} · ${esc(pet.name)} (${esc(cust.name)}) <span class="badge" style="${INCIDENT_SEVERITY_STYLE[inc.severity]||''}">${esc(inc.severity)}</span>${inc.types.map(t=>` <span class="badge badge-past">${esc(t)}</span>`).join('')}</div>
+            <div class="today-card-sub">${esc(inc.description)||'—'}</div>
+            <div class="today-card-sub">${inc.ownerNotified ? `✅ Owner notified${inc.notifiedMethod?` (${esc(inc.notifiedMethod)})`:''}` : '⚠️ Owner not yet notified'}</div>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-primary" id="cancelBtn">Close</button>
+    </div>
+  `);
+  wireSubTabRow('histTabs', [{active:false, onClick:()=>openChangeLogModal()}, {active:false, onClick:()=>openCancellationsModal()}, {active:true}]);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.querySelectorAll('[data-jump-incident]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const [custId, petId] = el.dataset.jumpIncident.split('|');
+      const cust = getCustomer(custId);
+      if(!cust) return;
+      state.activeTab='customers'; state.selectedCustomerId = custId; state.selectedPetId = petId; _subTab='incidents';
+      closeModal();
+      render();
+    });
+  });
+}
+
+
 function wireSubContentEvents(cust, pet){
   const root = document.getElementById('petSubContent');
   if(!root) return;
@@ -4656,6 +4825,21 @@ function wireSubContentEvents(cust, pet){
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       root.querySelector(`[data-photo-input="${el.dataset.groom}"]`).click();
+    });
+  });
+  const newIncidentBtn = root.querySelector('[data-act="new-incident"]');
+  if(newIncidentBtn) newIncidentBtn.addEventListener('click', ()=>openIncidentModal(cust, pet, null));
+  root.querySelectorAll('[data-act="edit-incident"]').forEach(el=>{
+    el.addEventListener('click', ()=>openIncidentModal(cust, pet, (pet.incidents||[]).find(i=>i.id===el.dataset.incident)));
+  });
+  root.querySelectorAll('[data-act="delete-incident"]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      if(confirm('Delete this incident record? This cannot be undone.')){
+        pet.incidents = (pet.incidents||[]).filter(i=>i.id!==el.dataset.incident);
+        scheduleSync();
+        renderPetSubContent(cust, pet);
+        toast('Incident deleted');
+      }
     });
   });
   root.querySelectorAll('[data-photo-input]').forEach(input=>{
@@ -6389,6 +6573,12 @@ function mapPetRow(p, customerId){
     last_vax: p.lastVax || null, last_tick: p.lastTick || null, medical: p.medical || null,
     personality: p.personality || null, special: p.special || null, risk_flags: p.riskFlags || [],
     vet_clinic: p.vetClinic || null, vet_phone: p.vetPhone || null,
+    // Incidents (Pain Point #19) — a plain jsonb column on the pet row,
+    // same treatment as risk_flags: no separate table/version tracking of
+    // its own needed, since it's logged well after the fact rather than
+    // fought over in real time the way a booking slot is, and the whole
+    // pet row is already version-protected.
+    incidents: p.incidents || [],
     // stays now has its own table (18 Aug 2026, Phase 4) — always send empty
     // here so this column stops carrying duplicate/stale data going forward,
     // and so a stays-only edit doesn't spuriously look like a pet-row change
@@ -6461,6 +6651,7 @@ async function loadCustomersPetsFromTables(){
         boardingSize: p.boarding_size, groomingSize: p.grooming_size, spayed: p.spayed,
         lastVax: p.last_vax, lastTick: p.last_tick, medical: p.medical, personality: p.personality, special: p.special,
         riskFlags: p.risk_flags || [], photo: p.photo || null, vetClinic: p.vet_clinic || '', vetPhone: p.vet_phone || '',
+        incidents: p.incidents || [],
         stays: ex ? (ex.stays||[]) : [], groomingHistory: ex ? (ex.groomingHistory||[]) : [],
       };
     }),
