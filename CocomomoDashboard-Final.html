@@ -8128,8 +8128,13 @@ function buildBoardingBlock(stay, sp){
   const chargesTotal = charges.reduce((s,c)=>s+c.amount,0);
   let fbgCount = 0;
   pets.forEach(p=>{
+    // Inclusive of checkOut itself — free groomings are deliberately spaced
+    // so the last one lands exactly on the checkout date (see
+    // computeFreeGroomingDates), so a strict "< checkOut" here was dropping
+    // that appointment entirely — for a 7-13 night stay it's the ONLY FBG,
+    // so the note vanished completely instead of just undercounting.
     fbgCount += (p.groomingHistory||[]).filter(g =>
-      (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<checkOut
+      (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<=checkOut
     ).length;
   });
 
