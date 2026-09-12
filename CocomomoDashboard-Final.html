@@ -817,6 +817,7 @@ function hydrateStateFromRemote(remote, opts){
   state.rates = remote.rates ?? state.rates;
   state.surchargeSM = remote.surchargeSM ?? state.surchargeSM;
   state.surchargeLXL = remote.surchargeLXL ?? state.surchargeLXL;
+  state.surchargeCat = remote.surchargeCat ?? state.surchargeCat;
   state.daycareRates = remote.daycareRates ?? state.daycareRates;
   state.holidays = remote.holidays ?? state.holidays;
   state.closedDates = remote.closedDates ?? state.closedDates;
@@ -971,7 +972,7 @@ async function loadFromCloud(){
 function snapshotShopConfig(){
   return {
     shopName: state.shopName, rates: state.rates,
-    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL,
+    surchargeSM: state.surchargeSM, surchargeLXL: state.surchargeLXL, surchargeCat: state.surchargeCat,
     daycareRates: state.daycareRates,
     holidays: state.holidays, closedDates: state.closedDates, closedWeekdays: state.closedWeekdays,
     waitlist: state.waitlist,
@@ -1247,6 +1248,7 @@ let state = {
   rates: defaultRates(),
   surchargeSM: 30,   // additional pet surcharge — S/M size dog (RM per pet, per night)
   surchargeLXL: 50,  // additional pet surcharge — L/XL/XXL size dog (RM per pet, per night)
+  surchargeCat: 25,  // additional pet surcharge — cat, any size (RM per cat, per night)
   // Daycare — a stay where check-in and check-out fall on the same date is
   // automatically treated as daycare (see isDaycareStay) instead of normal
   // per-night boarding. Flat rate by pet size, editable centrally here and
@@ -1979,8 +1981,7 @@ function computeMonthlyReport(monthStr){
             if(presentToday.length>1){
               presentToday.slice(1).forEach(o=>{
                 const p = findPetById(o.petId);
-                const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
-                surchargeRevenue += isLarge ? state.surchargeLXL : state.surchargeSM;
+                surchargeRevenue += surchargeAmountFor(p);
               });
             }
           }
@@ -2421,6 +2422,16 @@ function openHolidayRateNoticeModal(holidayHits, onContinue){
 }
 function nightsBetween(a,b){ const d1=new Date(a), d2=new Date(b); return Math.max(0, Math.round((d2-d1)/86400000)); }
 function daysBetweenAbs(a,b){ return Math.abs(Math.round((new Date(b) - new Date(a))/86400000)); }
+/* Additional-pet-in-same-room surcharge (per night) — a cat sharing a room
+   pays a flat rate regardless of size; a dog still uses the existing S/M
+   vs L/XL/XXL split. Used everywhere the sharing surcharge is computed
+   (stay cost, reports revenue, nightly breakdowns) so all three stay in
+   sync by construction. */
+function surchargeAmountFor(p){
+  if(p && p.type === 'Cat') return state.surchargeCat;
+  const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
+  return isLarge ? state.surchargeLXL : state.surchargeSM;
+}
 /* Same-week duplicate-booking check ("within 6 days" either direction) — used
    to gently flag possible accidental double-bookings before saving, not to
    block them (owners sometimes genuinely want multiple bookings in a week). */
@@ -4048,8 +4059,7 @@ function computeStayCost(stay){
         // every pet after the first present that night pays a per-night surcharge, based on its own size
         presentToday.slice(1).forEach(o=>{
           const p = findPetById(o.petId);
-          const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
-          const amt = isLarge ? state.surchargeLXL : state.surchargeSM;
+          const amt = surchargeAmountFor(p);
           total += amt;
           surchargeTotal += amt;
           if(!surchargeByPet[o.petId]) surchargeByPet[o.petId] = { nights:0, amount:0 };
@@ -7472,7 +7482,7 @@ async function syncCancellationsToTables(baseline, current){
 function mapShopConfigRow(cfg){
   return {
     id: WORKSPACE_ID, shop_name: cfg.shopName, rates: cfg.rates,
-    surcharge_sm: cfg.surchargeSM, surcharge_lxl: cfg.surchargeLXL,
+    surcharge_sm: cfg.surchargeSM, surcharge_lxl: cfg.surchargeLXL, surcharge_cat: cfg.surchargeCat,
     daycare_rates: cfg.daycareRates,
     holidays: cfg.holidays, closed_dates: cfg.closedDates, closed_weekdays: cfg.closedWeekdays,
     waitlist: cfg.waitlist,
@@ -7492,7 +7502,7 @@ async function migrateShopConfigFromBlobIfNeeded(blobData){
   if(!blobData || blobData.rates == null) return; // nothing to migrate from
   const cfg = {
     shopName: blobData.shopName, rates: blobData.rates,
-    surchargeSM: blobData.surchargeSM, surchargeLXL: blobData.surchargeLXL,
+    surchargeSM: blobData.surchargeSM, surchargeLXL: blobData.surchargeLXL, surchargeCat: blobData.surchargeCat,
     daycareRates: blobData.daycareRates || { SM: 40, LXL: 60 },
     holidays: blobData.holidays, closedDates: blobData.closedDates, closedWeekdays: blobData.closedWeekdays,
     policyText: blobData.policyText, LARGE_normal: blobData.LARGE_normal, LARGE_holiday: blobData.LARGE_holiday,
@@ -7511,6 +7521,7 @@ async function loadShopConfigFromTables(){
     state.rates = row.rates ?? state.rates;
     state.surchargeSM = row.surcharge_sm ?? state.surchargeSM;
     state.surchargeLXL = row.surcharge_lxl ?? state.surchargeLXL;
+    state.surchargeCat = row.surcharge_cat ?? state.surchargeCat;
     state.daycareRates = row.daycare_rates ?? state.daycareRates;
     state.holidays = row.holidays ?? state.holidays;
     state.closedDates = row.closed_dates ?? state.closedDates;
@@ -8258,15 +8269,16 @@ function openEnquiryModal(){
       const surchargeLines = [];
       const surchargeQuoteLines = [];
       extraPets.forEach((p,i)=>{
+        const isCatRoom = roomKind === 'Cat Deluxe';
         const isLarge = ['L','XL','XXL'].includes(p.size);
-        const perNight = isLarge ? state.surchargeLXL : state.surchargeSM;
+        const perNight = isCatRoom ? state.surchargeCat : (isLarge ? state.surchargeLXL : state.surchargeSM);
         const amt = perNight * nights;
         surchargeTotal += amt;
         surchargeLines.push(`<div class="breakdown-line" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
-          <span>Pet ${i+2} sharing (${p.size}) — RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'}</span>
+          <span>Pet ${i+2} sharing${isCatRoom?'':` (${p.size})`} — RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'}</span>
           <span>RM ${fmtRM2(amt)}</span>
         </div>`);
-        surchargeQuoteLines.push(`Pet ${i+2} sharing (${p.size}): RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'} = RM ${fmtRM2(amt)}`);
+        surchargeQuoteLines.push(`Pet ${i+2} sharing${isCatRoom?'':` (${p.size})`}: RM ${fmtRM(perNight)}/night × ${nights} night${nights===1?'':'s'} = RM ${fmtRM2(amt)}`);
       });
 
       const roomGrandTotal = roomTotal + surchargeTotal;
@@ -8468,10 +8480,7 @@ function buildBoardingBlock(stay, sp){
       ? (stay.customRateMode === 'percent' ? standardRate * (1 - Math.min(stay.customRate,100)/100) : stay.customRate)
       : standardRate;
     const extrasTonight = presentIds.slice(1).map(id=>findPetById(id)).filter(Boolean);
-    const surchargeAmt = extrasTonight.reduce((sum,p)=>{
-      const isLarge = ['L','XL','XXL'].includes(p.boardingSize);
-      return sum + (isLarge ? state.surchargeLXL : state.surchargeSM);
-    },0);
+    const surchargeAmt = extrasTonight.reduce((sum,p)=> sum + surchargeAmountFor(p), 0);
     nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight });
   }
 
@@ -9007,6 +9016,9 @@ function openRatesModal(){
         <div class="rate-row"><span class="rname">Additional pet — L/XL/XXL dog (per pet/night)</span>
           <input type="number" id="r_sur_lxl" value="${state.surchargeLXL}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
         </div>
+        <div class="rate-row"><span class="rname">Additional pet — cat, any size (per cat/night)</span>
+          <input type="number" id="r_sur_cat" value="${state.surchargeCat}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
+        </div>
         <div class="rate-row"><span class="rname">Daycare — S/M size (flat, per visit)</span>
           <input type="number" id="r_day_sm" value="${state.daycareRates.SM}" style="width:80px;padding:6px;border:1px solid var(--line);border-radius:6px;">
         </div>
@@ -9096,6 +9108,7 @@ function openRatesModal(){
     state.rates['Cat Deluxe'] = {label:'Cat Deluxe', normal:+document.getElementById('r_cat_n').value, holiday:+document.getElementById('r_cat_h').value};
     state.surchargeSM = +document.getElementById('r_sur_sm').value;
     state.surchargeLXL = +document.getElementById('r_sur_lxl').value;
+    state.surchargeCat = +document.getElementById('r_sur_cat').value;
     state.daycareRates = { SM: +document.getElementById('r_day_sm').value, LXL: +document.getElementById('r_day_lxl').value };
     // read latest field values from DOM before closing
     document.querySelectorAll('#holidayRows [data-hrow]').forEach(row=>{
