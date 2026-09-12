@@ -7971,14 +7971,20 @@ async function openStaffModal(){
   const originalStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
   let workingStaff = (state.staff||[]).map(s=>({...s, leaves:(s.leaves||[]).map(l=>({...l}))}));
 
-  function leaveRowHtml(staffId, l){
+  function leaveRowHtml(staffId, l, idx){
+    const days = (l.start && l.end && l.end >= l.start) ? daysBetweenAbs(l.start, l.end) + 1 : null;
     return `<div class="holiday-row" data-lrow="${l.id}" data-lstaff="${staffId}">
+      <span style="color:var(--ink-soft);font-size:12px;min-width:16px;">${idx+1}.</span>
       <div class="date-overlay-wrap"><input type="date" id="l_start_${l.id}" value="${l.start}" data-l-start><span class="date-overlay-label" id="l_start_${l.id}_wd">${l.start?fmtDateSlashDay(l.start):''}</span></div>
       <span style="color:var(--ink-soft);">to</span>
       <div class="date-overlay-wrap"><input type="date" id="l_end_${l.id}" value="${l.end}" data-l-end><span class="date-overlay-label" id="l_end_${l.id}_wd">${l.end?fmtDateSlashDay(l.end):''}</span></div>
+      <span style="color:var(--ink-soft);font-size:12px;white-space:nowrap;">${days!=null?`(${days} day${days===1?'':'s'})`:''}</span>
       <input placeholder="Note (optional)" value="${esc(l.note||'')}" data-l-note style="flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:7px;">
       <button type="button" class="mini-remove" data-l-remove="${l.id}">✕</button>
     </div>`;
+  }
+  function totalLeaveDays(s){
+    return (s.leaves||[]).reduce((sum,l)=> sum + ((l.start && l.end && l.end >= l.start) ? daysBetweenAbs(l.start, l.end) + 1 : 0), 0);
   }
   function staffRowHtml(s){
     return `<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px;" data-srow="${s.id}">
@@ -7988,8 +7994,9 @@ async function openStaffModal(){
       </div>
       <div style="padding-left:4px;">
         <div style="font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:6px;">Leave dates</div>
-        <div id="leaveRows_${s.id}">${(s.leaves||[]).map(l=>leaveRowHtml(s.id,l)).join('')}</div>
+        <div id="leaveRows_${s.id}">${(s.leaves||[]).map((l,idx)=>leaveRowHtml(s.id,l,idx)).join('')}</div>
         <button type="button" class="add-line" data-add-leave="${s.id}">+ Add leave</button>
+        ${(s.leaves||[]).length>0 ? `<div style="font-size:12px;font-weight:700;margin-top:6px;">Total: ${totalLeaveDays(s)} day${totalLeaveDays(s)===1?'':'s'}</div>` : ''}
       </div>
     </div>`;
   }
@@ -8049,7 +8056,13 @@ async function openStaffModal(){
         refreshStaff();
       });
     });
-    workingStaff.forEach(s=>(s.leaves||[]).forEach(l=>{ wireDateOverlay('l_start_'+l.id); wireDateOverlay('l_end_'+l.id); }));
+    workingStaff.forEach(s=>(s.leaves||[]).forEach(l=>{
+      wireDateOverlay('l_start_'+l.id); wireDateOverlay('l_end_'+l.id);
+      // Recompute this row's day count and the staff's total the moment
+      // either date changes, not just on save.
+      document.getElementById('l_start_'+l.id).addEventListener('change', ()=>{ syncStaffFromDom(); refreshStaff(); });
+      document.getElementById('l_end_'+l.id).addEventListener('change', ()=>{ syncStaffFromDom(); refreshStaff(); });
+    }));
   }
   document.getElementById('addStaffBtn').addEventListener('click', ()=>{
     syncStaffFromDom();
