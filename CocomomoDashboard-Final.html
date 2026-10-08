@@ -1642,7 +1642,22 @@ function fmtDateWithDay(s){ if(!s) return '—'; return `${fmtDate(s)} (${weekda
    mode selector next to the number input. idPrefix must be unique per modal
    instance (e.g. 's_rate' or 'cb_rate'). */
 function normalizeCustomRateMode(m){
-  return (m==='percent' || m==='percentAll') ? m : 'flat';
+  return (m==='percent' || m==='percentAll' || m==='amountOff') ? m : 'flat';
+}
+// True for the two "whole bill" modes, which leave the nightly room rate
+// alone and instead take a discount off the boarding subtotal afterwards.
+function isWholeBillMode(m){ return m==='percentAll' || m==='amountOff'; }
+/* Discount (RM) for a boarding subtotal (room nights + sharing surcharge)
+   under the stay's whole-bill mode: 'percentAll' = X% of it, 'amountOff' =
+   a fixed RM X off it, never more than the subtotal itself. */
+function wholeBillDiscountAmount(stay, subtotal){
+  if(!(subtotal>0)) return 0;
+  const pct = wholeBillDiscountPct(stay);
+  if(pct>0) return Math.round(subtotal * pct) / 100;
+  if(stay && stay.customRateMode==='amountOff' && stay.customRate!=null && +stay.customRate>0){
+    return Math.min(+stay.customRate, subtotal);
+  }
+  return 0;
 }
 /* 'percentAll' = X% off the WHOLE boarding bill — room nights AND the
    additional-pet (sharing) surcharge together — rather than only the room
@@ -1661,6 +1676,7 @@ function customRateFieldHtml(idPrefix, customRate, customRateMode){
       <option value="flat" ${mode==='flat'?'selected':''}>RM/night</option>
       <option value="percent" ${mode==='percent'?'selected':''}>% off room rate</option>
       <option value="percentAll" ${mode==='percentAll'?'selected':''}>% off whole bill</option>
+      <option value="amountOff" ${mode==='amountOff'?'selected':''}>RM off whole bill</option>
     </select>
     <input type="number" step="0.01" min="0" id="${idPrefix}" value="${customRate==null?'':customRate}" placeholder="Leave blank to use standard rate" style="flex:1;">
   </div>`;
@@ -1947,6 +1963,7 @@ function computeMonthlyReport(monthStr){
 
   let roomRevenue = 0, surchargeRevenue = 0, chargesRevenue = 0, groomingChargeRevenue = 0, paymentsReceived = 0, newStaysStarted = 0;
   const occupiedRoomNights = new Set();
+  const wbMultCache = new Map();
 
   state.customers.forEach(cust=>{
     cust.pets.forEach(pet=>{
@@ -1985,8 +2002,14 @@ function computeMonthlyReport(monthStr){
               rate = anyLarge ? LARGE : state.rates[room.type];
             } else rate = state.rates[room.type];
             if(!rate) rate = {normal:0, holiday:0};
-            const wbMult = 1 - wholeBillDiscountPct(stay)/100;
-            const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && stay.customRateMode!=='percentAll';
+            // Whole-bill discount spread evenly across every room-night and
+            // surcharge of the stay (computed once per stay per report run).
+            if(!wbMultCache.has(stay)){
+              const c = computeStayCost(stay);
+              wbMultCache.set(stay, c.boardingSubtotal>0 ? 1 - (c.discountAmount||0)/c.boardingSubtotal : 1);
+            }
+            const wbMult = wbMultCache.get(stay);
+            const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && !isWholeBillMode(stay.customRateMode);
             const standardRate = holiday ? rate.holiday : rate.normal;
             let nightRate = standardRate;
             if(usingCustomRate){
@@ -2691,7 +2714,7 @@ function normalizeStay(s){
     checkedInPets,
     notes: s?.notes || '',
     customRate: (s?.customRate === '' || s?.customRate == null) ? null : +s.customRate,
-    customRateMode: normalizeCustomRateMode(s?.customRateMode), // 'flat' = RM/night override, 'percent' = % off the standard room rate, 'percentAll' = % off whole boarding bill (room + sharing surcharge)
+    customRateMode: normalizeCustomRateMode(s?.customRateMode), // 'flat' = RM/night override, 'percent' = % off the standard room rate, 'percentAll' = % off whole boarding bill (room + sharing surcharge), 'amountOff' = fixed RM off whole boarding bill
     charges: Array.isArray(s?.charges) ? s.charges.map(c=>({ id:c?.id||uid('charge'), category:c?.category||'Others', description:c?.description||'', amount:+c?.amount||0, qty:c?.qty?+c.qty:1, paid: !!c?.paid })) : [],
     pets: Array.isArray(s?.pets) ? s.pets.map(normalizeStayPet) : [],
     dropoff: normalizeClosedAppt(s?.dropoff), // set when check-in lands on a closed day — {time, contactName, contactPhone} for whoever drops the pet off
@@ -3841,7 +3864,7 @@ function stayCardHtml(cust, pet, stay){
           `).join('')}
       </div>
       <div class="cost-box">
-        <div>${cost.isDaycare ? `🐾 Daycare rate${stay.daycareRate!=null?' (custom for this visit)':''}` : `Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}`}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.discountAmount>0?` · <span style="color:#1a7f37;font-weight:600;">−RM ${fmtRM2(cost.discountAmount)} discount (${fmtRM(cost.discountPct)}% off whole boarding bill)</span>`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
+        <div>${cost.isDaycare ? `🐾 Daycare rate${stay.daycareRate!=null?' (custom for this visit)':''}` : `Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}`}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.discountAmount>0?` · <span style="color:#1a7f37;font-weight:600;">−RM ${fmtRM2(cost.discountAmount)} discount (${cost.discountPct>0 ? fmtRM(cost.discountPct)+'% off' : 'RM '+fmtRM2(cost.discountAmount)+' off'} whole boarding bill)</span>`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
         ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${fmtRM2(cost.paidChargesTotal)} of the additional charges above is marked paid.</div>` : ''}
         <div class="cost-total">Estimated total: RM ${fmtRM2(cost.total)}</div>
         ${billing.isMerged ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -4061,7 +4084,7 @@ function computeStayCost(stay){
         rate = state.rates[room.type];
       }
       if(!rate) rate = {normal:0, holiday:0};
-      const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && stay.customRateMode !== 'percentAll';
+      const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && !isWholeBillMode(stay.customRateMode);
       const standardRate = holiday ? rate.holiday : rate.normal;
       let nightRate = standardRate;
       if(usingCustomRate){
@@ -4089,12 +4112,12 @@ function computeStayCost(stay){
   // subtotal (room nights + sharing surcharge), before additional charges.
   const discountPct = wholeBillDiscountPct(stay);
   const boardingSubtotal = total;
-  const discountAmount = discountPct>0 ? Math.round(boardingSubtotal * discountPct) / 100 : 0;
+  const discountAmount = wholeBillDiscountAmount(stay, boardingSubtotal);
   total -= discountAmount;
   const chargesTotal = (stay.charges||[]).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
   const paidChargesTotal = (stay.charges||[]).filter(c=>c.paid).reduce((s,c)=>s+(+c.amount||0)*(+c.qty||1),0);
   total += chargesTotal;
-  return { total, holidayUsed, extraCount, surchargeTotal, surchargeByPet, chargesTotal, paidChargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0 && stay.customRateMode !== 'percentAll', isDaycare:false, boardingSubtotal, discountPct, discountAmount };
+  return { total, holidayUsed, extraCount, surchargeTotal, surchargeByPet, chargesTotal, paidChargesTotal, usingCustomRate: stay.customRate != null && stay.customRate >= 0 && !isWholeBillMode(stay.customRateMode), isDaycare:false, boardingSubtotal, discountPct, discountAmount };
 }
 
 /* A payment can now be linked to more than one stay at once — a "combined
@@ -8496,7 +8519,7 @@ function buildBoardingBlock(stay, sp){
     // mirrors computeStayCost()'s own logic exactly: 'percent' takes X% off
     // whatever the standard rate for that night would have been (holiday or
     // normal), 'flat' replaces it outright with the fixed RM/night figure.
-    const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && stay.customRateMode !== 'percentAll';
+    const usingCustomRate = stay.customRate != null && stay.customRate >= 0 && !isWholeBillMode(stay.customRateMode);
     const baseRate = usingCustomRate
       ? (stay.customRateMode === 'percent' ? standardRate * (1 - Math.min(stay.customRate,100)/100) : stay.customRate)
       : standardRate;
@@ -8609,13 +8632,19 @@ function buildBoardingBlock(stay, sp){
     // Whole-bill discount ('% off whole bill' special-rate mode) — shown as
     // its own step after the normal rate math so the customer sees the
     // full price first, then the discount on room + sharing surcharge.
+    // A fixed "RM off" discount is one amount for the whole stay, so on a
+    // stay with several rooms it's only shown on the FIRST room's message
+    // (otherwise each room's message would take the full RM off again).
     const wbPct = wholeBillDiscountPct(stay);
-    if(wbPct>0 && boardingTotal>0){
+    const isAmountOff = stay.customRateMode==='amountOff';
+    const wbApplies = wbPct>0 || (isAmountOff && sp===stay.pets[0]);
+    const discount = wbApplies ? wholeBillDiscountAmount(stay, boardingTotal) : 0;
+    if(discount>0){
       const before = boardingTotal;
-      const discount = Math.round(before * wbPct) / 100;
       boardingTotal = before - discount;
+      const discLabel = wbPct>0 ? `${fmtRM(wbPct)}% discount` : 'Discount';
       lines.push('');
-      lines.push(`RM ${fmtRM(before)} - RM ${fmtRM(discount)} (${fmtRM(wbPct)}% discount) = RM ${fmtRM(boardingTotal)}`);
+      lines.push(`RM ${fmtRM(before)} - RM ${fmtRM(discount)} (${discLabel}) = RM ${fmtRM(boardingTotal)}`);
       lastLineIsCombine = true;
     }
   }
