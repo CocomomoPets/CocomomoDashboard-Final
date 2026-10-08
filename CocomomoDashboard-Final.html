@@ -95,6 +95,13 @@
   .sync-status.sync-error{ color:var(--danger); border-color:#EBD3CE; }
   .sync-status.sync-off{ cursor:pointer; }
   .sync-status.sync-off:hover{ border-color:var(--teal); color:var(--teal-dark); }
+  /* Offline read-only fallback banner (see OFFLINE COPY section in the script) */
+  #offlineBanner{ position:sticky; top:0; z-index:900; display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:10px 14px; background:#FFF4E5; border-bottom:2px solid #E8A33D; color:#6B3E00; font-size:13px; line-height:1.4; }
+  #offlineBanner.ob-none{ background:#FDECEA; border-bottom-color:#C9473A; color:#7A1F16; }
+  #offlineBanner.ob-back{ background:#E6F4EA; border-bottom-color:#2E8B57; color:#1E5E3A; }
+  #offlineBanner .ob-text{ flex:1 1 320px; }
+  #offlineBanner .ob-text b{ font-weight:800; }
+  #offlineBanner .ob-actions{ display:flex; flex-wrap:wrap; gap:6px; }
   @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
 
   .lock-screen{
@@ -513,10 +520,11 @@
     <input type="password" id="loginPassword" autocomplete="current-password" placeholder="Password" style="text-align:left;letter-spacing:normal;">
     <div id="loginError" class="lock-error hidden">Sign-in failed — check email/password</div>
     <button class="btn btn-primary" id="loginSubmit">Sign in</button>
-    <button class="btn btn-ghost" id="loginSkip" style="width:100%;justify-content:center;margin-top:8px;">Continue without cloud sync</button>
+    <button class="btn btn-ghost" id="loginSkip" style="width:100%;justify-content:center;margin-top:8px;">Can't sign in? View offline copy (view only)</button>
   </div>
 </div>
 <div class="app">
+  <div id="offlineBanner" class="hidden"></div>
 
   <div class="topbar">
     <div class="brand">
@@ -604,6 +612,18 @@ if (cloudEnabled) {
   }
 }
 let _syncTimer = null;
+// Offline read-only fallback — see the OFFLINE COPY section near initApp()
+let _offlineMode = null;          // null = normal; else { savedAt, source:'device'|'file', reason }
+let _offlineSnapshot = null;      // the parsed snapshot currently shown (re-applied to undo blocked edits)
+let _suppressOfflineAlert = false;
+let _loadGen = 0;
+let _loadProblems = [];
+let _offlineSnapTimer = null;
+let _offlineHealthTimer = null;
+let _offlineBlockPending = false;
+const LOAD_WATCHDOG_MS = 30000;
+const CRITICAL_LOAD_PARTS = ['customers','pets','stays','grooming'];
+const OFFLINE_DB = 'cocomomo-offline-copy', OFFLINE_STORE = 'snap', OFFLINE_KEY = 'latest';
 let _lastSyncedJSON = null;
 let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
 let _customersBaseline = []; // last-known state of state.customers as reflected in the customers/pets tables — used to diff on save
@@ -629,6 +649,7 @@ let _lastSyncedShopConfigVersion = null; // pain point #5, phase 2 (29 Aug 2026)
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
 function setSyncStatus(mode, text){
+  if(mode==='ok' && !_offlineMode && typeof queueOfflineSnapshot==='function') queueOfflineSnapshot();
   const el = document.getElementById('syncStatus');
   if(!el) return;
   el.className = 'sync-status sync-' + mode;
@@ -864,6 +885,24 @@ function hydrateStateFromRemote(remote, opts){
 async function loadFromCloud(){
   if(!cloudEnabled){ setSyncStatus('off','Cloud sync not set up'); return; }
   setSyncStatus('saving','Loading from cloud…');
+  // Offline-fallback bookkeeping: each load attempt gets a generation number
+  // so a load that hangs past the watchdog (Supabase outage — the individual
+  // table loads have no timeout of their own) can't later stomp on the
+  // offline copy we switched to. _loadProblems collects table loads that
+  // failed (they only toast and carry on, so without this a half-failed
+  // load used to show "Synced" with empty schedules).
+  const myGen = ++_loadGen;
+  _loadProblems = [];
+  _suppressOfflineAlert = true;
+  const watchdog = setTimeout(()=>{
+    if(myGen !== _loadGen) return;
+    _loadGen++; // abandon the hung attempt
+    _suppressOfflineAlert = false;
+    _cloudLoaded = true;
+    _lastSyncError = 'Cloud took too long to load (over 30 seconds) — Supabase may be down.';
+    setSyncStatus('error','Cloud not responding — tap to retry');
+    enterOfflineMode('Cloud took too long to respond');
+  }, LOAD_WATCHDOG_MS);
   try{
     const result = await withTimeout(
       sb.from(SUPABASE_TABLE).select('data').eq('id', WORKSPACE_ID).maybeSingle(),
@@ -927,18 +966,31 @@ async function loadFromCloud(){
       // complete) copy, since the earlier pass may have been working off
       // an incomplete/stale blob copy that didn't have this customer yet.
       applySavedNavSelection();
+      if(myGen !== _loadGen) return; // watchdog already gave up on this attempt
+      const critical = _loadProblems.filter(x=>CRITICAL_LOAD_PARTS.includes(x));
+      if(critical.length) throw new Error('Some data failed to load (' + critical.join(', ') + ')');
+      exitOfflineMode();
       setSyncStatus('ok','Synced');
     } else {
       // nothing saved yet — push current (seed) state as the first save
       await saveToCloudNow();
     }
   } catch(err){
+    if(myGen !== _loadGen) return; // watchdog already switched to the offline copy
     const msg = describeSupabaseError(err);
     console.error('Supabase load failed:', msg, err);
     _lastSyncError = msg;
     setSyncStatus('error','Cloud load failed — tap for details');
     toast('Cloud load failed: ' + msg);
+    clearTimeout(watchdog);
+    _suppressOfflineAlert = false;
+    _cloudLoaded = true;
+    enterOfflineMode('Cloud load failed');
+    return;
   }
+  clearTimeout(watchdog);
+  if(myGen !== _loadGen) return;
+  _suppressOfflineAlert = false;
   _cloudLoaded = true;
   render();
   checkSignedAgreements();
@@ -997,6 +1049,7 @@ const SAVE_RETRY_DELAYS_MS = [2000, 5000, 10000];
 let _saveInFlight = false;
 
 async function saveToCloudNow(){
+  if(_offlineMode) return; // never push the offline copy (or anything built on it) to the cloud
   if(!cloudEnabled) return;
   if(_saveInFlight){
     // Another save is already mid-retry — don't stack a parallel one, just
@@ -1158,6 +1211,9 @@ function editingBadgeHtml(){ return ''; }
 const _activeEditors = {};
 
 function scheduleSync(){
+  // Offline copy is VIEW ONLY — any edit is undone straight away (see
+  // offlineEditBlocked) so nothing typed during an outage is silently lost.
+  if(_offlineMode){ if(!_suppressOfflineAlert) offlineEditBlocked(); return; }
   if(!cloudEnabled || !_cloudLoaded) return;
   setSyncStatus('saving','Saving…');
   clearTimeout(_syncTimer);
@@ -6754,9 +6810,9 @@ async function migrateStaffFromBlobIfNeeded(blobStaff){
    else in the app needs to change. */
 async function loadStaffFromTables(){
   const { data: staffRows, error: e1 } = await sb.from('staff').select('*').order('created_at');
-  if(e1){ console.error('Staff load failed:', e1); toast('Staff data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
+  if(e1){ console.error('Staff load failed:', e1); _loadProblems.push('staff'); toast('Staff data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
   const { data: leaveRows, error: e2 } = await sb.from('staff_leaves').select('*').order('start_date');
-  if(e2){ console.error('Staff leaves load failed:', e2); toast('Staff leave data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  if(e2){ console.error('Staff leaves load failed:', e2); _loadProblems.push('staff'); toast('Staff leave data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
   state.staff = (staffRows||[]).map(s=>({
     id: s.id, name: s.name, version: s.version,
     leaves: (leaveRows||[]).filter(l=>l.staff_id===s.id).map(l=>({ id:l.id, start:l.start_date, end:l.end_date, note:l.note||'', version:l.version })),
@@ -6923,9 +6979,9 @@ async function migrateCustomersPetsFromBlobIfNeeded(blobCustomers){
    good — this function is now safe to call by itself, from anywhere. */
 async function loadCustomersPetsFromTables(){
   const { data: custRows, error: e1 } = await sb.from('customers').select('*').order('created_at');
-  if(e1){ console.error('Customers load failed:', e1); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
+  if(e1){ console.error('Customers load failed:', e1); _loadProblems.push('customers'); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
   const { data: petRows, error: e2 } = await sb.from('pets').select('*').order('created_at');
-  if(e2){ console.error('Pets load failed:', e2); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
+  if(e2){ console.error('Pets load failed:', e2); _loadProblems.push('pets'); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
   const existingCustById = new Map(state.customers.map(c=>[c.id, c]));
   const existingPetById = new Map();
   state.customers.forEach(c=>(c.pets||[]).forEach(p=>existingPetById.set(p.id, p)));
@@ -7116,7 +7172,7 @@ async function migrateStaysFromPetsColumnIfNeeded(customers){
    `_staysBaseline` to match. */
 async function loadStaysFromTables(){
   const { data: stayRows, error } = await sb.from('stays').select('*').order('created_at');
-  if(error){ console.error('Stays load failed:', error); toast('Stay/booking data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Stays load failed:', error); _loadProblems.push('stays'); toast('Stay/booking data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const stayById = {};
   (stayRows||[]).forEach(s=>{
     const stay = normalizeStay({
@@ -7222,7 +7278,7 @@ async function migrateGroomsFromPetsColumnIfNeeded(customers){
    normalizing each through normalizeGroom. Also resets `_groomsBaseline`. */
 async function loadGroomsFromTables(){
   const { data: rows, error } = await sb.from('grooming_appointments').select('*').order('created_at');
-  if(error){ console.error('Grooming load failed:', error); toast('Grooming data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Grooming load failed:', error); _loadProblems.push('grooming'); toast('Grooming data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const byPet = {};
   (rows||[]).forEach(g=>{
     const groom = normalizeGroom({
@@ -7326,7 +7382,7 @@ async function migratePaymentsFromCustomersColumnIfNeeded(customers){
    through normalizePayment. Also resets `_paymentsBaseline`. */
 async function loadPaymentsFromTables(){
   const { data: rows, error } = await sb.from('payments').select('*').order('created_at');
-  if(error){ console.error('Payments load failed:', error); toast('Payment data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Payments load failed:', error); _loadProblems.push('payments'); toast('Payment data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const byCust = {};
   (rows||[]).forEach(p=>{
     const pmt = normalizePayment({
@@ -7410,7 +7466,7 @@ async function migrateChangeLogFromBlobIfNeeded(blobChangeLog){
    `_changeLogBaseline`. */
 async function loadChangeLogFromTables(){
   const { data: rows, error } = await sb.from('change_log').select('*').order('ts', {ascending:false}).limit(300);
-  if(error){ console.error('Change log load failed:', error); toast('Change log failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Change log load failed:', error); _loadProblems.push('changeLog'); toast('Change log failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   state.changeLog = (rows||[]).map(r=>({
     id: r.id, ts: r.ts, entityType: r.entity_type, ref: r.ref || {}, entityLabel: r.entity_label || '',
     field: r.field, fieldLabel: r.field_label || r.field, oldValue: r.old_value, newValue: r.new_value, undone: !!r.undone,
@@ -7478,7 +7534,7 @@ async function migrateCancellationsFromBlobIfNeeded(blobCancellations){
    `_cancellationsBaseline`. */
 async function loadCancellationsFromTables(){
   const { data: rows, error } = await sb.from('cancellations').select('*').order('cancelled_at', {ascending:false});
-  if(error){ console.error('Cancellations load failed:', error); toast('Cancellations failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Cancellations load failed:', error); _loadProblems.push('cancellations'); toast('Cancellations failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   state.cancellations = (rows||[]).map(r=>({
     id: r.id, type: r.type, reason: r.reason || '', note: r.note || '', cancelledAt: r.cancelled_at,
     customerId: r.customer_id || null, customerName: r.customer_name || '', petName: r.pet_name || '', summary: r.summary || '',
@@ -7559,7 +7615,7 @@ async function migrateShopConfigFromBlobIfNeeded(blobData){
    if a field actually changed from here. */
 async function loadShopConfigFromTables(){
   const { data: row, error } = await sb.from('shop_config').select('*').eq('id', WORKSPACE_ID).maybeSingle();
-  if(error){ console.error('Shop config load failed:', error); toast('Shop settings failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
+  if(error){ console.error('Shop config load failed:', error); _loadProblems.push('shopConfig'); toast('Shop settings failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   if(row){
     state.shopName = row.shop_name ?? state.shopName;
     state.rates = row.rates ?? state.rates;
@@ -10278,11 +10334,221 @@ document.getElementById('belongingFileInput').addEventListener('change', async (
   }catch(err){ console.error(err); toast('Could not read that image'); }
 });
 
+/* =========================================================
+   OFFLINE COPY (read-only fallback for Supabase outages)
+   ---------------------------------------------------------
+   After every successful cloud load/save, this device quietly keeps its
+   own copy of the data (IndexedDB, photos and IC/passport numbers left
+   out). If the cloud can't be reached — outage, login fails, load hangs
+   or half-fails — the dashboard opens that copy instead of an empty
+   screen, with a banner saying how old it is. It is VIEW ONLY: any edit
+   is undone immediately with a warning, so nothing entered during an
+   outage is silently lost or later pushed over newer cloud data. A
+   downloaded backup .json can also be opened the same way (for a device
+   that has never loaded the dashboard before). The banner checks every
+   minute whether the cloud is back and offers a one-tap reload.
+   ========================================================= */
+// (state variables for this section are declared near the top, next to _syncTimer)
+
+function offlineDb(){
+  return new Promise((resolve, reject)=>{
+    try{
+      const req = indexedDB.open(OFFLINE_DB, 1);
+      req.onupgradeneeded = ()=>{ req.result.createObjectStore(OFFLINE_STORE); };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror = ()=>reject(req.error);
+    }catch(err){ reject(err); }
+  });
+}
+async function offlineDbPut(value){
+  const db = await offlineDb();
+  await new Promise((resolve, reject)=>{
+    const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+    tx.objectStore(OFFLINE_STORE).put(value, OFFLINE_KEY);
+    tx.oncomplete = ()=>resolve(); tx.onerror = ()=>reject(tx.error);
+  });
+  db.close();
+}
+async function offlineDbGet(){
+  const db = await offlineDb();
+  const val = await new Promise((resolve, reject)=>{
+    const tx = db.transaction(OFFLINE_STORE, 'readonly');
+    const req = tx.objectStore(OFFLINE_STORE).get(OFFLINE_KEY);
+    req.onsuccess = ()=>resolve(req.result || null); req.onerror = ()=>reject(req.error);
+  });
+  db.close();
+  return val;
+}
+// Photos (base64 images) are dropped to keep the copy small; IC/passport
+// numbers are dropped since they aren't needed to run the day.
+function offlineSnapshotJSON(){
+  const snap = { ...snapshotForBackup(), changeLog: [], cancellations: [] };
+  return JSON.stringify(snap, (k, v)=>{
+    if(k === 'photos' && Array.isArray(v)) return [];
+    if(k === 'icPassport') return '';
+    if(typeof v === 'string' && v.startsWith('data:') && v.length > 200) return null;
+    return v;
+  });
+}
+function queueOfflineSnapshot(){
+  if(_offlineMode) return;
+  clearTimeout(_offlineSnapTimer);
+  _offlineSnapTimer = setTimeout(async ()=>{
+    if(_offlineMode || !_cloudLoaded || !(state.customers||[]).length) return;
+    try{ await offlineDbPut({ savedAt: new Date().toISOString(), json: offlineSnapshotJSON() }); }
+    catch(err){ console.warn('Could not save offline copy on this device:', err); }
+  }, 3000);
+}
+
+function applyOfflineSnapshot(snap, keepSelection){
+  const prev = _suppressOfflineAlert;
+  _suppressOfflineAlert = true; // hydrate's one-time fixups call scheduleSync — not a user edit
+  try{
+    hydrateStateFromRemote(JSON.parse(JSON.stringify(snap)), { resetSelection: !keepSelection });
+    state.staff = snap.staff || state.staff;
+    state.waitlist = snap.waitlist || state.waitlist || [];
+  } finally { _suppressOfflineAlert = prev; }
+}
+
+function fmtOfflineWhen(iso){
+  try{
+    const d = new Date(iso);
+    return d.toLocaleString('en-GB', { weekday:'short', day:'numeric', month:'short', hour:'numeric', minute:'2-digit', hour12:true, timeZone:'Asia/Kuala_Lumpur' });
+  }catch{ return iso; }
+}
+
+async function enterOfflineMode(reason){
+  let stored = null;
+  try{ stored = await offlineDbGet(); }catch(err){ console.warn('Offline copy unavailable:', err); }
+  if(stored && stored.json){
+    let snap = null;
+    try{ snap = JSON.parse(stored.json); }catch(err){ console.error('Offline copy unreadable:', err); }
+    if(snap){
+      _offlineMode = { savedAt: stored.savedAt, source:'device', reason };
+      _offlineSnapshot = snap;
+      cloudEnabled = false;
+      applyOfflineSnapshot(snap, false);
+      setSyncStatus('error','Offline · view only');
+      if(!_lastSyncError) _lastSyncError = reason;
+      render();
+      renderOfflineBanner();
+      startOfflineHealthCheck();
+      return true;
+    }
+  }
+  // Nothing saved on this device yet — say so clearly, offer a backup file.
+  _offlineMode = null;
+  renderOfflineBanner({ none:true, reason });
+  startOfflineHealthCheck();
+  return false;
+}
+function exitOfflineMode(){
+  const wasOffline = !!_offlineMode || !document.getElementById('offlineBanner').classList.contains('hidden');
+  _offlineMode = null;
+  _offlineSnapshot = null;
+  clearInterval(_offlineHealthTimer); _offlineHealthTimer = null;
+  const b = document.getElementById('offlineBanner');
+  b.className = 'hidden'; b.innerHTML = '';
+  if(wasOffline) toast('Cloud is back — showing live data again');
+}
+
+function renderOfflineBanner(opts){
+  opts = opts || {};
+  const b = document.getElementById('offlineBanner');
+  if(opts.back){
+    b.className = 'ob-back';
+    b.innerHTML = `<div class="ob-text"><b>✅ The cloud is reachable again.</b> Reload to get live data and start saving again.</div>
+      <div class="ob-actions"><button class="btn btn-primary btn-sm" id="obReload">Reload now</button></div>`;
+    b.querySelector('#obReload').onclick = ()=>location.reload();
+    return;
+  }
+  if(opts.none){
+    b.className = 'ob-none';
+    b.innerHTML = `<div class="ob-text"><b>⚠️ Can't reach the cloud</b> (${esc(opts.reason||'')}) and this device has no offline copy saved yet. Open a downloaded backup file to view the schedule, or retry.</div>
+      <div class="ob-actions">
+        <button class="btn btn-sm" id="obRetry">Retry connection</button>
+        <button class="btn btn-sm" id="obOpenFile">Open backup file…</button>
+      </div>`;
+  } else {
+    const m = _offlineMode;
+    const src = m.source==='file' ? `backup file (${fmtOfflineWhen(m.savedAt)})` : `this device's copy from <b>${fmtOfflineWhen(m.savedAt)}</b>`;
+    b.className = '';
+    b.innerHTML = `<div class="ob-text"><b>⚠️ OFFLINE COPY — VIEW ONLY.</b> The cloud can't be reached right now, so you're seeing ${src}. Anything booked or changed after that time isn't shown. Changes can't be saved — note new bookings/changes on paper and enter them once the cloud is back.</div>
+      <div class="ob-actions">
+        <button class="btn btn-sm" id="obRetry">Retry connection</button>
+        <button class="btn btn-sm" id="obPrint">🖨️ Print today</button>
+        <button class="btn btn-sm" id="obOpenFile">Open backup file…</button>
+      </div>`;
+    b.querySelector('#obPrint').onclick = ()=>{ try{ printTodaySchedule(); }catch(err){ console.error(err); toast('Could not print'); } };
+  }
+  b.querySelector('#obRetry').onclick = ()=>location.reload();
+  b.querySelector('#obOpenFile').onclick = openOfflineBackupFile;
+}
+
+function openOfflineBackupFile(){
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json';
+  input.onchange = async ()=>{
+    const file = input.files && input.files[0];
+    if(!file) return;
+    try{
+      const snap = JSON.parse(await file.text());
+      if(!snap || !Array.isArray(snap.customers)) throw new Error('not a Cocomomo backup');
+      _offlineMode = { savedAt: new Date(file.lastModified).toISOString(), source:'file', reason:'Opened backup file' };
+      _offlineSnapshot = snap;
+      cloudEnabled = false;
+      _cloudLoaded = true;
+      applyOfflineSnapshot(snap, false);
+      setSyncStatus('error','Backup · view only');
+      render();
+      renderOfflineBanner();
+      startOfflineHealthCheck();
+      toast('Backup file opened — view only');
+    }catch(err){
+      console.error(err);
+      alert('That file could not be opened as a Cocomomo backup (' + (err.message||err) + ').');
+    }
+  };
+  input.click();
+}
+
+// Any edit while viewing the offline copy: undo it and say why.
+function offlineEditBlocked(){
+  if(_offlineBlockPending) return;
+  _offlineBlockPending = true;
+  setTimeout(()=>{
+    _offlineBlockPending = false;
+    try{ closeModal(); }catch{}
+    if(_offlineSnapshot) applyOfflineSnapshot(_offlineSnapshot, true);
+    render();
+    alert('Offline copy — view only.\n\nThat change was NOT saved and has been undone, because the cloud can\'t be reached right now.\n\nPlease write it down and enter it again once the cloud is back.');
+  }, 0);
+}
+
+// Every minute while offline, quietly check whether Supabase answers again.
+function startOfflineHealthCheck(){
+  if(_offlineHealthTimer || !sb) return;
+  _offlineHealthTimer = setInterval(async ()=>{
+    try{
+      const res = await withTimeout(sb.from(SUPABASE_TABLE).select('id').eq('id', WORKSPACE_ID).limit(1), 8000, 'timeout');
+      if(res !== 'timeout' && !res.error){
+        clearInterval(_offlineHealthTimer); _offlineHealthTimer = null;
+        renderOfflineBanner({ back:true });
+      }
+    }catch{ /* still down */ }
+  }, 60000);
+}
+
 async function initApp(){
   render();
   if(cloudEnabled){
     const loggedIn = await ensureLogin();
     if(loggedIn) await loadFromCloud();
+    else { _cloudLoaded = true; enterOfflineMode('Not signed in to the cloud'); }
+  } else if(SUPABASE_URL && SUPABASE_ANON_KEY){
+    // Configured, but the Supabase library itself failed to load
+    _cloudLoaded = true;
+    enterOfflineMode('Cloud connection could not start');
   }
 }
 
