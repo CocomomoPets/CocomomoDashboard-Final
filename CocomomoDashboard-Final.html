@@ -622,7 +622,7 @@ let _offlineSnapTimer = null;
 let _offlineHealthTimer = null;
 let _offlineBlockPending = false;
 const LOAD_WATCHDOG_MS = 30000;
-const CRITICAL_LOAD_PARTS = ['customers','pets','stays','grooming'];
+const CRITICAL_LOAD_PARTS = ['customers','pets','stays','grooming','shopConfig'];
 const OFFLINE_DB = 'cocomomo-offline-copy', OFFLINE_STORE = 'snap', OFFLINE_KEY = 'latest';
 let _lastSyncedJSON = null;
 let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
@@ -645,6 +645,12 @@ let _lastSyncedCancellationsJSON = null; // 27 Aug 2026 migration (Phase 7) — 
 let _cancellationsBaseline = []; // last-known state.cancellations as reflected in the cancellations table
 let _cancellationsVersions = new Map(); // pain point #5, phase 7 — id -> version this device last saw for each cancellation entry
 let _lastSyncedShopConfigJSON = null; // 27 Aug 2026 migration (Phase 8) — shop config tracked separately too, see the shop_config unit in saveToCloudNow()
+// 9 Oct 2026 fix: true only once shop_config has actually been read from
+// the cloud this session. Until then the shop settings in memory are just
+// the app's built-in defaults, and saving them would overwrite the real
+// rates/holidays/closed dates — the cause of holiday periods "disappearing"
+// after a load hiccup (the first edit afterwards wiped them).
+let _shopConfigLoaded = false;
 let _lastSyncedShopConfigVersion = null; // pain point #5, phase 2 (29 Aug 2026) — the version this device last saw for the singleton shop_config row; null means no row has been loaded yet (fresh workspace), so the next save is a plain insert with nothing to conflict against
 let _cloudLoaded = !cloudEnabled; // if cloud isn't configured, treat as "loaded" so app works locally right away
 
@@ -1097,7 +1103,7 @@ async function saveToCloudNow(){
     { changed: cancellationsJson !== _lastSyncedCancellationsJSON,
       run: ()=>syncCancellationsToTables(_cancellationsBaseline, state.cancellations||[]),
       commit: ()=>{ _lastSyncedCancellationsJSON = cancellationsJson; _cancellationsBaseline = JSON.parse(cancellationsJson); } },
-    { changed: shopConfigJson !== _lastSyncedShopConfigJSON,
+    { changed: _shopConfigLoaded && shopConfigJson !== _lastSyncedShopConfigJSON,
       run: async ()=>{
         const payload = mapShopConfigRow(JSON.parse(shopConfigJson));
         if(_lastSyncedShopConfigVersion == null){
@@ -1311,10 +1317,7 @@ let state = {
   // always overridable per-stay (stay.daycareRate) since a customer might
   // want a different/upgraded room for the day.
   daycareRates: { SM: 40, LXL: 60 },
-  holidays: [
-    {id:'h1', name:'Hari Raya', start:'2026-08-10', end:'2026-08-13'},
-    {id:'h2', name:'School holidays', start:'2026-08-20', end:'2026-08-30'},
-  ],
+  holidays: [], // real holiday periods always come from the cloud (shop_config) — no sample defaults, so a failed load can never pass them off as real
   closedDates: [], // {id, name, start, end} — days the shop is fully closed: no grooming appointments taken, and any boarding check-in/out landing here needs a scheduled drop-off/pick-up appointment instead
   closedWeekdays: [2], // weekday indices (0=Sun..6=Sat) that are closed every week — defaults to Tuesday per 8 Aug 2026 request; same closed-day rules apply as closedDates
   // Waitlist (Pain Point #17) — {id, customerId, petId, desiredCheckIn,
@@ -7633,6 +7636,7 @@ async function loadShopConfigFromTables(){
   }
   _lastSyncedShopConfigVersion = row ? row.version : null;
   _lastSyncedShopConfigJSON = JSON.stringify(snapshotShopConfig());
+  _shopConfigLoaded = true;
 }
 /* =========================================================
    ARCHIVING (27 Aug 2026, migration Phase 9 — the final piece of pain
@@ -9108,6 +9112,10 @@ function openCombineWhatsAppModal(custId){
 }
 
 function openRatesModal(){
+  if(cloudEnabled && !_shopConfigLoaded){
+    alert('Shop settings (rates, holidays, closed dates) haven\'t loaded from the cloud yet, so they can\'t be edited right now — otherwise the real settings could be overwritten.\n\nPlease reload the page and try again.');
+    return;
+  }
   openModal(`
     <div class="modal-head"><h3>Rates &amp; holidays</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
