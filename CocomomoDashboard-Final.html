@@ -5440,6 +5440,13 @@ function openCustomerModal(existing){
 }
 document.getElementById('addCustomerBtn').addEventListener('click', ()=>openCustomerModal(null));
 
+/* Order for stay pickers (Combine message, Combine bill, payment): Active
+   stays on top, soonest first → furthest future last; Past stays below,
+   newest first → oldest last. */
+function stayPickerOrder(a, b){
+  if(a.status!==b.status) return a.status==='Active' ? -1 : 1;
+  return a.status==='Active' ? a.checkIn.localeCompare(b.checkIn) : b.checkIn.localeCompare(a.checkIn);
+}
 /* ---- Payment modal ---- */
 function allCustomerStays(cust){
   const out = [];
@@ -5451,7 +5458,7 @@ function allCustomerStays(cust){
 function openPaymentModal(cust, existing, presetStayId){
   const presetIds = Array.isArray(presetStayId) ? presetStayId : (presetStayId ? [presetStayId] : []);
   const p = existing || { id:'', type:'Deposit', amount:'', date: todayStr(), receiptNo:'', stayIds: presetIds };
-  const stays = allCustomerStays(cust);
+  const stays = allCustomerStays(cust).sort((x,y)=>stayPickerOrder(x.stay, y.stay));
   // Fully paid stays get a green tick. Past + fully paid ones are folded
   // under "Show history" (unless this payment is already linked to them),
   // same as on the stay cards; unpaid past stays stay in the main list.
@@ -9293,10 +9300,7 @@ function openCombineBillModal(stayId){
   if(!ownerCust) return;
   const currentGroupId = stay.billingGroupId || null;
   const entries = allCustomerStays(ownerCust); // [{pet, stay}]
-  const sorted = entries.slice().sort((a,b)=>{
-    if(a.stay.status!==b.stay.status) return a.stay.status==='Active' ? -1 : 1;
-    return a.stay.checkIn.localeCompare(b.stay.checkIn);
-  });
+  const sorted = entries.slice().sort((a,b)=>stayPickerOrder(a.stay, b.stay));
 
   function rowHtml(entry, idx){
     const { pet, stay: st } = entry;
@@ -9346,10 +9350,7 @@ function openCombineWhatsAppModal(custId){
   const entries = allOwnStayRoomBlocksForCustomer(cust);
   if(entries.length===0){ toast('No stays on file for this customer yet'); return; }
   // Active/upcoming first, defaulted checked; Past shown further down, unchecked.
-  const sorted = entries.slice().sort((a,b)=>{
-    if(a.stay.status!==b.stay.status) return a.stay.status==='Active' ? -1 : 1;
-    return a.stay.checkIn.localeCompare(b.stay.checkIn);
-  });
+  const sorted = entries.slice().sort((a,b)=>stayPickerOrder(a.stay, b.stay));
 
   // Past stays are folded behind a "Show history" toggle so the picker only
   // shows what's current; they're still there (unticked) if ever needed.
