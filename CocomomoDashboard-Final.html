@@ -5452,6 +5452,13 @@ function openPaymentModal(cust, existing, presetStayId){
   const presetIds = Array.isArray(presetStayId) ? presetStayId : (presetStayId ? [presetStayId] : []);
   const p = existing || { id:'', type:'Deposit', amount:'', date: todayStr(), receiptNo:'', stayIds: presetIds };
   const stays = allCustomerStays(cust);
+  // Fully paid stays get a green tick. Past + fully paid ones are folded
+  // under "Show history" (unless this payment is already linked to them),
+  // same as on the stay cards; unpaid past stays stay in the main list.
+  const stayPaid = stay => computeStayBilling(cust, stay).balance <= 0.004;
+  const stayRow = ({pet,stay})=>`<label class="check-pill"><input type="checkbox" value="${stay.id}" data-pay-stay-check ${p.stayIds.includes(stay.id)?'checked':''}> ${stayPaid(stay)?'<span style="color:#1a7f37;font-weight:700;" title="Fully paid">✓</span> ':''}${petLabel(pet)} · ${fmtDate(stay.checkIn)} → ${fmtDate(stay.checkOut)} (${stay.status}${stayPaid(stay)?' · paid':''})</label>`;
+  const payHist = stays.filter(x=>x.stay.status==='Past' && stayPaid(x.stay) && !p.stayIds.includes(x.stay.id));
+  const payMain = stays.filter(x=>!payHist.includes(x));
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit payment':'Add payment'}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
@@ -5464,7 +5471,11 @@ function openPaymentModal(cust, existing, presetStayId){
         <div class="field span3">
           <label>Which stay(s) is this for? <span style="font-weight:500;color:var(--ink-soft);">— tick just one to keep it separate, or tick several if the customer is paying one bill for multiple bookings</span></label>
           <div class="checks" id="pay_stayChecks">
-            ${stays.map(({pet,stay})=>`<label class="check-pill"><input type="checkbox" value="${stay.id}" data-pay-stay-check ${p.stayIds.includes(stay.id)?'checked':''}> ${petLabel(pet)} · ${fmtDate(stay.checkIn)} → ${fmtDate(stay.checkOut)} (${stay.status})</label>`).join('') || `<div style="font-size:12px;color:var(--ink-soft);">This customer has no boarding stays yet.</div>`}
+            ${stays.length===0 ? `<div style="font-size:12px;color:var(--ink-soft);">This customer has no boarding stays yet.</div>` : payMain.map(stayRow).join('')}
+            ${payHist.length ? `<div style="width:100%;">
+              <button type="button" class="btn btn-sm" id="payHistToggle">Show history — fully paid (${payHist.length}) ▼</button>
+              <div id="payHistRows" class="checks" style="display:none;margin-top:8px;">${payHist.map(stayRow).join('')}</div>
+            </div>` : ''}
           </div>
           <div id="pay_staySummary" style="margin-top:8px;font-size:12px;color:var(--ink-soft);"></div>
         </div>
@@ -5496,6 +5507,13 @@ function openPaymentModal(cust, existing, presetStayId){
       : `This stay's total cost: RM ${combinedCost.toFixed(2)}, already paid RM ${alreadyPaid.toFixed(2)} before this payment.`;
   }
   document.querySelectorAll('#pay_stayChecks input[data-pay-stay-check]').forEach(cb=>cb.addEventListener('change', updateStaySummary));
+  const payHistToggle = document.getElementById('payHistToggle');
+  if(payHistToggle) payHistToggle.addEventListener('click', ()=>{
+    const box = document.getElementById('payHistRows');
+    const open = box.style.display === 'none';
+    box.style.display = open ? '' : 'none';
+    payHistToggle.textContent = open ? 'Hide history ▲' : `Show history — fully paid (${payHist.length}) ▼`;
+  });
   updateStaySummary();
   document.getElementById('pay_type').addEventListener('change', (e)=>{
     document.getElementById('pay_receipt_field').classList.toggle('hidden', e.target.value !== 'Full payment');
