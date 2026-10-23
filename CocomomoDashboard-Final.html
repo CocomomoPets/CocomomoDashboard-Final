@@ -180,6 +180,7 @@
   .sidebar-membership-badge{ font-size:9.5px; font-weight:800; letter-spacing:.3px; padding:1px 6px; border-radius:99px; background:var(--amber-tint); color:#8A5A22; flex-shrink:0; }
 
   .payments-section{ margin-top:16px; padding-top:14px; border-top:1px solid var(--line-soft); }
+  .pay-settled-tag{ font-size:11.5px; font-weight:600; color:#1a7f37; background:#E6F4EA; border:1px solid #B7DFC2; border-radius:999px; padding:2px 8px; }
   .payments-head{ display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
   .payments-title{ font-family:var(--font-display); font-weight:600; font-size:14px; }
   .payments-total{ font-size:12.5px; font-weight:700; color:var(--teal-dark); background:var(--teal-tint); padding:2px 10px; border-radius:99px; }
@@ -2358,8 +2359,7 @@ function computeReminders(dateStr){
         if(g.date !== dateStr) return;
         if(g.status === 'Picked up') return; // already done, nothing to remind about
         if(isPetBoardingOn(pet.id, dateStr)) return; // already here for boarding — no reminder needed
-        const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${pet.name} has a grooming appointment on tomorrow (${dateShort}) at ${fmtTimeAMPM(g.time)}.\nSee you then!`;
-        groomItems.push({ cust, pet, record:g, message, sent: !!g.reminderSent, kind:'groom', groomId:g.id });
+        groomItems.push({ cust, pet, record:g, sent: !!g.reminderSent, kind:'groom', groomId:g.id });
       });
       (pet.stays||[]).forEach(stay=>{
         if(stay.status !== 'Active') return;
@@ -2377,19 +2377,69 @@ function computeReminders(dateStr){
             const owner = memberCust || cust;
             if(w.checkIn === dateStr && !seenCheckin.has(`${stay.id}:${id}`)){
               seenCheckin.add(`${stay.id}:${id}`);
-              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`;
-              checkinItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkin||[]).includes(id), kind:'checkin', stayId:stay.id, petId:id });
+              checkinItems.push({ cust: owner, pet: memberPet, record:stay, sent: (stay.remindersSent.checkin||[]).includes(id), kind:'checkin', stayId:stay.id, petId:id });
             }
             if(w.checkOut === dateStr && !seenCheckout.has(`${stay.id}:${id}`)){
               seenCheckout.add(`${stay.id}:${id}`);
-              const message = `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${memberPet.name} are checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
-              checkoutItems.push({ cust: owner, pet: memberPet, record:stay, message, sent: (stay.remindersSent.checkout||[]).includes(id), kind:'checkout', stayId:stay.id, petId:id });
+              checkoutItems.push({ cust: owner, pet: memberPet, record:stay, sent: (stay.remindersSent.checkout||[]).includes(id), kind:'checkout', stayId:stay.id, petId:id });
             }
           });
         });
       });
     });
   });
+  // One reminder per owner: several of the same owner's pets on the same
+  // day are combined ("Coco & Momo"), using the earliest grooming time /
+  // closed-day appointment time among them. Each item keeps its `members`
+  // so Mark as sent ticks off every pet in it.
+  const namesOf = list => { const n = list.map(x=>x.pet.name); return n.length<=2 ? n.join(' & ') : `${n.slice(0,-1).join(', ')} & ${n[n.length-1]}`; };
+  const byOwner = list => {
+    const groups = [];
+    list.forEach(it=>{
+      let g = groups.find(x=>x.cust.id===it.cust.id);
+      if(!g){ g = { cust: it.cust, members: [] }; groups.push(g); }
+      g.members.push(it);
+    });
+    return groups;
+  };
+  const dotTime = t => fmtTimeAMPM(t).replace(':','.');
+  const closedMsg = (opening, names, verb, time, kindWord, isAre) =>
+    `${opening}\nJust a gentle reminder that ${names} ${isAre} ${verb} tomorrow (${dateShort}), appointment time *${time ? dotTime(time) : 'to be confirmed'}*, please come on time and phone call this number (Do Not Whatsapp Call) while you've arrive tomorrow, after receiving your call we will ask our caretaker to assist for the ${kindWord}, thank you and have a nice day ahead!`;
+  const isClosed = !!closedDateFor(dateStr);
+  const earliest = arr => arr.filter(Boolean).sort()[0] || '';
+
+  const groomGrouped = byOwner(groomItems).map(g=>{
+    const members = g.members.slice().sort((a,b)=>(a.record.time||'').localeCompare(b.record.time||''));
+    const first = members[0];
+    const names = namesOf(members);
+    return { ...first, members, pet: { ...first.pet, name: names },
+      sent: members.every(m=>m.sent),
+      subLabel: members.map(m=>`${members.length>1?m.pet.name+' ':''}${m.record.time} · ${m.record.bay}`).join(', '),
+      message: `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${names} has a grooming appointment on tomorrow (${dateShort}) at ${fmtTimeAMPM(first.record.time)}.\nSee you then!` };
+  });
+  const stayGrouped = (list, kind) => byOwner(list).map(g=>{
+    const members = g.members;
+    const first = members[0];
+    const names = namesOf(members);
+    const isAre = members.length===1 ? 'is' : 'are';
+    let message;
+    if(isClosed){
+      const time = earliest(members.map(m=> kind==='checkin' ? m.record.dropoff?.time : m.record.pickup?.time));
+      message = kind==='checkin'
+        ? closedMsg('Greetings from Cocomomo Old Klang Road!', names, 'checking in', time, 'check in', isAre)
+        : closedMsg(`Hi! Update for ${names} today! ☺️`, names, 'checking out', time, 'check out', isAre);
+    } else {
+      message = kind==='checkin'
+        ? `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${names} ${isAre} checking in tomorrow, check in time : 10am to 5.45pm. (Closed at 6pm)\n(Additional charges may incur for late check in stated as policies)\nSee you then!`
+        : `Greetings from Cocomomo Old Klang Road!\nJust a gentle reminder that ${names} ${isAre} checking out tomorrow, check out time : 10am to 3pm.\n(Additional charges may incur for late check out stated as policies)\nSee you then!`;
+    }
+    return { ...first, members, pet: { ...first.pet, name: names }, sent: members.every(m=>m.sent), message };
+  });
+  groomItems.length = 0; groomItems.push(...groomGrouped);
+  const ci = stayGrouped(checkinItems, 'checkin'), co = stayGrouped(checkoutItems, 'checkout');
+  checkinItems.length = 0; checkinItems.push(...ci);
+  checkoutItems.length = 0; checkoutItems.push(...co);
+
   groomItems.sort((a,b)=> (Number(a.sent)-Number(b.sent)) || (a.record.time||'').localeCompare(b.record.time||'') || (a.record.bay||'').localeCompare(b.record.bay||''));
   // Sent items sink to the bottom (same pattern as Today grid's columns) —
   // sort is stable, so within each group (unsent/sent) the original order
@@ -2399,6 +2449,8 @@ function computeReminders(dateStr){
   return { dateStr, dayLabel, groomItems, checkinItems, checkoutItems };
 }
 function setReminderSent(item, sent){
+  // A combined (same-owner) reminder ticks off every pet inside it.
+  if(item.members){ item.members.forEach(m=>setReminderSent(m, sent)); return; }
   if(item.kind==='groom'){
     const groom = (findPetById(item.pet.id)?.groomingHistory||[]).find(g=>g.id===item.groomId);
     if(groom) groom.reminderSent = sent;
@@ -2443,7 +2495,7 @@ function openRemindersModal(dateStr){
       ${allItems.length>0 ? `<button class="btn btn-primary" id="remMarkAllSent" style="width:100%;margin-bottom:14px;">Mark all (${allItems.length}) as sent</button>` : ''}
       <div style="font-weight:700;font-size:13px;margin-bottom:6px;">✂️ Grooming appointments (${r.groomItems.length})</div>
       ${r.groomItems.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">None.</div>` :
-        r.groomItems.map(item=>itemCard(item, '✂️', `${item.record.time} · ${item.record.bay}`)).join('')}
+        r.groomItems.map(item=>itemCard(item, '✂️', item.subLabel || `${item.record.time} · ${item.record.bay}`)).join('')}
       <div style="font-weight:700;font-size:13px;margin:14px 0 6px;">🏨 Boarding check-ins (${r.checkinItems.length})</div>
       ${r.checkinItems.length===0 ? `<div style="font-size:13px;color:var(--ink-soft);margin-bottom:14px;">None.</div>` :
         r.checkinItems.map(item=>itemCard(item, '🏨', `Checking in`)).join('')}
@@ -3827,6 +3879,8 @@ function stayCardHtml(cust, pet, stay){
   const isForeign = ownerCust.id !== cust.id;
   const stayPayments = (ownerCust.payments||[]).filter(p=>(p.stayIds||[]).includes(stay.id));
   const billing = computeStayBilling(ownerCust, stay);
+  const payCollapsible = stay.status==='Past' && billing.balance <= 0.004;
+  const payHistOpen = _stayPayHistOpen.has(stay.id);
   const nightsSplit = stayPaidNightsSplit(stay);
   const myCheckedIn = isPetCheckedIn(stay, pet.id);
   return `
@@ -3907,8 +3961,13 @@ function stayCardHtml(cust, pet, stay){
       <div class="payments-section" style="margin-top:14px;">
         <div class="payments-head" style="margin-bottom:6px;">
           <span class="payments-title" style="font-size:12.5px;">Payments for this stay</span>
-          <button class="btn btn-sm" data-add-stay-payment="${stay.id}">+ Add payment</button>
+          ${payCollapsible ? `<span class="pay-settled-tag">✓ Paid in full · RM ${fmtRM2(billing.paid)}</span>` : ''}
+          <span style="display:inline-flex;gap:6px;margin-left:auto;">
+            ${payCollapsible ? `<button type="button" class="btn btn-sm" data-pay-hist-toggle="${stay.id}" onclick="event.stopPropagation();toggleStayPayHistory(this,'${stay.id}')">${payHistOpen ? 'Hide history ▲' : `Show history (${stayPayments.length}) ▼`}</button>` : ''}
+            <button class="btn btn-sm" data-add-stay-payment="${stay.id}">+ Add payment</button>
+          </span>
         </div>
+        <div class="pay-hist-body" data-pay-hist-body="${stay.id}" style="${payCollapsible && !payHistOpen ? 'display:none;' : ''}">
         ${stayPayments.length===0 ? `<div style="font-size:12px;color:var(--ink-soft);">No payments recorded for this stay yet.</div>` :
           stayPayments.slice().sort((a,b)=>b.date.localeCompare(a.date)).map(p=>`
             <div class="payment-row" data-edit-payment="${p.id}" style="cursor:pointer;">
@@ -3922,7 +3981,8 @@ function stayCardHtml(cust, pet, stay){
             </div>
           `).join('')}
       </div>
-      <div class="cost-box">
+      </div>
+      <div class="cost-box" data-pay-hist-body="${stay.id}" style="${payCollapsible && !payHistOpen ? 'display:none;' : ''}">
         <div>${cost.isDaycare ? `🐾 Daycare rate${stay.daycareRate!=null?' (custom for this visit)':''}` : `Room rate${cost.usingCustomRate?' (custom/promo rate applied)':cost.holidayUsed?' (holiday rate applied)':''} × ${nights} night${nights===1?'':'s'}`}${cost.extraCount>0?` · +RM ${fmtRM2(cost.surchargeTotal)} additional-pet surcharge (${surchargePetLabel(cost.surchargeByPet)})`:''}${cost.discountAmount>0?` · <span style="color:#1a7f37;font-weight:600;">−RM ${fmtRM2(cost.discountAmount)} discount (${cost.discountPct>0 ? fmtRM(cost.discountPct)+'% off' : 'RM '+fmtRM2(cost.discountAmount)+' off'} whole boarding bill)</span>`:''}${cost.chargesTotal>0?` · +RM ${fmtRM2(cost.chargesTotal)} additional charges${cost.paidChargesTotal>0?` (RM ${fmtRM2(cost.paidChargesTotal)} of that already paid)`:''}`:''}</div>
         ${cost.paidChargesTotal>0.004 ? `<div style="font-size:12px;color:var(--ink-soft);margin-top:4px;">RM ${fmtRM2(cost.paidChargesTotal)} of the additional charges above is marked paid.</div>` : ''}
         <div class="cost-total">Estimated total: RM ${fmtRM2(cost.total)}</div>
@@ -3940,6 +4000,24 @@ function stayCardHtml(cust, pet, stay){
       </div>
     </div>
   </div>`;
+}
+/* Past stays whose bill is fully settled keep their payment rows + cost
+   breakdown folded behind a "Show history" toggle (same idea as the
+   membership points history), so finished-and-paid stays don't clutter
+   the pet's boarding history. Past stays still owing money stay fully
+   expanded. Open/closed is remembered per stay for this session and the
+   toggle works purely on the DOM, so it behaves the same wherever a stay
+   card is shown. */
+var _stayPayHistOpen = new Set();
+function toggleStayPayHistory(btn, stayId){
+  const card = btn.closest('.payments-section')?.parentElement || document;
+  const bodies = card.querySelectorAll(`[data-pay-hist-body="${stayId}"]`);
+  if(!bodies.length) return;
+  const open = bodies[0].style.display === 'none';
+  bodies.forEach(el=>{ el.style.display = open ? '' : 'none'; });
+  if(open) _stayPayHistOpen.add(stayId); else _stayPayHistOpen.delete(stayId);
+  const count = bodies[0].querySelectorAll('.payment-row').length;
+  btn.textContent = open ? 'Hide history ▲' : `Show history (${count}) ▼`;
 }
 /* The "add charge" row: Retail purchase / Others still take a free-typed
    description + amount. Grooming instead offers a preset picker (auto-priced
@@ -8501,7 +8579,9 @@ function fmtRM2(n){
 // Groups a sorted list of yyyy-mm-dd strings into consecutive-run ranges,
 // e.g. ["08-08","08-09","08-14"] -> "8/8 - 9/8, 14/8" — matches how the
 // normal-rate nights either side of a holiday block are shown together.
-function groupDateRangesForMessage(dateStrs){
+// Pass checkOut to add ", 26th check out" when the last range runs right
+// up to the departure day (e.g. "24/12 - 25/12, 26th check out").
+function groupDateRangesForMessage(dateStrs, checkOut){
   if(dateStrs.length===0) return '';
   const sorted = dateStrs.slice().sort();
   const ranges = [];
@@ -8513,7 +8593,12 @@ function groupDateRangesForMessage(dateStrs){
     start = d; prev = d;
   }
   ranges.push([start, prev]);
-  return ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
+  let txt = ranges.map(([a,b]) => a===b ? fmtDateShortNoLeadingZero(a) : `${fmtDateShortNoLeadingZero(a)} - ${fmtDateShortNoLeadingZero(b)}`).join(', ');
+  if(checkOut && addDays(prev,1)===checkOut){
+    const day = new Date(checkOut+'T00:00:00').getDate();
+    txt += `, ${day}${ordinalSuffix(day)} check out`;
+  }
+  return txt;
 }
 
 /* Computes everything for ONE room booking (one stay.pets row) up through
@@ -8535,6 +8620,12 @@ function buildBoardingBlock(stay, sp){
   const lines = [];
   let boardingTotal = 0;
   let lastLineIsCombine = false; // true when the last boarding line already ends in "X + Y = Z" (holiday split)
+  // Extra facts for the combined message's "same species, same dates,
+  // separate rooms" layout (see buildSameDatesMultiRoomMessage) — it only
+  // applies when every night of a room is priced the same.
+  // Raw per-night rows + discount, so buildSameDatesMultiRoomMessage can
+  // re-price several rooms together as one booking.
+  const merge = { daycare: nights===0, nightRows: [], paidFrom: null, discount: 0, wbPct: 0, room };
 
   if(nights===0){
     // Daycare — checkIn===checkOut, a flat one-time charge instead of the
@@ -8587,6 +8678,8 @@ function buildBoardingBlock(stay, sp){
     const surchargeAmt = extrasTonight.reduce((sum,p)=> sum + surchargeAmountFor(p), 0);
     nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight, primaryId: presentIds[0] });
   }
+  merge.nightRows = nightRows;
+  merge.paidFrom = paidThroughCapped;
 
   const coClosed = closedDateFor(checkOut);
   const pickupTime = stay.pickup && stay.pickup.time;
@@ -8616,7 +8709,10 @@ function buildBoardingBlock(stay, sp){
     const sample = rows[0];
     const baseRate = sample.baseRate;
     const primaryPet = findPetById(sample.primaryId);
-    const primaryLabel = (primaryPet && primaryPet.type === 'Cat') ? 'cat' : 'dog';
+    // Deluxe room rate depends on dog size, so the size is shown there;
+    // Suite / Royal Suite cost the same for any single dog — no size.
+    const primaryLabel = (primaryPet && primaryPet.type === 'Cat') ? 'cat'
+      : (roomLabel==='Deluxe room' && primaryPet) ? `${sizeGroupLabel(primaryPet.boardingSize)} size dog` : 'dog';
     const sizeCounts = {};
     sample.extrasTonight.forEach(p=>{
       const lbl = p.type === 'Cat' ? 'cat' : `${sizeGroupLabel(p.boardingSize)} size dog`;
@@ -8658,19 +8754,19 @@ function buildBoardingBlock(stay, sp){
       let holidayPerNight = holidayRows[0].baseRate;
       let normalPerNight = normalRows[0].baseRate;
       if(hasSharing){
-        lines.push('_Holiday rate_');
+        lines.push(`_Holiday Rate (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr), checkOut)})_`);
         const hs = sharingLine(holidayRows);
         holidayPerNight = hs.perNight;
         lines.push(hs.text);
         const holidayTotal = holidayPerNight * holidayRows.length;
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
         lines.push('');
-        lines.push('_Normal rate_');
+        lines.push(`_Normal Rate (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr), checkOut)})_`);
         const ns = sharingLine(normalRows);
         normalPerNight = ns.perNight;
         lines.push(ns.text);
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
@@ -8678,11 +8774,11 @@ function buildBoardingBlock(stay, sp){
       } else {
         const holidayTotal = holidayPerNight * holidayRows.length;
         const normalTotal = normalPerNight * normalRows.length;
-        lines.push('_Holiday rate_');
-        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)} (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr))})`);
+        lines.push(`_Holiday Rate (${groupDateRangesForMessage(holidayRows.map(r=>r.dateStr), checkOut)})_`);
+        lines.push(`${holidayRows.length} night${holidayRows.length===1?'':'s'} x RM ${fmtRM(holidayPerNight)} = RM ${fmtRM(holidayTotal)}`);
         lines.push('');
-        lines.push('_Normal rate_');
-        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)} (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr))})`);
+        lines.push(`_Normal Rate (${groupDateRangesForMessage(normalRows.map(r=>r.dateStr), checkOut)})_`);
+        lines.push(`${normalRows.length} night${normalRows.length===1?'':'s'} x RM ${fmtRM(normalPerNight)} = RM ${fmtRM(normalTotal)}`);
         lines.push('');
         boardingTotal = holidayTotal + normalTotal;
         lines.push(`RM ${fmtRM(holidayTotal)} + RM ${fmtRM(normalTotal)} = RM ${fmtRM(boardingTotal)}`);
@@ -8699,6 +8795,8 @@ function buildBoardingBlock(stay, sp){
     const isAmountOff = stay.customRateMode==='amountOff';
     const wbApplies = wbPct>0 || (isAmountOff && sp===stay.pets[0]);
     const discount = wbApplies ? wholeBillDiscountAmount(stay, boardingTotal) : 0;
+    merge.discount = discount;
+    merge.wbPct = wbApplies ? wbPct : 0;
     if(discount>0){
       const before = boardingTotal;
       boardingTotal = before - discount;
@@ -8734,11 +8832,16 @@ function buildBoardingBlock(stay, sp){
     // so the note vanished completely instead of just undercounting.
     count: (p.groomingHistory||[]).filter(g =>
       (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date>=checkIn && g.date<=checkOut
+    ).length,
+    // How many of those land on the check-out day itself — when all of
+    // them do, the message says "upon check out" instead of "during stay".
+    onCheckout: (p.groomingHistory||[]).filter(g =>
+      (g.apptTypes||[]).includes('FBG') && g.notes==='(Boarding)' && g.date===checkOut
     ).length
   }));
   const fbgCount = fbgByPet.reduce((s,f)=>s+f.count,0);
 
-  return { namesLabel, roomLabel, pets, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount, fbgByPet, checkIn, checkOut };
+  return { namesLabel, roomLabel, pets, lines, boardingTotal, lastLineIsCombine, charges, chargesTotal, fbgCount, fbgByPet, checkIn, checkOut, merge };
 }
 
 /* Turns per-pet FBG counts into the "included ... free basic grooming
@@ -8751,17 +8854,18 @@ function buildBoardingBlock(stay, sp){
 function fbgNoteFromByPet(fbgByPet){
   const earners = (fbgByPet||[]).filter(f=>f.count>0);
   if(earners.length===0) return '';
+  const when = earners.every(f=>f.onCheckout===f.count) ? 'upon check out' : 'during stay';
   if(earners.length===1){
     const f = earners[0];
-    return ` included ${f.count>1?f.count+'x':'1x'} free basic grooming during stay`;
+    return ` included ${f.count>1?f.count+'x':'1x'} free basic grooming ${when}`;
   }
   const sameCount = earners.every(f=>f.count===earners[0].count);
   if(sameCount){
     const n = earners[0].count;
-    return ` included ${n>1?n+'x':'1x'} free basic grooming for each of them during stay`;
+    return ` included ${n>1?n+'x':'1x'} free basic grooming for each of them ${when}`;
   }
-  const parts = earners.map(f=>`${f.count>1?f.count+'x':'1x'} for ${esc(f.name)}`);
-  return ` included free basic grooming during stay (${parts.join(', ')})`;
+  const parts = earners.map(f=>`${f.count>1?f.count+'x':'1x'} for ${f.name}`);
+  return ` included free basic grooming ${when} (${parts.join(', ')})`;
 }
 
 function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
@@ -8803,7 +8907,7 @@ function buildBoardingWhatsAppMessage(stay, sp, ownerCust){
     }
     out.push('');
     const grandTotal = boardingTotal + chargesTotal - depositTotal;
-    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...charges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
+    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...charges.map(c=>`+ RM ${fmtRM(c.amount)} (${c.label})`)];
     if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
     out.push(addendsParts.join(' '));
     const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
@@ -8841,8 +8945,13 @@ function allOwnStayRoomBlocksForCustomer(cust){
 function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
   const blocks = entries.map(({stay, sp})=>({ stay, block: buildBoardingBlock(stay, sp) })).filter(x=>x.block);
   if(blocks.length===0) return '';
+  // Only one room picked — same message as that stay's own WhatsApp button.
+  if(entries.length===1) return buildBoardingWhatsAppMessage(entries[0].stay, entries[0].sp, ownerCust);
 
-  const out = [`${esc(ownerCust.name)}'s boarding details :`, ''];
+  const sameDates = buildSameDatesMultiRoomMessage(blocks, ownerCust);
+  if(sameDates) return sameDates;
+
+  const out = [`${ownerCust.name}'s boarding details :`, ''];
   let boardingTotal = 0;
   const allCharges = [];
   const fbgByPetMap = new Map(); // petId -> { name, count } — summed across all combined stays, since the same pet can appear in more than one block
@@ -8856,8 +8965,8 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
       const f = (block.fbgByPet||[])[idx];
       if(!f) return;
       const existing = fbgByPetMap.get(p.id);
-      if(existing) existing.count += f.count;
-      else fbgByPetMap.set(p.id, { name: f.name, count: f.count });
+      if(existing){ existing.count += f.count; existing.onCheckout += (f.onCheckout||0); }
+      else fbgByPetMap.set(p.id, { name: f.name, count: f.count, onCheckout: f.onCheckout||0 });
     });
   });
   out.push('');
@@ -8885,7 +8994,7 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
   if(hasChargesOrDeposit){
     out.push('');
     const grandTotal = boardingTotal + chargesTotal - depositTotal;
-    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...allCharges.map(c=>`+ RM ${fmtRM(c.amount)} (${esc(c.label)})`)];
+    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...allCharges.map(c=>`+ RM ${fmtRM(c.amount)} (${c.label})`)];
     if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
     out.push(addendsParts.join(' '));
     const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
@@ -8904,6 +9013,169 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
     out[out.length-1] = out[out.length-1].replace(` = RM ${fmtRM(boardingTotal)}`, ` = *Total RM ${fmtRM(boardingTotal)}${fbgNote}*`);
   }
 
+  return out.join('\n');
+}
+
+/* Combined message, merged layout: when every picked pet is the same
+   species (all dogs or all cats) and every picked room checks in and out
+   on the same days, the quote reads as ONE booking instead of a block per
+   room — even with room sharing, a holiday/normal split, nights already
+   paid, or a whole-bill discount. Examples:
+
+     Coco & Momo's Deluxe room boarding details :
+
+     Check In - 17th Jun 26 (Wed)
+     Check Out - 22nd Jun 26 (Mon)
+
+     RM 60 (1x S/M size dog 1x room) x 2 rooms = RM 120 per night
+     5 nights x RM 120 = *Total RM 600*
+
+   With sharing: "RM 120 (1x S/M size dog 1x room x 2 rooms @ RM 60 per
+   room) + RM 30 (Additional 1x S/M size dog in same room) = RM 150 per
+   night". Holiday + normal nights get a "_Holiday Rate_" / "_Normal Rate_"
+   block each, dates in the heading e.g. "_Holiday Rate (24/12 - 25/12, 26th check out)_", then "RM 280 + RM 240 = *Total RM 520*". A discount adds
+   "RM 600 - 10% discount = *Total RM 540*". Returns null (normal
+   block-per-room layout) for daycare, mixed species, different dates, or
+   anything priced in more than a holiday/normal pair of ways (e.g. a
+   sharing partner joining mid-stay). */
+function buildSameDatesMultiRoomMessage(blocks, ownerCust){
+  if(blocks.length < 2) return null;
+  const bs = blocks.map(x=>x.block);
+  if(!bs.every(b=>b.merge && !b.merge.daycare && b.merge.nightRows.length>0)) return null;
+  const first = bs[0];
+  if(!bs.every(b=>b.checkIn===first.checkIn && b.checkOut===first.checkOut && b.merge.paidFrom===first.merge.paidFrom)) return null;
+  const nightCount = first.merge.nightRows.length;
+  if(!bs.every(b=>b.merge.nightRows.length===nightCount)) return null;
+  const allPets = [];
+  bs.forEach(b=>b.pets.forEach(p=>{ if(!allPets.includes(p)) allPets.push(p); }));
+  const species = allPets[0].type==='Cat' ? 'cat' : 'dog';
+  if(!allPets.every(p=>(p.type==='Cat' ? 'cat' : 'dog')===species)) return null;
+
+  // Group nights by how every room is priced that night — at most two
+  // groups, and only when they're the holiday vs normal nights.
+  const sigOf = i => bs.map(b=>{ const r=b.merge.nightRows[i]; return `${r.primaryId}|${r.baseRate}|${r.surchargeAmt}|${r.extrasTonight.map(p=>p.id).join(',')}`; }).join('#');
+  const segs = [];
+  for(let i=0;i<nightCount;i++){
+    const sig = sigOf(i);
+    const holiday = !!first.merge.nightRows[i].holiday;
+    let seg = segs.find(x=>x.sig===sig);
+    if(!seg){ seg = { sig, idx: i, holiday, nights: 0, dates: [] }; segs.push(seg); }
+    if(seg.holiday!==holiday) return null;
+    seg.nights++;
+    seg.dates.push(first.merge.nightRows[i].dateStr);
+  }
+  if(segs.length>2) return null;
+  if(segs.length===2 && segs[0].holiday===segs[1].holiday) return null;
+  segs.sort((a,b)=>(b.holiday?1:0)-(a.holiday?1:0)); // holiday first
+
+  const roomLabels = Array.from(new Set(bs.map(b=>b.roomLabel)));
+  const sameRoomType = roomLabels.length===1;
+  const roomPhrase = lbl => sameRoomType ? '1x room' : `1x ${lbl}`;
+  const primaryLabel = (pet, roomLabel) => {
+    if(species==='cat') return '1x cat';
+    return roomLabel==='Deluxe room' ? `1x ${sizeGroupLabel(pet.boardingSize)} size dog` : '1x dog';
+  };
+  const extraLabel = p => p.type==='Cat' ? 'cat' : `${sizeGroupLabel(p.boardingSize)} size dog`;
+
+  // "RM ... per night" line for one priced group of nights.
+  function perNightLine(i){
+    const prim = [], extras = [];
+    bs.forEach(b=>{
+      const r = b.merge.nightRows[i];
+      const pet = findPetById(r.primaryId) || b.pets[0];
+      const lbl = `${primaryLabel(pet, b.roomLabel)} ${roomPhrase(b.roomLabel)}`;
+      let g = prim.find(x=>x.lbl===lbl && x.rate===r.baseRate);
+      if(!g){ g = { lbl, rate: r.baseRate, count: 0 }; prim.push(g); }
+      g.count++;
+      r.extrasTonight.forEach(p=>{
+        const el = extraLabel(p);
+        let e = extras.find(x=>x.lbl===el);
+        if(!e){ e = { lbl: el, count: 0, amount: 0 }; extras.push(e); }
+        e.count++; e.amount += surchargeAmountFor(p);
+      });
+    });
+    const perNight = prim.reduce((s,g)=>s+g.rate*g.count,0) + extras.reduce((s,e)=>s+e.amount,0);
+    let text;
+    if(prim.length===1 && extras.length===0){
+      const g = prim[0];
+      text = `RM ${fmtRM(g.rate)} (${g.lbl})${g.count>1?` x ${g.count} rooms`:''}`;
+    } else {
+      const terms = prim.map(g=> g.count>1
+        ? `RM ${fmtRM(g.rate*g.count)} (${g.lbl} x ${g.count} rooms @ RM ${fmtRM(g.rate)} per room)`
+        : `RM ${fmtRM(g.rate)} (${g.lbl})`);
+      extras.forEach(e=>terms.push(`RM ${fmtRM(e.amount)} (Additional ${e.count}x ${e.lbl} in same room)`));
+      text = terms.join(' + ');
+    }
+    return { text: `${text} = RM ${fmtRM(perNight)} per night`, perNight };
+  }
+
+  const names = allPets.map(p=>p.name);
+  const namesLabel = names.length<=2 ? names.join(' & ') : `${names.slice(0,-1).join(', ')} & ${names[names.length-1]}`;
+  const header = sameRoomType ? `${namesLabel}'s ${first.roomLabel} boarding details :` : `${namesLabel}'s boarding details :`;
+  const out = [header, '', first.lines[0], first.lines[1].replace(/^Until\/Check Out/, 'Check Out'), ''];
+
+  let boardingTotal = 0;
+  if(segs.length===1){
+    const pl = perNightLine(segs[0].idx);
+    boardingTotal = pl.perNight * segs[0].nights;
+    out.push(pl.text);
+    out.push(`${segs[0].nights} night${segs[0].nights===1?'':'s'} x RM ${fmtRM(pl.perNight)} = RM ${fmtRM(boardingTotal)}${segs[0].holiday?' (holiday rate)':''}`);
+  } else {
+    const segTotals = segs.map(seg=>{
+      const pl = perNightLine(seg.idx);
+      const t = pl.perNight * seg.nights;
+      out.push(`_${seg.holiday ? 'Holiday' : 'Normal'} Rate (${groupDateRangesForMessage(seg.dates, first.checkOut)})_`);
+      out.push(pl.text);
+      out.push(`${seg.nights} night${seg.nights===1?'':'s'} x RM ${fmtRM(pl.perNight)} = RM ${fmtRM(t)}`);
+      out.push('');
+      return t;
+    });
+    boardingTotal = segTotals.reduce((s,t)=>s+t,0);
+    out.push(`${segTotals.map(t=>`RM ${fmtRM(t)}`).join(' + ')} = RM ${fmtRM(boardingTotal)}`);
+  }
+
+  // Whole-bill discount — summed across the rooms (each stay's own setting).
+  const discount = bs.reduce((s,b)=>s+(b.merge.discount||0),0);
+  if(discount>0.004){
+    const pcts = bs.map(b=>b.merge.wbPct||0);
+    const samePct = pcts[0]>0 && pcts.every(x=>x===pcts[0]);
+    const before = boardingTotal;
+    boardingTotal = before - discount;
+    out.push('');
+    out.push(`RM ${fmtRM(before)} - ${samePct ? `${fmtRM(pcts[0])}% discount` : `RM ${fmtRM(discount)} discount`} = RM ${fmtRM(boardingTotal)}`);
+  }
+
+  // Charges / deposit / free grooming — same rules as the other messages.
+  const fbgByPet = [];
+  bs.forEach(b=>{ fbgByPet.push(...(b.fbgByPet||[])); });
+  // Charges live on the stay, so a stay holding several of these rooms
+  // must only contribute its charges once.
+  const seenStay = new Set();
+  const charges = [];
+  blocks.forEach(({stay, block})=>{
+    if(seenStay.has(stay.id)) return;
+    seenStay.add(stay.id);
+    charges.push(...block.charges);
+  });
+  const chargesTotal = charges.reduce((s,c)=>s+c.amount,0);
+  const fbgNote = fbgNoteFromByPet(fbgByPet);
+  const includedStayIds = new Set(blocks.map(b=>b.stay.id));
+  const depositTotal = ((ownerCust && ownerCust.payments) || [])
+    .filter(p => p.type==='Deposit' && (p.stayIds||[]).some(id=>includedStayIds.has(id)))
+    .reduce((s,p)=>s+(+p.amount||0), 0);
+
+  if(charges.length===0 && depositTotal<=0){
+    const lastIdx = out.length-1;
+    out[lastIdx] = out[lastIdx].replace(`= RM ${fmtRM(boardingTotal)}`, `= *Total RM ${fmtRM(boardingTotal)}${fbgNote}*`);
+  } else {
+    out[out.length-1] += ' (Boarding)';
+    out.push('');
+    const addendsParts = [`RM ${fmtRM(boardingTotal)}`, ...charges.map(c=>`+ RM ${fmtRM(c.amount)} (${c.label})`)];
+    if(depositTotal>0) addendsParts.push(`- RM ${fmtRM(depositTotal)} (Paid deposit)`);
+    out.push(addendsParts.join(' '));
+    const balanceNote = depositTotal>0 ? ' outstanding balance' : '';
+    out.push(`= *Total RM ${fmtRM(boardingTotal + chargesTotal - depositTotal)}${balanceNote}${fbgNote}*`);
+  }
   return out.join('\n');
 }
 
@@ -9061,6 +9333,11 @@ function openCombineWhatsAppModal(custId){
     return a.stay.checkIn.localeCompare(b.stay.checkIn);
   });
 
+  // Past stays are folded behind a "Show history" toggle so the picker only
+  // shows what's current; they're still there (unticked) if ever needed.
+  const activeIdxs = [], pastIdxs = [];
+  sorted.forEach((e,i)=>{ (e.stay.status==='Past' ? pastIdxs : activeIdxs).push(i); });
+
   function rowHtml(entry, idx){
     const { stay, sp } = entry;
     const win = spRoomWindow(stay, sp);
@@ -9080,7 +9357,12 @@ function openCombineWhatsAppModal(custId){
     <div class="modal-head"><h3>Combine stays</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(cust.name)}'s stays to combine into one quote with one grand total — handy when they want to settle for all their pets at once, even across different rooms or bookings.</div>
-      <div id="combineRows">${sorted.map(rowHtml).join('')}</div>
+      <div id="combineRows">${activeIdxs.length ? activeIdxs.map(i=>rowHtml(sorted[i], i)).join('') : `<div style="font-size:12.5px;color:var(--ink-soft);">No current or upcoming stays — past ones are under history below.</div>`}</div>
+      ${pastIdxs.length ? `
+      <div style="margin-top:12px;">
+        <button type="button" class="btn btn-sm" id="toggleCombinePastBtn">Show history (${pastIdxs.length}) ▼</button>
+        <div id="combinePastRows" style="display:none;margin-top:8px;">${pastIdxs.map(i=>rowHtml(sorted[i], i)).join('')}</div>
+      </div>` : ''}
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Close</button>
@@ -9088,6 +9370,13 @@ function openCombineWhatsAppModal(custId){
     </div>
   `, {wide:true});
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  const togglePastBtn = document.getElementById('toggleCombinePastBtn');
+  if(togglePastBtn) togglePastBtn.addEventListener('click', ()=>{
+    const box = document.getElementById('combinePastRows');
+    const open = box.style.display === 'none';
+    box.style.display = open ? '' : 'none';
+    togglePastBtn.textContent = open ? 'Hide history ▲' : `Show history (${pastIdxs.length}) ▼`;
+  });
   document.getElementById('genCombineBtn').addEventListener('click', ()=>{
     const checked = Array.from(document.querySelectorAll('[data-combine-idx]:checked')).map(el=>+el.dataset.combineIdx);
     if(checked.length===0){ toast('Select at least one stay to combine'); return; }
