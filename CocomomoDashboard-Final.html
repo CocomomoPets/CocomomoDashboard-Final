@@ -9302,12 +9302,19 @@ function openCombineBillModal(stayId){
   const entries = allCustomerStays(ownerCust); // [{pet, stay}]
   const sorted = entries.slice().sort((a,b)=>stayPickerOrder(a.stay, b.stay));
 
+  // Past stays fold under "Show history" (same as the Combine message
+  // picker), except ones already ticked — this stay or its current group.
+  const isTickedByDefault = st => st.id===stay.id || (currentGroupId && st.billingGroupId===currentGroupId);
+  const billMainIdxs = [], billPastIdxs = [];
+  sorted.forEach((e,i)=>{ (e.stay.status==='Past' && !isTickedByDefault(e.stay) ? billPastIdxs : billMainIdxs).push(i); });
+
   function rowHtml(entry, idx){
     const { pet, stay: st } = entry;
     const isDefaultChecked = st.id===stay.id || (currentGroupId && st.billingGroupId===currentGroupId);
+    const paid = computeStayBilling(ownerCust, st).balance <= 0.004;
     return `<label class="charge-row" style="cursor:pointer;">
       <input type="checkbox" data-mergebill-idx="${idx}" ${isDefaultChecked?'checked':''} style="margin-right:4px;">
-      <span class="charge-desc">${esc(pet.name)}</span>
+      <span class="charge-desc">${paid?'<span style="color:#1a7f37;font-weight:700;" title="Fully paid">✓</span> ':''}${esc(pet.name)}${paid?' <span style="font-size:11px;color:#1a7f37;">(paid)</span>':''}</span>
       <span class="charge-qty">${fmtDateSlash(st.checkIn)} → ${fmtDateSlash(st.checkOut)}</span>
       <span class="badge ${st.status==='Active'?'badge-active':'badge-past'}">${esc(st.status)}</span>
     </label>`;
@@ -9317,7 +9324,12 @@ function openCombineBillModal(stayId){
     <div class="modal-head"><h3>Combine bill</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
       <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Pick which of ${esc(ownerCust.name)}'s stays to combine into one bill — the combined total shows on each of their stay cards right away, even before any payment is made.</div>
-      <div id="mergeBillRows">${sorted.map(rowHtml).join('')}</div>
+      <div id="mergeBillRows">${billMainIdxs.length ? billMainIdxs.map(i=>rowHtml(sorted[i], i)).join('') : `<div style="font-size:12.5px;color:var(--ink-soft);">No current or upcoming stays — past ones are under history below.</div>`}</div>
+      ${billPastIdxs.length ? `
+      <div style="margin-top:12px;">
+        <button type="button" class="btn btn-sm" id="toggleBillPastBtn">Show history (${billPastIdxs.length}) ▼</button>
+        <div id="billPastRows" style="display:none;margin-top:8px;">${billPastIdxs.map(i=>rowHtml(sorted[i], i)).join('')}</div>
+      </div>` : ''}
     </div>
     <div class="modal-foot">
       <button class="btn" id="cancelBtn">Close</button>
@@ -9325,6 +9337,13 @@ function openCombineBillModal(stayId){
     </div>
   `, {wide:true});
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  const toggleBillPastBtn = document.getElementById('toggleBillPastBtn');
+  if(toggleBillPastBtn) toggleBillPastBtn.addEventListener('click', ()=>{
+    const box = document.getElementById('billPastRows');
+    const open = box.style.display === 'none';
+    box.style.display = open ? '' : 'none';
+    toggleBillPastBtn.textContent = open ? 'Hide history ▲' : `Show history (${billPastIdxs.length}) ▼`;
+  });
   document.getElementById('doMergeBtn').addEventListener('click', ()=>{
     const checkedIdxs = Array.from(document.querySelectorAll('[data-mergebill-idx]:checked')).map(el=>+el.dataset.mergebillIdx);
     if(checkedIdxs.length<2){ toast('Select at least 2 stays to combine'); return; }
