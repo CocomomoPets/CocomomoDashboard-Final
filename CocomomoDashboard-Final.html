@@ -3557,7 +3557,9 @@ function renderTodayView(){
       const owningPet = cust.pets.find(p=>p.stays.some(s=>s.id===stayId));
       const stay = owningPet?.stays.find(s=>s.id===stayId);
       if(!stay) return;
+      if(blockCheckoutIfUnpaid(stay)) return;
       openChecklistModal('Check-out checklist', checkoutChecklistItems(cust, stay), 'Complete check-out', ()=>{
+        if(blockCheckoutIfUnpaid(stay)) return;
         stay.status='Past'; renderTodayView(); scheduleSync(); toast('Checked out');
       });
     });
@@ -3636,12 +3638,43 @@ function checkoutChecklistItems(cust, stay){
    button stays disabled until every checkbox is checked. If `items` is
    empty (nothing applies to this stay/pet) it skips straight to
    `onConfirm` instead of showing an empty modal. */
+/* Check-out is blocked until the stay (or its combined bill) is fully
+   paid. Shows a popup with the outstanding amount and an "Add payment"
+   shortcut instead. Returns true when check-out must NOT go ahead. */
+function blockCheckoutIfUnpaid(stay){
+  const owner = findStayOwnerCustomer(stay.id);
+  if(!owner) return false;
+  const billing = computeStayBilling(owner, stay);
+  if(billing.balance <= 0.004) return false;
+  openModal(`
+    <div class="modal-head"><h3>Can't check out yet</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:13.5px;line-height:1.55;">This stay hasn't been fully paid yet.</div>
+      <div class="cost-box" style="margin-top:10px;">
+        <div>Total${billing.isMerged?' (combined bill)':''}: RM ${fmtRM2(billing.isMerged ? billing.groupCost : computeStayCost(stay).total)}</div>
+        <div class="cost-paid">Paid: RM ${fmtRM2(billing.paid)}</div>
+        <div class="cost-outstanding">Outstanding: RM ${fmtRM2(billing.balance)}</div>
+      </div>
+      <div style="font-size:12px;color:var(--ink-soft);margin-top:10px;">Record the payment first, then check out again.</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn btn-primary" id="unpaidAddPayBtn">+ Add payment</button>
+    </div>
+  `);
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  document.getElementById('unpaidAddPayBtn').addEventListener('click', ()=>openPaymentModal(owner, null, stay.id));
+  return true;
+}
 function openChecklistModal(title, items, confirmLabel, onConfirm){
   if(!items.length){ onConfirm(); return; }
   openModal(`
     <div class="modal-head"><h3>${esc(title)}</h3><button class="modal-close">✕</button></div>
     <div class="modal-body">
-      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">Confirm each item before continuing.</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
+        <div style="font-size:12.5px;color:var(--ink-soft);">Confirm each item before continuing.</div>
+        <button type="button" class="btn btn-sm" id="checklistTickAll">✓ Tick all</button>
+      </div>
       ${items.map(it=>`<label class="check-pill" style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;margin-bottom:6px;cursor:pointer;white-space:normal;"><input type="checkbox" data-checklist-item="${it.key}" style="margin-top:3px;flex-shrink:0;"> <span>${it.label}</span></label>`).join('')}
     </div>
     <div class="modal-foot">
@@ -3651,8 +3684,17 @@ function openChecklistModal(title, items, confirmLabel, onConfirm){
   `);
   function refreshConfirm(){
     const all = Array.from(document.querySelectorAll('[data-checklist-item]'));
-    document.getElementById('confirmBtn').disabled = !all.every(cb=>cb.checked);
+    const allTicked = all.every(cb=>cb.checked);
+    document.getElementById('confirmBtn').disabled = !allTicked;
+    document.getElementById('checklistTickAll').textContent = allTicked ? 'Untick all' : '✓ Tick all';
   }
+  // One tap ticks every item (or unticks them all again if already done).
+  document.getElementById('checklistTickAll').addEventListener('click', ()=>{
+    const all = Array.from(document.querySelectorAll('[data-checklist-item]'));
+    const tick = !all.every(cb=>cb.checked);
+    all.forEach(cb=>{ cb.checked = tick; });
+    refreshConfirm();
+  });
   document.querySelectorAll('[data-checklist-item]').forEach(cb=>cb.addEventListener('change', refreshConfirm));
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('confirmBtn').addEventListener('click', ()=>{ closeModal(); onConfirm(); });
@@ -4869,7 +4911,9 @@ function wireSubContentEvents(cust, pet){
       e.stopPropagation();
       const s = findStayById(el.dataset.stay);
       if(!s) return;
+      if(blockCheckoutIfUnpaid(s)) return;
       openChecklistModal('Check-out checklist', checkoutChecklistItems(cust, s), 'Complete check-out', ()=>{
+        if(blockCheckoutIfUnpaid(s)) return;
         s.status='Past'; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked out');
       });
     });
