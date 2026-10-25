@@ -1676,7 +1676,24 @@ const TIME_SLOTS = (() => { // 10:00 -> 18:00, 30-min increments
   return out;
 })();
 
-function uid(prefix){ return prefix + '_' + Math.random().toString(36).slice(2,9); }
+/* Record ids (double-check pass, 25 Oct 2026): were 7 random characters
+   from Math.random. New records are saved with "insert or overwrite", so
+   two ids ever colliding (more likely as records pile up across devices)
+   would silently replace an existing appointment/stay/payment. Now 16
+   characters from the browser's cryptographic random generator. Existing
+   ids are unchanged. */
+function uid(prefix){
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  try{
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes.forEach(b=>{ out += chars[b % 36]; });
+  }catch(e){
+    for(let i=0;i<16;i++) out += chars[Math.floor(Math.random()*36)];
+  }
+  return prefix + '_' + out;
+}
 /* "Today" is always computed in Malaysia time, regardless of the device's own clock/timezone setting. */
 function todayStr(){
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kuala_Lumpur', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date());
@@ -1885,6 +1902,17 @@ function undoChange(entryId){
   const obj = resolveChangeEntity(entry);
   if(!obj){ toast('That record no longer exists — can\'t undo'); return; }
   const currentVal = obj[entry.field];
+  // Double-check pass (25 Oct 2026): undoing a stay's check-in/check-out
+  // date wrote the old date straight back — even if the room had been
+  // booked by someone else for those dates in the meantime, or the result
+  // ended before it started. Now checked first, like a normal edit.
+  if(entry.entityType==='Stay' && (entry.field==='checkIn' || entry.field==='checkOut')){
+    const trial = { ...obj, [entry.field]: entry.oldValue };
+    if(!trial.checkIn || !trial.checkOut || trial.checkOut < trial.checkIn){ toast("Can't undo — the stay would end before it starts"); return; }
+    const clash = (obj.pets||[]).find(sp=>{ const w = spRoomWindow(trial, sp); return !isRoomAvailable(sp.room, w.checkIn, w.checkOut, obj.id); });
+    if(clash){ toast(`Can't undo — ${clash.room} is now booked by someone else for those dates`); return; }
+    if(!confirm('Undo this date change? Free grooming appointments are not moved automatically — check them afterwards.')) return;
+  }
   obj[entry.field] = entry.oldValue;
   entry.undone = true;
   logChange(entry.entityType, entry.ref, entry.entityLabel, entry.field, entry.fieldLabel, currentVal, entry.oldValue);
@@ -5271,6 +5299,10 @@ function wireSubContentEvents(cust, pet){
   async function bulkApplyBooking(computeNew, verb){
     let moved = 0; const conflicts = [];
     const selected = pet.groomingHistory.filter(g=>_groomSelection.has(g.id));
+    // Double-check pass (25 Oct 2026): a bulk shift could land appointments on
+    // closed days with no warning (e.g. shifting by 1 day onto a Tuesday).
+    const closedHits = selected.filter(g=>{ const t = computeNew(g); return t.date !== g.date && isClosedDate(t.date); });
+    if(closedHits.length && !confirm(`${closedHits.length} appointment${closedHits.length===1?'':'s'} would land on a day the shop is closed (${closedHits.map(g=>fmtDate(computeNew(g).date)).join(', ')}). Move anyway?`)) return;
     for(const g of selected){
       const { date:newDate, time:newTime, bay:newBay } = computeNew(g);
       // Live check follows the local one — pain point #5 follow-up (29 Aug
