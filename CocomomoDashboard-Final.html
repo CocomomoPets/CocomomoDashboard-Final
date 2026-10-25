@@ -623,7 +623,10 @@ let _offlineSnapTimer = null;
 let _offlineHealthTimer = null;
 let _offlineBlockPending = false;
 const LOAD_WATCHDOG_MS = 30000;
-const CRITICAL_LOAD_PARTS = ['customers','pets','stays','grooming','shopConfig'];
+// 'payments' added 25 Oct 2026: without it, a failed payments load left every
+// customer showing as owing money (risk of collecting twice) instead of
+// switching to the view-only offline copy like the other core parts do.
+const CRITICAL_LOAD_PARTS = ['customers','pets','stays','grooming','payments','shopConfig'];
 const OFFLINE_DB = 'cocomomo-offline-copy', OFFLINE_STORE = 'snap', OFFLINE_KEY = 'latest';
 let _lastSyncedJSON = null;
 let _lastSyncedCustomersJSON = null; // 17 Aug 2026 migration — customers/pets tracked separately from the blob, see syncCustomersAndPetsToTables()
@@ -1014,6 +1017,10 @@ async function loadFromCloud(){
     // this doesn't solve (nobody has it open at all that day).
     setInterval(maybeRunAutoBackup, 60000);
   }
+  if(!_autoRefreshStarted && cloudEnabled){
+    _autoRefreshStarted = true;
+    setInterval(maybeAutoRefresh, AUTO_REFRESH_MS);
+  }
   if(!_agreementPollStarted && cloudEnabled && sbSession){
     _agreementPollStarted = true;
     setInterval(checkSignedAgreements, 60000);
@@ -1254,7 +1261,7 @@ document.getElementById('syncStatus').addEventListener('click', async ()=>{
    the user comes back — rather than leaving them to notice and tap retry. */
 document.addEventListener('visibilitychange', async ()=>{
   if(document.visibilityState !== 'visible') return;
-  if(cloudEnabled) return; // already connected/working, nothing to do
+  if(cloudEnabled){ if(typeof maybeAutoRefresh==='function') maybeAutoRefresh(); return; } // connected — just check for other devices' changes
   if(!SUPABASE_URL || !SUPABASE_ANON_KEY) return; // never configured, nothing to reconnect
   if(document.getElementById('lockScreen')) return; // still on the PIN screen — don't interrupt
   cloudEnabled = true;
@@ -2052,7 +2059,8 @@ function computeMonthlyReport(monthStr){
           for(let n=0;n<roomNights;n++){
             const dateStr = addDays(roomCheckIn, n);
             if(!monthDates.has(dateStr)) continue;
-            const presentToday = occupants.filter(o => dateStr >= o.checkIn && dateStr < o.checkOut);
+            // findPetById: a sharing partner whose pet was deleted no longer occupies or pays (25 Oct 2026)
+            const presentToday = occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut);
             if(presentToday.length===0) continue;
             occupiedRoomNights.add(`${roomId}|${dateStr}`);
             const holiday = isHoliday(dateStr);
@@ -2707,7 +2715,38 @@ function calendarColorFor(custId){
   return _calendarColorMap[custId] || CATEGORICAL_COLORS[0];
 }
 function initials(name){ return name.trim().split(/\s+/).slice(0,2).map(w=>w[0]).join('').toUpperCase(); }
-function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2200); }
+/* Error messages (25 Oct 2026): anything that looks like a failure or a
+   conflict also stays on screen in a separate bar until tapped, instead of
+   vanishing with the normal 2-second toast — load/save failures were easy
+   to miss. Normal confirmations ("Appointment booked") are unchanged. */
+const STICKY_TOAST_RE = /fail|could not|couldn't|cannot|not responding|timed out|changed on another device|just booked/i;
+function toast(msg){
+  const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2200);
+  if(STICKY_TOAST_RE.test(String(msg||''))) showStickyError(msg);
+}
+function showStickyError(msg){
+  let bar = document.getElementById('stickyErrorBar');
+  if(!bar){
+    bar = document.createElement('div');
+    bar.id = 'stickyErrorBar';
+    bar.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);top:10px;z-index:99999;width:min(560px,calc(100% - 24px));display:flex;flex-direction:column;gap:6px;';
+    document.body.appendChild(bar);
+  }
+  // Don't stack the same message twice.
+  if([...bar.children].some(el=>el.dataset.msg===String(msg))) return;
+  const item = document.createElement('div');
+  item.dataset.msg = String(msg);
+  item.style.cssText = 'background:#A23B2C;color:#fff;border-radius:10px;padding:10px 12px;font-size:13px;line-height:1.35;box-shadow:0 4px 14px rgba(0,0,0,.25);cursor:pointer;display:flex;gap:10px;align-items:flex-start;';
+  const text = document.createElement('div'); text.style.flex='1'; text.textContent = msg;
+  const x = document.createElement('div'); x.textContent = '✕'; x.style.cssText='font-weight:700;padding-left:4px;';
+  const time = document.createElement('div'); time.style.cssText='font-size:11px;opacity:.8;margin-top:2px;';
+  time.textContent = new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kuala_Lumpur',hour:'2-digit',minute:'2-digit'}).format(new Date()) + ' · tap to dismiss';
+  text.appendChild(time);
+  item.appendChild(text); item.appendChild(x);
+  item.addEventListener('click', ()=>item.remove());
+  bar.appendChild(item);
+  while(bar.children.length > 4) bar.firstChild.remove();
+}
 function roomTypeFor(id){ return ROOM_INVENTORY.find(r=>r.id===id); }
 
 /* Per-pet checked-in helpers — see checkedInPets on normalizeStay(). */
@@ -3203,13 +3242,17 @@ function renderCustomersMain(){
   `;
 
   document.getElementById('editCustBtn').addEventListener('click', ()=>openCustomerModal(cust));
-  document.getElementById('delCustBtn').addEventListener('click', ()=>{
-    if(confirm(`Delete ${cust.name} and all their records? This cannot be undone.`)){
-      state.customers = state.customers.filter(c=>c.id!==cust.id);
-      state.selectedCustomerId = state.customers[0]?.id || null;
-      state.selectedPetId = state.selectedCustomerId ? getCustomer(state.selectedCustomerId).pets[0]?.id : null;
-      render(); scheduleSync(); toast('Customer deleted');
-    }
+  document.getElementById('delCustBtn').addEventListener('click', async ()=>{
+    if(_offlineMode){ offlineEditBlocked(); return; }
+    const petIds = (cust.pets||[]).map(p=>p.id);
+    const plan = planSharedStayChanges(petIds);
+    const msg = `Delete ${cust.name} and all their records? This cannot be undone.` + sharedStayDeleteNote(plan, cust);
+    if(!confirm(msg)) return;
+    if(!(await applySharedStayChanges(plan, petIds))) return;
+    state.customers = state.customers.filter(c=>c.id!==cust.id);
+    state.selectedCustomerId = state.customers[0]?.id || null;
+    state.selectedPetId = state.selectedCustomerId ? getCustomer(state.selectedCustomerId).pets[0]?.id : null;
+    render(); scheduleSync(); toast('Customer deleted');
   });
   document.getElementById('addPaymentBtn').addEventListener('click', ()=>openPaymentModal(cust));
   document.getElementById('addPickupBtn').addEventListener('click', ()=>openPickupModal(cust, null));
@@ -4246,7 +4289,9 @@ function computeStayCost(stay){
     for(let n=0;n<roomNights;n++){
       const dateStr = addDays(roomCheckIn, n);
       // only the occupants actually present this specific night
-      const presentToday = occupants.filter(o => dateStr >= o.checkIn && dateStr < o.checkOut);
+      // findPetById: a sharing partner whose pet was deleted is no longer charged a surcharge (25 Oct 2026) —
+      // previously the stay card still billed it while the WhatsApp quote didn't.
+      const presentToday = occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut);
       if(presentToday.length===0) continue;
       maxConcurrent = Math.max(maxConcurrent, presentToday.length);
       const holiday = isHoliday(dateStr);
@@ -4765,14 +4810,17 @@ function wireSubContentEvents(cust, pet){
   const editPetBtn = root.querySelector('[data-act="edit-pet"]');
   if(editPetBtn) editPetBtn.addEventListener('click', ()=>openPetModal(cust, pet));
   const delPetBtn = root.querySelector('[data-act="delete-pet"]');
-  if(delPetBtn) delPetBtn.addEventListener('click', ()=>{
-    if(confirm(`Delete ${pet.name}'s record, including boarding & grooming history?`)){
-      cust.pets = cust.pets.filter(p=>p.id!==pet.id);
-      state.selectedPetId = cust.pets[0]?.id || null;
-      renderCustomersMain();
-      scheduleSync();
-      toast('Pet deleted');
-    }
+  if(delPetBtn) delPetBtn.addEventListener('click', async ()=>{
+    if(_offlineMode){ offlineEditBlocked(); return; }
+    const plan = planSharedStayChanges([pet.id]);
+    const msg = `Delete ${pet.name}'s record, including boarding & grooming history?` + sharedStayDeleteNote(plan, cust);
+    if(!confirm(msg)) return;
+    if(!(await applySharedStayChanges(plan, [pet.id]))) return;
+    cust.pets = cust.pets.filter(p=>p.id!==pet.id);
+    state.selectedPetId = cust.pets[0]?.id || null;
+    renderCustomersMain();
+    scheduleSync();
+    toast('Pet deleted');
   });
   const petPhotoUploadBtn = root.querySelector('#petPhotoUploadBtn');
   if(petPhotoUploadBtn){
@@ -6655,6 +6703,151 @@ async function selectAllRows(build){
   }
   return { data: all, error: null };
 }
+
+/* =========================================================
+   SHARED-ROOM SAFE DELETE (25 Oct 2026)
+   A shared room is stored once, under the pet it was booked under. Deleting
+   that pet (or its customer) used to delete the whole stay — silently
+   wiping the booking of every OTHER pet sharing the room, possibly another
+   customer's. And deleting a sharing PARTNER left its id in the stay, so the
+   stay card kept charging a surcharge for a pet that no longer exists.
+   Now, before a pet/customer is deleted:
+   - stays it holds that still have other pets are MOVED under one of those
+     pets (saved to the cloud first, before the pet row is removed, so the
+     database can never drop the stay along with the deleted pet);
+   - it is removed from any stay it was only a sharing partner in.
+   ========================================================= */
+function stayPetIdList(stay){
+  return Array.from(new Set((stay.pets||[]).flatMap(sp=>[sp.petId, ...(sp.sharingWith||[])]).filter(Boolean)));
+}
+function removePetsFromStay(stay, delSet){
+  const rows = [];
+  (stay.pets||[]).forEach(sp=>{
+    const ids = [sp.petId, ...(sp.sharingWith||[])].filter(id=>id && !delSet.has(id));
+    if(!ids.length) return;
+    const dates = {};
+    Object.entries(sp.dates||{}).forEach(([k,v])=>{ if(!delSet.has(k)) dates[k] = v; });
+    rows.push({ ...sp, petId: ids[0], sharingWith: ids.slice(1), dates });
+  });
+  stay.pets = rows;
+  stay.checkedInPets = (stay.checkedInPets||[]).filter(id=>!delSet.has(id));
+  stay.remindersSent = {
+    checkin: (stay.remindersSent?.checkin||[]).filter(id=>!delSet.has(id)),
+    checkout: (stay.remindersSent?.checkout||[]).filter(id=>!delSet.has(id)),
+  };
+  stay.confirmationSent = (stay.confirmationSent||[]).filter(id=>!delSet.has(id));
+}
+function planSharedStayChanges(delIds){
+  const del = new Set(delIds);
+  const moves = [], partnerEdits = [];
+  state.customers.forEach(c=>(c.pets||[]).forEach(p=>(p.stays||[]).forEach(stay=>{
+    const ids = stayPetIdList(stay);
+    if(!ids.some(id=>del.has(id))) return;
+    if(del.has(p.id)){
+      const keepId = ids.find(id=>!del.has(id) && findPetById(id));
+      if(!keepId) return; // nobody else in this room — stay is deleted with the pet, as before
+      const { pet: toPet, cust: toCust } = findPetWithCustomer(keepId);
+      moves.push({ stay, fromPet: p, fromCust: c, toPet, toCust });
+    } else {
+      partnerEdits.push({ stay });
+    }
+  })));
+  return { moves, partnerEdits };
+}
+function sharedStayDeleteNote(plan, cust){
+  if(!plan.moves.length) return '';
+  const lines = plan.moves.map(m=>`• ${fmtDate(m.stay.checkIn)} → ${fmtDate(m.stay.checkOut)}: kept for ${m.toPet.name}${m.toCust.id!==cust.id?` (${m.toCust.name})`:''}`);
+  const crossOwner = plan.moves.some(m=>m.toCust.id!==m.fromCust.id);
+  return `\n\nShared-room bookings will NOT be deleted — they'll be kept for the other pet(s) in the room:\n${lines.join('\n')}`
+    + (crossOwner ? `\n\nPlease check the payments on those bookings afterwards, since they now sit under a different owner.` : '');
+}
+async function applySharedStayChanges(plan, delIds){
+  const del = new Set(delIds);
+  plan.partnerEdits.forEach(({stay})=>removePetsFromStay(stay, del));
+  if(!plan.moves.length) return true;
+  plan.moves.forEach(m=>{
+    removePetsFromStay(m.stay, del);
+    m.fromPet.stays = (m.fromPet.stays||[]).filter(s=>s.id!==m.stay.id);
+    m.toPet.stays = m.toPet.stays || [];
+    m.toPet.stays.push(m.stay);
+  });
+  if(!cloudEnabled) return true;
+  // Save the move NOW, while the old pet still exists, then confirm the
+  // cloud really has each stay under its new pet before deleting anything.
+  clearTimeout(_syncTimer);
+  for(let i=0; i<60 && _saveInFlight; i++) await new Promise(r=>setTimeout(r, 500));
+  await saveToCloudNow();
+  for(let i=0; i<60 && _saveInFlight; i++) await new Promise(r=>setTimeout(r, 500));
+  const saved = plan.moves.every(m=>_staysBaseline.some(x=>x.stay.id===m.stay.id && x.primaryPetId===m.toPet.id));
+  if(!saved){
+    toast('Could not save the shared-room change to the cloud yet — nothing was deleted. Please try again in a moment.');
+    render();
+    return false;
+  }
+  return true;
+}
+
+/* =========================================================
+   AUTO-REFRESH (25 Oct 2026)
+   A tab left open never saw bookings made on another device until someone
+   reloaded it. Every 3 minutes (and whenever the tab comes back into
+   view) this does a tiny check — ids + version numbers of upcoming
+   grooming and current/upcoming stays, plus row counts of customers, pets
+   and payments; no photos, a few KB — and only if something changed does
+   it reload the data. Skipped whenever someone is mid-edit: a popup is
+   open, a field is focused, or a save is pending/failed.
+   ========================================================= */
+const AUTO_REFRESH_MS = 3 * 60 * 1000;
+let _autoRefreshStarted = false, _autoRefreshBusy = false;
+function autoRefreshIsSafe(){
+  if(!cloudEnabled || !_cloudLoaded || _offlineMode || _saveInFlight) return false;
+  if(document.visibilityState !== 'visible') return false;
+  if(document.getElementById('lockScreen')) return false;
+  const modalRoot = document.getElementById('modalRoot');
+  if(modalRoot && modalRoot.children.length) return false;
+  const ae = document.activeElement;
+  if(ae && ['INPUT','TEXTAREA','SELECT'].includes(ae.tagName)) return false;
+  const el = document.getElementById('syncStatus');
+  return !!el && el.classList.contains('sync-ok');
+}
+async function cloudHasNewerData(){
+  const since = addDays(todayStr(), -1);
+  const [gRes, sRes, cRes, pRes, payRes] = await Promise.all([
+    selectAllRows(()=>sb.from('grooming_appointments').select('id, version').gte('date', since).order('id')),
+    selectAllRows(()=>sb.from('stays').select('id, version').gte('check_out', since).order('id')),
+    sb.from('customers').select('id', {count:'exact', head:true}),
+    sb.from('pets').select('id', {count:'exact', head:true}),
+    sb.from('payments').select('id', {count:'exact', head:true}),
+  ]);
+  if(gRes.error || sRes.error || cRes.error || pRes.error || payRes.error) return false; // can't tell — try again next time
+  const sameSet = (remoteRows, localIds, versions)=>{
+    if(remoteRows.length !== localIds.length) return false;
+    const local = new Set(localIds);
+    return remoteRows.every(r=>local.has(r.id) && versions.get(r.id) === r.version);
+  };
+  const localGrooms = flattenAllGrooms(state.customers).filter(x=>x.groom.date >= since).map(x=>x.groom.id);
+  const localStays = flattenAllStays(state.customers).filter(x=>x.stay.checkOut >= since).map(x=>x.stay.id);
+  const petCount = state.customers.reduce((n,c)=>n+(c.pets||[]).length, 0);
+  const payCount = state.customers.reduce((n,c)=>n+(c.payments||[]).length, 0);
+  return !sameSet(gRes.data, localGrooms, _groomVersions)
+      || !sameSet(sRes.data, localStays, _stayVersions)
+      || cRes.count !== state.customers.length
+      || pRes.count !== petCount
+      || payRes.count !== payCount;
+}
+async function maybeAutoRefresh(){
+  if(_autoRefreshBusy || !autoRefreshIsSafe()) return;
+  _autoRefreshBusy = true;
+  try{
+    if(!(await cloudHasNewerData())) return;
+    if(!autoRefreshIsSafe()) return; // someone started editing while we checked
+    const scrollY = window.scrollY;
+    await loadFromCloud();
+    window.scrollTo(0, scrollY);
+  }catch(err){ console.error('Auto-refresh check failed:', err); }
+  finally{ _autoRefreshBusy = false; }
+}
+
 function findGroomConflict(date, time, bay, excludeId){
   for(const c of state.customers){
     for(const p of c.pets){
@@ -8140,16 +8333,17 @@ const AUTO_BACKUP_SLOTS = [ { hour:10, minute:30, suffix:'-1030' }, { hour:18, m
 async function maybeRunAutoBackup(){
   if(!cloudEnabled) return;
   try{
-    const now = new Date();
     const today = todayStr();
+    // Malaysia time, not the device's own clock setting (25 Oct 2026).
+    const [klHour, klMin] = klTimestamp().split('-').slice(3,5).map(Number);
     for(const slot of AUTO_BACKUP_SLOTS){
-      const slotPassed = now.getHours() > slot.hour || (now.getHours() === slot.hour && now.getMinutes() >= slot.minute);
+      const slotPassed = klHour > slot.hour || (klHour === slot.hour && klMin >= slot.minute);
       if(!slotPassed) continue;
       const id = today + slot.suffix;
       const { data: existing, error: checkErr } = await sb.from('backup_snapshots').select('id').eq('id', id).maybeSingle();
       if(checkErr){ console.error('Auto-backup check failed:', checkErr); continue; }
       if(existing) continue; // already have this slot's snapshot for today
-      const { error: insErr } = await sb.from('backup_snapshots').insert({ id, data: snapshotForBackup() });
+      const { error: insErr } = await sb.from('backup_snapshots').insert({ id, data: snapshotForAutoBackup() });
       if(insErr){ console.error('Auto-backup save failed:', insErr); continue; }
     }
     await pruneOldAutoBackups();
@@ -8193,7 +8387,7 @@ async function openBackupModal(){
   wireSubTabRow('archiveBackupTabs', [{active:false, onClick:()=>openArchiveModal()}, {active:true}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('downloadNowBtn').addEventListener('click', ()=>{
-    const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+    const stamp = klTimestamp();
     downloadBackupFile(snapshotForBackup(), stamp);
     toast('Backup downloaded');
   });
@@ -8748,6 +8942,7 @@ function buildBoardingBlock(stay, sp){
     if(paidThroughCapped && dateStr < paidThroughCapped) continue; // already paid — leave out of the quote
     const holiday = isHoliday(dateStr);
     const presentIds = petIds.filter(id=>{
+      if(!findPetById(id)) return false; // deleted pet — matches computeStayCost (25 Oct 2026)
       const w = petDatesInStay(stay, sp, id);
       return dateStr >= w.checkIn && dateStr < w.checkOut;
     });
@@ -10705,6 +10900,25 @@ document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key=
    they're explicitly added back in here. Shared by the manual "Download
    backup" button, the automatic daily snapshot, and the "Backup history"
    downloader — all three need the exact same complete shape. */
+/* "2026-10-25-07-30-05" in Malaysia time — backup filenames used UTC, so a
+   backup downloaded before 8am showed yesterday's date (25 Oct 2026). */
+function klTimestamp(){
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Kuala_Lumpur', year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hourCycle:'h23' }).formatToParts(new Date());
+  const g = t => (parts.find(x=>x.type===t)||{}).value || '00';
+  return `${g('year')}-${g('month')}-${g('day')}-${g('hour')}-${g('minute')}-${g('second')}`;
+}
+/* What the automatic 10:30am/6pm backups store in the backup_snapshots
+   table (25 Oct 2026): everything EXCEPT photos. 60 full copies including
+   every pet/grooming/belongings photo was the thing most likely to fill
+   Supabase's free 500 MB. The photos themselves are untouched in the live
+   data, and the manual "Download backup now" file still includes them. */
+function snapshotForAutoBackup(){
+  return JSON.parse(JSON.stringify(snapshotForBackup(), (k, v)=>{
+    if(k === 'photos' && Array.isArray(v)) return [];
+    if(typeof v === 'string' && v.startsWith('data:') && v.length > 200) return null;
+    return v;
+  }));
+}
 function snapshotForBackup(){
   return { ...snapshotForCloud(), ...snapshotShopConfig(), customers: state.customers, changeLog: state.changeLog, cancellations: state.cancellations };
 }
