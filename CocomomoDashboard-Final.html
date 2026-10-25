@@ -892,7 +892,16 @@ function hydrateStateFromRemote(remote, opts){
   _lastSyncedJSON = JSON.stringify(remote);
   if(fbgNotesFixed>0 || fbgSharingBackfilled>0 || orphanedPaymentsFixed>0) scheduleSync();
 }
+/* While a cloud load is running, saves wait (25 Oct 2026, second audit):
+   a save firing halfway through a load could compare half-old,
+   half-new data and write stale rows back. The wait is short (the load). */
+let _loadInProgress = false;
 async function loadFromCloud(){
+  _loadInProgress = true;
+  try{ return await loadFromCloudInner(); }
+  finally{ _loadInProgress = false; }
+}
+async function loadFromCloudInner(){
   if(!cloudEnabled){ setSyncStatus('off','Cloud sync not set up'); return; }
   setSyncStatus('saving','Loading from cloud…');
   // Offline-fallback bookkeeping: each load attempt gets a generation number
@@ -1065,6 +1074,7 @@ let _saveInFlight = false;
 async function saveToCloudNow(){
   if(_offlineMode) return; // never push the offline copy (or anything built on it) to the cloud
   if(!cloudEnabled) return;
+  if(_loadInProgress){ clearTimeout(_syncTimer); _syncTimer = setTimeout(saveToCloudNow, 1000); return; }
   if(_saveInFlight){
     // Another save is already mid-retry — don't stack a parallel one, just
     // let this newer snapshot get picked up shortly after the current one
@@ -3106,6 +3116,13 @@ function findPetWithCustomer(petId){
   }
   return { pet:null, cust:null };
 }
+/* Only real embedded images are allowed into an <img src> (deep audit,
+   25 Oct 2026). The signature arrives from the public signing page, so a
+   crafted value could otherwise break out of the attribute and run code
+   inside the staff dashboard. Photos go through the same check. */
+function safeImgSrc(u){
+  return (typeof u === 'string' && /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+\/=\s]+$/.test(u)) ? u : '';
+}
 function esc(s){ return (s??'').toString().replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 /* Display a pet as "Name (Breed)" wherever a pet is listed; falls back to just the name if no breed is set. */
 function petLabel(p){
@@ -3395,7 +3412,7 @@ function renderPetTabs(cust, activePet){
   const wrap = document.getElementById('petTabs');
   wrap.innerHTML = cust.pets.map(p=>`
     <div class="pet-tab ${activePet && p.id===activePet.id ? 'active':''}" data-pet="${p.id}">
-      ${p.photo ? `<img class="pet-tab-thumb" src="${p.photo}">` : `<span class="pt-icon">${ANIMAL_ICON[p.type]||'🐾'}</span>`} ${petLabel(p)}${riskFlagBadgesHtml(p, true)}
+      ${p.photo ? `<img class="pet-tab-thumb" src="${safeImgSrc(p.photo)}">` : `<span class="pt-icon">${ANIMAL_ICON[p.type]||'🐾'}</span>`} ${petLabel(p)}${riskFlagBadgesHtml(p, true)}
     </div>
   `).join('') + `<div class="pet-tab pet-tab-add" id="addPetTab">+ Add pet</div>`;
   wrap.querySelectorAll('.pet-tab[data-pet]').forEach(el=>{
@@ -3422,7 +3439,7 @@ function petInfoHtml(p){
       <div style="display:flex;align-items:center;gap:14px;">
         <div class="pet-photo-box" data-pet-photo-box>
           ${p.photo
-            ? `<img src="${p.photo}" class="pet-photo-img" data-view-pet-photo>`
+            ? `<img src="${safeImgSrc(p.photo)}" class="pet-photo-img" data-view-pet-photo>`
             : `<div class="pet-photo-placeholder">${ANIMAL_ICON[p.type]||'🐾'}</div>`}
         </div>
         <div>
@@ -4165,7 +4182,7 @@ function findPetAcrossStay(cust, petId){
 function belongingChipHtml(key, idx, b, editable){
   const bkey = `${key}:${idx}`;
   const photoPart = b.photo
-    ? `<img class="belonging-photo" src="${b.photo}" data-view-belonging="${bkey}" title="View photo">`
+    ? `<img class="belonging-photo" src="${safeImgSrc(b.photo)}" data-view-belonging="${bkey}" title="View photo">`
     : (editable ? `<button type="button" class="belonging-cam" data-attach-belonging="${bkey}" title="Attach photo">📷</button>` : '<span>📷</span>');
   return `<div class="belonging-chip">${photoPart} ${esc(b.item)}${editable ? `<button type="button" class="belonging-x" data-remove-belonging-inline="${bkey}" title="Remove">✕</button>` : ''}</div>`;
 }
@@ -4646,7 +4663,7 @@ function groomCardHtml(g){
         <div class="photo-row">
           ${g.photos.length ? g.photos.map((ph,i)=>`
             <div class="photo-thumb-wrap" data-photo-wrap>
-              <img class="photo-thumb" src="${ph.dataUrl}" data-view-photo="${g.id}:${i}">
+              <img class="photo-thumb" src="${safeImgSrc(ph.dataUrl)}" data-view-photo="${g.id}:${i}">
               <button type="button" class="photo-remove" data-remove-photo="${g.id}:${i}" title="Remove photo">✕</button>
             </div>`).join('') : '<span style="font-size:12px;color:var(--ink-soft);">No photos attached</span>'}
           <button class="btn btn-sm btn-ghost" data-act="add-photo" data-groom="${g.id}">+ Add photo</button>
@@ -4964,6 +4981,18 @@ function wireSubContentEvents(cust, pet){
       if(blockCheckoutIfUnpaid(s)) return;
       openChecklistModal('Check-out checklist', checkoutChecklistItems(cust, s), 'Complete check-out', ()=>{
         if(blockCheckoutIfUnpaid(s)) return;
+        // Deep audit (25 Oct 2026): checking out before the booked check-out
+        // date used to leave the room blocked (and the nights billed) until
+        // the original date. Ask whether to shorten the stay to today.
+        const today = todayStr();
+        if(s.checkOut > today && s.checkIn <= today &&
+           confirm(`This stay was booked until ${fmtDate(s.checkOut)}. Change the check-out date to today (${fmtDate(today)})?\n\nOK = frees the room from today and bills only the nights actually stayed.\nCancel = keep the original date (e.g. unused nights are still charged).`)){
+          s.checkOut = today;
+          (s.pets||[]).forEach(sp=>Object.values(sp.dates||{}).forEach(d=>{ if(d.checkOut > today) d.checkOut = today; if(d.checkIn > today) d.checkIn = today; }));
+          const laterFbg = (s.pets||[]).flatMap(sp=>[sp.petId, ...(sp.sharingWith||[])]).map(findPetById).filter(Boolean)
+            .flatMap(pt=>(pt.groomingHistory||[]).filter(g=>(g.apptTypes||[]).includes('FBG') && g.date > today && g.status==='Not arrived'));
+          if(laterFbg.length) toast(`Note: ${laterFbg.length} free grooming appointment(s) after today are still booked — remove them from the grooming tab if no longer needed`);
+        }
         s.status='Past'; scheduleSync(); renderPetSubContent(cust, pet); toast('Checked out');
       });
     });
@@ -5412,7 +5441,7 @@ function compressImage(file, maxDim=1000, quality=0.75){
 function openPhotoLightbox(dataUrl){
   const div = document.createElement('div');
   div.className = 'lightbox-backdrop';
-  div.innerHTML = `<button class="lightbox-close">✕</button><img src="${dataUrl}">`;
+  div.innerHTML = `<button class="lightbox-close">✕</button><img src="${safeImgSrc(dataUrl)}">`;
   div.addEventListener('click', (e)=>{ if(e.target===div || e.target.classList.contains('lightbox-close')) div.remove(); });
   document.body.appendChild(div);
 }
@@ -5505,7 +5534,14 @@ function openCustomerModal(existing){
       existing.emergencyPhone=document.getElementById('f_ephone').value;
       existing.customerTypes=customerTypes;
       existing.flagged=flagged; existing.flagReason=flagReason;
-      if(existing.id !== phone){ existing.id = phone; }
+      // Deep audit (25 Oct 2026): the customer's id used to be switched to
+      // the new phone number here. The id is the database key every pet,
+      // stay, grooming appointment and payment points to, and changing it
+      // made the save DELETE the old customer row — which cascades to the
+      // pets (and their bookings) — then re-create it under the new id.
+      // The id now stays fixed forever; only the phone field changes.
+      const dupe = findCustomerByPhone(phone, existing.id);
+      if(dupe && !confirm(`${dupe.name} already uses this contact number. Save anyway?`)) return;
       closeModal(); render(); scheduleSync();
       if(!wasMembership && isMembershipCustomer(existing)){
         toast('Membership added — set their starting points balance');
@@ -5515,6 +5551,10 @@ function openCustomerModal(existing){
       }
       return;
     } else {
+      // Compares digits only ("012-345 6789" = "0123456789" = "+60123456789"),
+      // against every customer's current phone as well as old ids.
+      const dupe = findCustomerByPhone(phone, null);
+      if(dupe){ toast(`A customer with this contact number already exists (${dupe.name})`); return; }
       if(state.customers.some(c=>c.id===phone)){ toast('A customer with this contact number already exists'); return; }
       const nc = { id:phone, name, icPassport:document.getElementById('f_ic').value, phone,
         gender:document.getElementById('f_gender').value, dob:document.getElementById('f_dob').value,
@@ -5531,6 +5571,17 @@ function openCustomerModal(existing){
       return;
     }
   });
+}
+/* Digits-only, Malaysian prefix folded: "+6012-345 6789" -> "0123456789". */
+function phoneDigitsKey(ph){
+  let d = String(ph||'').replace(/\D/g,'');
+  if(d.startsWith('60')) d = '0' + d.slice(2);
+  return d;
+}
+function findCustomerByPhone(phone, excludeId){
+  const key = phoneDigitsKey(phone);
+  if(!key) return null;
+  return state.customers.find(c=>c.id!==excludeId && (phoneDigitsKey(c.phone)===key || phoneDigitsKey(c.id)===key)) || null;
 }
 document.getElementById('addCustomerBtn').addEventListener('click', ()=>openCustomerModal(null));
 
@@ -5623,6 +5674,7 @@ function openPaymentModal(cust, existing, presetStayId){
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const amount = +document.getElementById('pay_amount').value;
     if(!amount || amount<=0){ toast('Please enter a valid amount'); return; }
+    if(!document.getElementById('pay_date').value){ toast('Please pick the payment date'); return; } // deep audit 25 Oct 2026: blank-dated payments were left out of monthly reports
     const type = document.getElementById('pay_type').value;
     const data = {
       type, amount, date:document.getElementById('pay_date').value,
@@ -5708,6 +5760,7 @@ function openPointsModal(cust, existing){
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const amount = +document.getElementById('pts_amount').value;
     if(!amount || amount<=0){ toast('Please enter a valid number of points'); return; }
+    if(!document.getElementById('pts_date').value){ toast('Please pick a date'); return; } // deep audit 25 Oct 2026
     const type = document.getElementById('pts_type').value;
     if(type==='Deduct' && !existing){
       const projected = currentBalance - amount;
@@ -5765,7 +5818,7 @@ function openAgreementModal(cust){
       ${existing ? `
         <div class="kv-row"><span>Signed by</span><span>${esc(existing.signedName)}</span></div>
         <div class="kv-row"><span>Date</span><span>${fmtDate(existing.signedAt)}</span></div>
-        ${existing.signatureDataUrl ? `<img src="${existing.signatureDataUrl}" style="max-width:260px;border:1px solid var(--line);border-radius:8px;background:#fff;margin-top:6px;">` : ''}
+        ${existing.signatureDataUrl ? `<img src="${safeImgSrc(existing.signatureDataUrl)}" style="max-width:260px;border:1px solid var(--line);border-radius:8px;background:#fff;margin-top:6px;">` : ''}
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line-soft);">
           <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:10px;">Policy changed, or need a fresh signature? Re-sign below.</div>
       ` : ''}
@@ -5839,15 +5892,29 @@ async function checkSignedAgreements(){
   const pending = state.customers.filter(c => c.agreementToken && !c.agreement);
   if(pending.length===0) return;
   try{
+    // Second audit (25 Oct 2026): this runs every minute on every open
+    // device, and used to download the full policy text (and signature
+    // image) for EVERY customer with an unsigned link, every time — a
+    // steady drain on the free download allowance that grows with each
+    // unsigned link. Now: a tiny "which are signed?" check first (in
+    // batches, so a long list of links can't make the request too long
+    // and silently fail), then the full details only for newly signed ones.
     const tokens = pending.map(c=>c.agreementToken);
-    const { data, error } = await sb.from('agreement_signing').select('token,signed,signed_name,signature_data_url,signed_at,policy_text').in('token', tokens);
+    const signedTokens = [];
+    for(let i=0; i<tokens.length; i+=100){
+      const { data: chk, error: chkErr } = await sb.from('agreement_signing').select('token').in('token', tokens.slice(i, i+100)).eq('signed', true);
+      if(chkErr) throw chkErr;
+      (chk||[]).forEach(r=>signedTokens.push(r.token));
+    }
+    if(!signedTokens.length) return;
+    const { data, error } = await sb.from('agreement_signing').select('token,signed,signed_name,signature_data_url,signed_at,policy_text').in('token', signedTokens);
     if(error) throw error;
     let changed = false;
     (data||[]).forEach(row=>{
       if(!row.signed) return;
       const cust = pending.find(c=>c.agreementToken===row.token);
       if(cust && !cust.agreement){
-        cust.agreement = { signedName: row.signed_name, signedAt: row.signed_at, policyTextSnapshot: row.policy_text, signatureDataUrl: row.signature_data_url };
+        cust.agreement = { signedName: row.signed_name, signedAt: row.signed_at, policyTextSnapshot: row.policy_text, signatureDataUrl: safeImgSrc(row.signature_data_url) || null };
         changed = true;
       }
     });
@@ -6232,7 +6299,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
           ${sp.belongings.map((b,bidx)=>{
             const bkey = `${idx}:${bidx}`;
             const photoPart = b.photo
-              ? `<img class="belonging-photo" src="${b.photo}" data-modal-view-belonging="${bkey}" title="View photo">`
+              ? `<img class="belonging-photo" src="${safeImgSrc(b.photo)}" data-modal-view-belonging="${bkey}" title="View photo">`
               : `<button type="button" class="belonging-cam" data-modal-attach-belonging="${bkey}" title="Attach photo">📷</button>`;
             return `<div class="belonging-chip">${photoPart} ${esc(b.item)} <button type="button" class="belonging-x" data-remove-belonging="${idx}-${bidx}" title="Remove">✕</button></div>`;
           }).join('')}
@@ -6269,8 +6336,18 @@ function openStayModal(cust, primaryPet, existing, afterSave){
           toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates in the sharing section aren't valid`);
           return;
         }
+        // Deep audit (25 Oct 2026): a sharing pet's own dates must sit inside the stay.
+        if(d.checkIn < checkIn || d.checkOut > checkOut){
+          const { pet: badPet } = findPetWithCustomer(petId);
+          toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates must be within the stay (${fmtDate(checkIn)} → ${fmtDate(checkOut)})`);
+          return;
+        }
       }
     }
+    // Deep audit (25 Oct 2026): the same room picked twice in one booking was never caught.
+    const roomsUsed = workingPets.map(w=>w.room);
+    const dupRoom = roomsUsed.find((r,i)=>roomsUsed.indexOf(r)!==i);
+    if(dupRoom){ toast(`${dupRoom} is picked for two pets in this booking — put them in one row as "sharing", or choose another room`); return; }
     const conflictRoom = workingPets.find(w => { const rw = spRoomWindow({checkIn, checkOut}, w); return !isRoomAvailable(w.room, rw.checkIn, rw.checkOut, existing?.id); });
     if(conflictRoom){ toast(`${conflictRoom.room} is already booked for these dates — please choose a different room`); return; }
     const saveBtn = document.getElementById('saveBtn');
@@ -6585,8 +6662,15 @@ function openGroomModal(cust, pet, existing, opts){
     const time = document.getElementById('g_time').value;
     const bay = document.getElementById('g_bay').value;
     const apptTypes = getGTypes();
+    if(!date){ toast('Please pick a date'); return; } // deep audit 25 Oct 2026: a blank date saved an appointment that showed nowhere
     if(apptTypes.length===0){ toast('Please pick at least one appointment type'); return; }
     if(!existing && isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
+    // Deep audit (25 Oct 2026): editing an appointment could move it onto a closed day unnoticed.
+    if(existing && date !== existing.date && isClosedDate(date) && !confirm('The shop is closed on that date. Move this appointment there anyway?')) return;
+    const repeatUntilChk = document.getElementById('g_repeat_until')?.value;
+    if(!existing && (document.getElementById('g_repeat')?.value||'none') !== 'none' && repeatUntilChk && repeatUntilChk < date){
+      toast('"Repeat until" is before the first appointment date — nothing would be booked'); return;
+    }
     const conflict = findGroomConflict(date, time, bay, existing?.id);
     if(conflict){ toast(`${bay} is already booked at ${time} on that date`); return; }
     const saveBtn = document.getElementById('saveBtn');
@@ -6633,7 +6717,11 @@ function openGroomModal(cust, pet, existing, opts){
     // can manually place those few instead. Each iteration also re-checks
     // LIVE (not just local) — same double-booking gap as a single booking,
     // just repeated per date in the series.
-    const step = repeatMode==='weekly' ? (d)=>addDays(d,7) : repeatMode==='biweekly' ? (d)=>addDays(d,14) : (d)=>addMonths(d,1);
+    // Monthly counts from the FIRST date each time (deep audit, 25 Oct 2026):
+    // stepping month-by-month from the previous result drifted after a short
+    // month (31 Jan -> 28 Feb -> 28 Mar -> 28 Apr...). Now 31 Jan -> 28 Feb -> 31 Mar.
+    let monthIdx = 0;
+    const step = repeatMode==='weekly' ? (d)=>addDays(d,7) : repeatMode==='biweekly' ? (d)=>addDays(d,14) : ()=>addMonths(date, ++monthIdx);
     let cursor = date;
     let booked = 0, skipped = [], skippedClosed = [];
     while(cursor <= repeatUntil){
@@ -6810,7 +6898,25 @@ function autoRefreshIsSafe(){
   const el = document.getElementById('syncStatus');
   return !!el && el.classList.contains('sync-ok');
 }
-async function cloudHasNewerData(){
+/* Fetches up to ~100 full rows per request by id (keeps URLs short). */
+async function fetchRowsByIds(table, ids){
+  const out = [];
+  for(let i=0; i<ids.length; i+=100){
+    const { data, error } = await sb.from(table).select('*').in('id', ids.slice(i, i+100));
+    if(error) return { data:null, error };
+    out.push(...(data||[]));
+  }
+  return { data: out, error: null };
+}
+/* Auto-refresh (revised 25 Oct 2026, second audit): instead of reloading
+   EVERYTHING (every photo included) whenever another device changed one
+   thing — which on a busy day across 3 devices could burn through the free
+   5 GB monthly download allowance — this fetches only the grooming
+   appointments and stays that actually changed, and merges them in. Only a
+   new/removed customer or pet (rare) triggers a full reload; a payment
+   change reloads just the small payments table. Returns false if anything
+   couldn't be checked (it simply tries again next time). */
+async function refreshChangedData(){
   const since = addDays(todayStr(), -1);
   const [gRes, sRes, cRes, pRes, payRes] = await Promise.all([
     selectAllRows(()=>sb.from('grooming_appointments').select('id, version').gte('date', since).order('id')),
@@ -6819,32 +6925,78 @@ async function cloudHasNewerData(){
     sb.from('pets').select('id', {count:'exact', head:true}),
     sb.from('payments').select('id', {count:'exact', head:true}),
   ]);
-  if(gRes.error || sRes.error || cRes.error || pRes.error || payRes.error) return false; // can't tell — try again next time
-  const sameSet = (remoteRows, localIds, versions)=>{
-    if(remoteRows.length !== localIds.length) return false;
-    const local = new Set(localIds);
-    return remoteRows.every(r=>local.has(r.id) && versions.get(r.id) === r.version);
-  };
-  const localGrooms = flattenAllGrooms(state.customers).filter(x=>x.groom.date >= since).map(x=>x.groom.id);
-  const localStays = flattenAllStays(state.customers).filter(x=>x.stay.checkOut >= since).map(x=>x.stay.id);
+  if(gRes.error || sRes.error || cRes.error || pRes.error || payRes.error) return false;
   const petCount = state.customers.reduce((n,c)=>n+(c.pets||[]).length, 0);
+  if(cRes.count !== state.customers.length || pRes.count !== petCount){
+    await loadFromCloud(); // new or removed customer/pet — full reload, rare
+    return true;
+  }
+  // Work out what changed inside the window.
+  const diff = (remoteRows, localIds, versions)=>{
+    const remoteIds = new Set(remoteRows.map(r=>r.id));
+    const changed = remoteRows.filter(r=>versions.get(r.id) !== r.version).map(r=>r.id);
+    const removed = localIds.filter(id=>!remoteIds.has(id));
+    return { changed, removed };
+  };
+  const localG = flattenAllGrooms(state.customers).filter(x=>x.groom.date >= since).map(x=>x.groom.id);
+  const localS = flattenAllStays(state.customers).filter(x=>x.stay.checkOut >= since).map(x=>x.stay.id);
+  const g = diff(gRes.data, localG, _groomVersions);
+  const st = diff(sRes.data, localS, _stayVersions);
   const payCount = state.customers.reduce((n,c)=>n+(c.payments||[]).length, 0);
-  return !sameSet(gRes.data, localGrooms, _groomVersions)
-      || !sameSet(sRes.data, localStays, _stayVersions)
-      || cRes.count !== state.customers.length
-      || pRes.count !== petCount
-      || payRes.count !== payCount;
+  const paymentsChanged = payRes.count !== payCount;
+  if(!g.changed.length && !g.removed.length && !st.changed.length && !st.removed.length && !paymentsChanged) return true;
+  // A row that moved out of the window (e.g. date changed to last week)
+  // shows up as "removed" here — fetch those too, so a moved row is
+  // updated rather than dropped. Rows genuinely deleted won't come back.
+  const [gRows, sRows] = await Promise.all([
+    fetchRowsByIds('grooming_appointments', [...g.changed, ...g.removed]),
+    fetchRowsByIds('stays', [...st.changed, ...st.removed]),
+  ]);
+  if(gRows.error || sRows.error) return false;
+  if(!autoRefreshIsSafe()) return false; // someone started editing meanwhile — don't touch their screen
+  const petsById = new Map();
+  state.customers.forEach(c=>c.pets.forEach(p=>petsById.set(p.id, p)));
+  if([...gRows.data.map(r=>r.pet_id), ...sRows.data.map(r=>r.primary_pet_id)].some(id=>!petsById.has(id))){
+    await loadFromCloud(); // belongs to a pet this device doesn't have yet
+    return true;
+  }
+  // Grooming: remove old copies of every fetched/removed id, then insert fresh ones.
+  const gTouch = new Set([...g.changed, ...g.removed]);
+  state.customers.forEach(c=>c.pets.forEach(p=>{ p.groomingHistory = (p.groomingHistory||[]).filter(x=>!gTouch.has(x.id)); }));
+  g.removed.forEach(id=>_groomVersions.delete(id));
+  gRows.data.forEach(r=>{ petsById.get(r.pet_id).groomingHistory.push(groomFromRow(r)); _groomVersions.set(r.id, r.version); });
+  // Stays: same.
+  const sTouch = new Set([...st.changed, ...st.removed]);
+  state.customers.forEach(c=>c.pets.forEach(p=>{ p.stays = (p.stays||[]).filter(x=>!sTouch.has(x.id)); }));
+  st.removed.forEach(id=>_stayVersions.delete(id));
+  sRows.data.forEach(r=>{ petsById.get(r.primary_pet_id).stays.push(stayFromRow(r)); _stayVersions.set(r.id, r.version); });
+  // Nothing was pending locally (autoRefreshIsSafe requires "Synced"), so
+  // what's in memory now IS the cloud state — make it the new baseline.
+  _lastSyncedGroomsJSON = JSON.stringify(flattenAllGrooms(state.customers));
+  _groomsBaseline = JSON.parse(_lastSyncedGroomsJSON);
+  _lastSyncedStaysJSON = JSON.stringify(flattenAllStays(state.customers));
+  _staysBaseline = JSON.parse(_lastSyncedStaysJSON);
+  _lastSyncedCustomersJSON = JSON.stringify(state.customers);
+  _customersBaseline = JSON.parse(_lastSyncedCustomersJSON);
+  if(paymentsChanged){
+    await loadPaymentsFromTables();
+    _lastSyncedCustomersJSON = JSON.stringify(state.customers);
+    _customersBaseline = JSON.parse(_lastSyncedCustomersJSON);
+  }
+  const scrollY = window.scrollY;
+  render();
+  window.scrollTo(0, scrollY);
+  return true;
 }
+let _lastRenderedDay = null;
 async function maybeAutoRefresh(){
+  // Tab left open past midnight: move Today/Tomorrow/Yesterday along.
+  if(_lastRenderedDay && _lastRenderedDay !== todayStr() && autoRefreshIsSafe()) render();
+  _lastRenderedDay = todayStr();
   if(_autoRefreshBusy || !autoRefreshIsSafe()) return;
   _autoRefreshBusy = true;
-  try{
-    if(!(await cloudHasNewerData())) return;
-    if(!autoRefreshIsSafe()) return; // someone started editing while we checked
-    const scrollY = window.scrollY;
-    await loadFromCloud();
-    window.scrollTo(0, scrollY);
-  }catch(err){ console.error('Auto-refresh check failed:', err); }
+  try{ await refreshChangedData(); }
+  catch(err){ console.error('Auto-refresh failed:', err); }
   finally{ _autoRefreshBusy = false; }
 }
 
@@ -7538,21 +7690,26 @@ async function migrateStaysFromPetsColumnIfNeeded(customers){
    authoritative table copy, then normalizes each through normalizeStay so
    nothing else in the app needs to know this changed. Also resets
    `_staysBaseline` to match. */
+/* Table row -> in-app stay object (shared by the full load and the
+   auto-refresh's changed-rows-only merge, 25 Oct 2026). */
+function stayFromRow(s){
+  return normalizeStay({
+    id: s.id, checkIn: s.check_in, checkOut: s.check_out, status: s.status,
+    checkedIn: s.checked_in, checkedInPets: s.checked_in_pets || [],
+    notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
+    charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
+    paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
+    confirmationSent: s.confirmation_sent || [],
+    billingGroupId: s.billing_group_id || null,
+    daycareRate: s.daycare_rate,
+  });
+}
 async function loadStaysFromTables(){
   const { data: stayRows, error } = await selectAllRows(()=>sb.from('stays').select('*').order('created_at').order('id'));
   if(error){ console.error('Stays load failed:', error); _loadProblems.push('stays'); toast('Stay/booking data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const stayById = {};
   (stayRows||[]).forEach(s=>{
-    const stay = normalizeStay({
-      id: s.id, checkIn: s.check_in, checkOut: s.check_out, status: s.status,
-      checkedIn: s.checked_in, checkedInPets: s.checked_in_pets || [],
-      notes: s.notes || '', customRate: s.custom_rate, customRateMode: s.custom_rate_mode || 'flat',
-      charges: s.charges || [], pets: s.pets || [], dropoff: s.dropoff || null, pickup: s.pickup || null,
-      paidThrough: s.paid_through || null, remindersSent: s.reminders_sent || {checkin:[],checkout:[]},
-      confirmationSent: s.confirmation_sent || [],
-      billingGroupId: s.billing_group_id || null,
-      daycareRate: s.daycare_rate,
-    });
+    const stay = stayFromRow(s);
     (stayById[s.primary_pet_id] = stayById[s.primary_pet_id] || []).push(stay);
   });
   state.customers.forEach(c=>c.pets.forEach(p=>{ p.stays = stayById[p.id] || []; }));
@@ -7644,22 +7801,27 @@ async function migrateGroomsFromPetsColumnIfNeeded(customers){
 /* Loads every grooming appointment from the table and attaches it back
    onto the right pet's `.groomingHistory` array (matched by pet_id),
    normalizing each through normalizeGroom. Also resets `_groomsBaseline`. */
+/* Table row -> in-app grooming appointment (shared by the full load and
+   the auto-refresh's changed-rows-only merge, 25 Oct 2026). */
+function groomFromRow(g){
+  return normalizeGroom({
+    id: g.id, date: g.date, time: g.time || '', bay: g.bay || '', apptTypes: g.appt_types || [],
+    sizeCode: g.size_code || '', cutCode: g.cut_code || '', details: g.details || '',
+    addons: g.addons || [], photos: g.photos || [], notes: g.notes || '', status: g.status,
+    groomColor: g.groom_color || null, reminderSent: !!g.reminder_sent,
+    // The rest of the app looks these up directly off the appointment
+    // object (e.g. the grooming grid's cust/pet lookup) rather than only
+    // relying on which pet's array it's nested in — omitting them here
+    // is what caused names to go missing on the grid after this migration.
+    customerId: g.customer_id, petId: g.pet_id,
+  });
+}
 async function loadGroomsFromTables(){
   const { data: rows, error } = await selectAllRows(()=>sb.from('grooming_appointments').select('*').order('created_at').order('id'));
   if(error){ console.error('Grooming load failed:', error); _loadProblems.push('grooming'); toast('Grooming data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const byPet = {};
   (rows||[]).forEach(g=>{
-    const groom = normalizeGroom({
-      id: g.id, date: g.date, time: g.time || '', bay: g.bay || '', apptTypes: g.appt_types || [],
-      sizeCode: g.size_code || '', cutCode: g.cut_code || '', details: g.details || '',
-      addons: g.addons || [], photos: g.photos || [], notes: g.notes || '', status: g.status,
-      groomColor: g.groom_color || null, reminderSent: !!g.reminder_sent,
-      // The rest of the app looks these up directly off the appointment
-      // object (e.g. the grooming grid's cust/pet lookup) rather than only
-      // relying on which pet's array it's nested in — omitting them here
-      // is what caused names to go missing on the grid after this migration.
-      customerId: g.customer_id, petId: g.pet_id,
-    });
+    const groom = groomFromRow(g);
     (byPet[g.pet_id] = byPet[g.pet_id] || []).push(groom);
   });
   state.customers.forEach(c=>c.pets.forEach(p=>{ p.groomingHistory = byPet[p.id] || []; }));
@@ -8066,6 +8228,21 @@ async function runArchive({ stays, grooms, payments }){
   for(const id of stayIds){ const { error } = await sb.from('stays').delete().eq('id', id); if(error) throw error; }
   for(const id of groomIds){ const { error } = await sb.from('grooming_appointments').delete().eq('id', id); if(error) throw error; }
   for(const id of paymentIds){ const { error } = await sb.from('payments').delete().eq('id', id); if(error) throw error; }
+  // Deep audit (25 Oct 2026): a payment split across an archived stay AND a
+  // stay that stays live kept pointing at the archived one, so the whole
+  // payment counted against the remaining stay (showing it as overpaid).
+  // Unlink and write just those payments directly — the baseline reset
+  // below means the normal save wouldn't notice the change.
+  for(const c of state.customers){
+    for(const pmt of (c.payments||[])){
+      if(paymentIds.has(pmt.id) || !(pmt.stayIds||[]).some(id=>stayIds.has(id))) continue;
+      pmt.stayIds = pmt.stayIds.filter(id=>!stayIds.has(id));
+      const { data, error } = await sb.from('payments').update({ stay_ids: pmt.stayIds }).eq('id', pmt.id).eq('version', _paymentVersions.get(pmt.id)).select();
+      if(error) throw error;
+      if(data && data.length) _paymentVersions.set(pmt.id, data[0].version);
+      else console.warn('Payment changed on another device during archive — refresh to see latest:', pmt.id);
+    }
+  }
   // Reflect it locally right away rather than waiting for a reload, and
   // update every baseline that tracks these three areas so the next
   // scheduleSync() doesn't see them as "removed since baseline" and try to
@@ -8554,6 +8731,17 @@ async function openStaffModal(){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', async ()=>{
     syncStaffFromDom();
+    // Deep audit (25 Oct 2026): clearing a staff member's name used to
+    // silently delete them (and all their leave) on save, and a leave whose
+    // end date was before its start was kept but never shown anywhere.
+    const nameless = workingStaff.find(s=>!(s.name||'').trim() && (originalStaff||[]).some(o=>o.id===s.id));
+    if(nameless){ toast('A staff member has no name — type their name back in, or use the remove button to delete them'); return; }
+    for(const st of workingStaff){
+      for(const l of (st.leaves||[])){
+        if(l.start && l.end && l.end < l.start){ toast(`${(st.name||'').trim()||'A staff member'}'s leave ends before it starts`); return; }
+        if((l.start && !l.end) || (!l.start && l.end)){ toast(`${(st.name||'').trim()||'A staff member'}'s leave needs both a start and end date`); return; }
+      }
+    }
     const cleaned = workingStaff
       .filter(s=>s.name && s.name.trim())
       .map(s=>({ ...s, leaves: s.leaves.filter(l=>l.start && l.end) }));
@@ -9823,6 +10011,27 @@ function openRatesModal(){
   wireSubTabRow('ratesStaffTabs', [{active:true}, {active:false, onClick:()=>openStaffModal()}]);
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.getElementById('saveBtn').addEventListener('click', ()=>{
+    // Deep audit (25 Oct 2026): a blank rate field used to save as RM 0 (a
+    // free room), a holiday row with no name was silently thrown away (so
+    // normal rates got charged on that holiday), and an end date before the
+    // start date was saved but never matched any day.
+    const rateIds = ['r_dsm_n','r_dsm_h','r_dl_n','r_dl_h','r_su_n','r_su_h','r_ro_n','r_ro_h','r_cat_n','r_cat_h','r_sur_sm','r_sur_lxl','r_sur_cat','r_day_sm','r_day_lxl'];
+    const badRate = rateIds.find(id=>{ const el=document.getElementById(id); if(!el) return false; const v=el.value.trim(); return v==='' || isNaN(+v) || +v<0; });
+    if(badRate){ toast('Every rate needs a number (0 or more) — one is blank or invalid'); document.getElementById(badRate).focus(); return; }
+    let rangeProblem = '';
+    document.querySelectorAll('#holidayRows [data-hrow]').forEach(row=>{
+      const name=row.querySelector('[data-h-name]').value.trim(), st=row.querySelector('[data-h-start]').value, en=row.querySelector('[data-h-end]').value;
+      if(!rangeProblem && (st || en || name)){
+        if(!name) rangeProblem = 'A holiday period has no name — give it a name or remove it';
+        else if(!st || !en) rangeProblem = `"${name}" needs both a start and an end date`;
+        else if(en < st) rangeProblem = `"${name}" ends before it starts`;
+      }
+    });
+    document.querySelectorAll('#closedRows [data-crow]').forEach(row=>{
+      const name=row.querySelector('[data-c-name]').value.trim()||'A closed period', st=row.querySelector('[data-c-start]').value, en=row.querySelector('[data-c-end]').value;
+      if(!rangeProblem && st && en && en < st) rangeProblem = `${name} ends before it starts`;
+    });
+    if(rangeProblem){ toast(rangeProblem); return; }
     state.rates['Dog Deluxe (Bottom)'] = {label:'Dog Deluxe S/M', normal:+document.getElementById('r_dsm_n').value, holiday:+document.getElementById('r_dsm_h').value};
     state.rates['Dog Deluxe (Upper)'] = {...state.rates['Dog Deluxe (Bottom)']};
     LARGE.normal = +document.getElementById('r_dl_n').value; LARGE.holiday = +document.getElementById('r_dl_h').value;
@@ -10518,6 +10727,11 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
         toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates in the sharing section aren't valid`);
         return;
       }
+      if(d.checkIn < checkIn || d.checkOut > checkOut){ // deep audit 25 Oct 2026
+        const { pet: badPet } = findPetWithCustomer(petId);
+        toast(`${badPet?badPet.name+"'s":'That pet\'s'} own dates must be within the stay (${fmtDate(checkIn)} → ${fmtDate(checkOut)})`);
+        return;
+      }
     }
     const stayPet = { petId: pet.id, room, sharingWith: cbSharingIds.filter(id=>id!==pet.id), feeding: document.getElementById('cb_feeding').value, belongings:[], dates: cbSharingDates };
     const rowWindow = spRoomWindow({checkIn, checkOut}, stayPet);
@@ -10859,6 +11073,7 @@ function openFullBookingModal(prefTime, prefBay){
     const time = document.getElementById('b_time').value;
     const bay = document.getElementById('b_bay').value;
     const apptTypes = getBTypes();
+    if(!date){ toast('Please pick a date'); return; } // deep audit 25 Oct 2026
     if(apptTypes.length===0){ toast('Please pick at least one appointment type'); return; }
     if(isClosedDate(date)){ toast('Shop is closed on that date — no grooming appointments can be taken'); return; }
     if(findGroomConflict(date,time,bay,null)){ toast(`${bay} is already booked at ${time} on that date`); return; }
