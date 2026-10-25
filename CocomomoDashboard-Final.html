@@ -4503,9 +4503,11 @@ function isRoomAvailable(roomId, checkIn, checkOut, excludeStayId){
    confirm, proceed" so a network hiccup doesn't block booking outright. */
 async function isRoomAvailableLive(roomId, checkIn, checkOut, excludeStayId){
   if(!cloudEnabled || !checkIn || !checkOut) return true;
-  let q = sb.from('stays').select('*').gt('check_out', checkIn).lt('check_in', checkOut);
-  if(excludeStayId) q = q.neq('id', excludeStayId);
-  const { data, error } = await q;
+  const { data, error } = await selectAllRows(()=>{
+    let q = sb.from('stays').select('*').gt('check_out', checkIn).lt('check_in', checkOut).order('id');
+    if(excludeStayId) q = q.neq('id', excludeStayId);
+    return q;
+  });
   if(error){ console.error('Live room conflict check failed:', error); return true; }
   for(const s of (data||[])){
     const stay = normalizeStay({
@@ -6630,6 +6632,29 @@ function applyBoardingNoteTag(notesEl, isBoarding){
   }
 }
 
+/* Row-cap fix (25 Oct 2026). Supabase returns at most 1,000 rows per
+   query unless asked page by page. Every table load used a single
+   select('*'), so once grooming_appointments passed 1,000 rows (sorted
+   oldest-first) the NEWEST appointments silently stopped loading — still
+   safe in the cloud, but invisible on every screen, while the live
+   double-booking check (which queries the slot directly) correctly said
+   the slot was taken. `build` must return a FRESH query (filters + a
+   stable order, ending in .order('id') so pages never overlap or skip);
+   this pages through with .range() until an empty page comes back.
+   Returns { data, error } like a normal Supabase call. */
+async function selectAllRows(build){
+  const PAGE = 1000;
+  let all = [];
+  let from = 0;
+  for(let guard=0; guard<1000; guard++){
+    const { data, error } = await build().range(from, from + PAGE - 1);
+    if(error) return { data: null, error };
+    if(!data || !data.length) break;
+    all = all.concat(data);
+    from += data.length;
+  }
+  return { data: all, error: null };
+}
 function findGroomConflict(date, time, bay, excludeId){
   for(const c of state.customers){
     for(const p of c.pets){
@@ -6959,9 +6984,9 @@ async function migrateStaffFromBlobIfNeeded(blobStaff){
    (staffOnLeaveFor, the Staff modal, etc.) already expects — so nothing
    else in the app needs to change. */
 async function loadStaffFromTables(){
-  const { data: staffRows, error: e1 } = await sb.from('staff').select('*').order('created_at');
+  const { data: staffRows, error: e1 } = await selectAllRows(()=>sb.from('staff').select('*').order('created_at').order('id'));
   if(e1){ console.error('Staff load failed:', e1); _loadProblems.push('staff'); toast('Staff data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
-  const { data: leaveRows, error: e2 } = await sb.from('staff_leaves').select('*').order('start_date');
+  const { data: leaveRows, error: e2 } = await selectAllRows(()=>sb.from('staff_leaves').select('*').order('start_date').order('id'));
   if(e2){ console.error('Staff leaves load failed:', e2); _loadProblems.push('staff'); toast('Staff leave data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
   state.staff = (staffRows||[]).map(s=>({
     id: s.id, name: s.name, version: s.version,
@@ -7128,9 +7153,9 @@ async function migrateCustomersPetsFromBlobIfNeeded(blobCustomers){
    deletions. Preserving local values here removes that dependency for
    good — this function is now safe to call by itself, from anywhere. */
 async function loadCustomersPetsFromTables(){
-  const { data: custRows, error: e1 } = await sb.from('customers').select('*').order('created_at');
+  const { data: custRows, error: e1 } = await selectAllRows(()=>sb.from('customers').select('*').order('created_at').order('id'));
   if(e1){ console.error('Customers load failed:', e1); _loadProblems.push('customers'); toast('Customer data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e1)); return; }
-  const { data: petRows, error: e2 } = await sb.from('pets').select('*').order('created_at');
+  const { data: petRows, error: e2 } = await selectAllRows(()=>sb.from('pets').select('*').order('created_at').order('id'));
   if(e2){ console.error('Pets load failed:', e2); _loadProblems.push('pets'); toast('Pet data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(e2)); return; }
   const existingCustById = new Map(state.customers.map(c=>[c.id, c]));
   const existingPetById = new Map();
@@ -7321,7 +7346,7 @@ async function migrateStaysFromPetsColumnIfNeeded(customers){
    nothing else in the app needs to know this changed. Also resets
    `_staysBaseline` to match. */
 async function loadStaysFromTables(){
-  const { data: stayRows, error } = await sb.from('stays').select('*').order('created_at');
+  const { data: stayRows, error } = await selectAllRows(()=>sb.from('stays').select('*').order('created_at').order('id'));
   if(error){ console.error('Stays load failed:', error); _loadProblems.push('stays'); toast('Stay/booking data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const stayById = {};
   (stayRows||[]).forEach(s=>{
@@ -7427,7 +7452,7 @@ async function migrateGroomsFromPetsColumnIfNeeded(customers){
    onto the right pet's `.groomingHistory` array (matched by pet_id),
    normalizing each through normalizeGroom. Also resets `_groomsBaseline`. */
 async function loadGroomsFromTables(){
-  const { data: rows, error } = await sb.from('grooming_appointments').select('*').order('created_at');
+  const { data: rows, error } = await selectAllRows(()=>sb.from('grooming_appointments').select('*').order('created_at').order('id'));
   if(error){ console.error('Grooming load failed:', error); _loadProblems.push('grooming'); toast('Grooming data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const byPet = {};
   (rows||[]).forEach(g=>{
@@ -7531,7 +7556,7 @@ async function migratePaymentsFromCustomersColumnIfNeeded(customers){
    customer's `.payments` array (matched by customer_id), normalizing each
    through normalizePayment. Also resets `_paymentsBaseline`. */
 async function loadPaymentsFromTables(){
-  const { data: rows, error } = await sb.from('payments').select('*').order('created_at');
+  const { data: rows, error } = await selectAllRows(()=>sb.from('payments').select('*').order('created_at').order('id'));
   if(error){ console.error('Payments load failed:', error); _loadProblems.push('payments'); toast('Payment data failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   const byCust = {};
   (rows||[]).forEach(p=>{
@@ -7683,7 +7708,7 @@ async function migrateCancellationsFromBlobIfNeeded(blobCancellations){
    per the manager's routine, not truncated). Also resets
    `_cancellationsBaseline`. */
 async function loadCancellationsFromTables(){
-  const { data: rows, error } = await sb.from('cancellations').select('*').order('cancelled_at', {ascending:false});
+  const { data: rows, error } = await selectAllRows(()=>sb.from('cancellations').select('*').order('cancelled_at', {ascending:false}).order('id'));
   if(error){ console.error('Cancellations load failed:', error); _loadProblems.push('cancellations'); toast('Cancellations failed to load from cloud (showing last-known copy): ' + describeSupabaseError(error)); return; }
   state.cancellations = (rows||[]).map(r=>({
     id: r.id, type: r.type, reason: r.reason || '', note: r.note || '', cancelledAt: r.cancelled_at,
@@ -7959,9 +7984,9 @@ async function runArchiveSearch(query){
   resultBox.innerHTML = `<div style="color:var(--ink-soft);">Searching…</div>`;
   try{
     const [stayRes, groomRes, paymentRes] = await Promise.all([
-      sb.from('stays_archive').select('*').in('customer_id', custIds).order('check_out', {ascending:false}),
-      sb.from('grooming_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}),
-      sb.from('payments_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}),
+      selectAllRows(()=>sb.from('stays_archive').select('*').in('customer_id', custIds).order('check_out', {ascending:false}).order('id')),
+      selectAllRows(()=>sb.from('grooming_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}).order('id')),
+      selectAllRows(()=>sb.from('payments_archive').select('*').in('customer_id', custIds).order('date', {ascending:false}).order('id')),
     ]);
     if(stayRes.error) throw stayRes.error;
     if(groomRes.error) throw groomRes.error;
