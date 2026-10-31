@@ -616,6 +616,7 @@ let _syncTimer = null;
 // Offline read-only fallback — see the OFFLINE COPY section near initApp()
 let _offlineMode = null;          // null = normal; else { savedAt, source:'device'|'file', reason }
 let _offlineSnapshot = null;      // the parsed snapshot currently shown (re-applied to undo blocked edits)
+let _offlineBaselineJSON = null;  // fingerprint of the offline data as shown — see scheduleSync (30 Oct 2026)
 let _suppressOfflineAlert = false;
 let _loadGen = 0;
 let _loadProblems = [];
@@ -1237,7 +1238,20 @@ const _activeEditors = {};
 function scheduleSync(){
   // Offline copy is VIEW ONLY — any edit is undone straight away (see
   // offlineEditBlocked) so nothing typed during an outage is silently lost.
-  if(_offlineMode){ if(!_suppressOfflineAlert) offlineEditBlocked(); return; }
+  // 30 Oct 2026 fix: render() calls scheduleSync() on EVERY redraw (tab
+  // switch, picking a customer…), so this used to treat plain viewing as a
+  // blocked edit — and offlineEditBlocked() itself re-renders, so the
+  // "NOT saved" alert looped forever and the offline copy was unusable.
+  // Now it only blocks when the data actually differs from what the
+  // offline copy loaded (fingerprint taken in applyOfflineSnapshot).
+  if(_offlineMode){
+    if(_suppressOfflineAlert) return;
+    let cur = null;
+    try{ cur = offlineSnapshotJSON(); }catch(err){ cur = null; }
+    if(cur !== null && cur === _offlineBaselineJSON) return; // just a redraw — nothing changed
+    offlineEditBlocked();
+    return;
+  }
   if(!cloudEnabled || !_cloudLoaded) return;
   setSyncStatus('saving','Saving…');
   clearTimeout(_syncTimer);
@@ -2098,7 +2112,7 @@ function computeMonthlyReport(monthStr){
             const dateStr = addDays(roomCheckIn, n);
             if(!monthDates.has(dateStr)) continue;
             // findPetById: a sharing partner whose pet was deleted no longer occupies or pays (25 Oct 2026)
-            const presentToday = occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut);
+            const presentToday = orderOccupantsForRoom(room.type, occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut), o=>findPetById(o.petId)?.boardingSize);
             if(presentToday.length===0) continue;
             occupiedRoomNights.add(`${roomId}|${dateStr}`);
             const holiday = isHoliday(dateStr);
@@ -2626,6 +2640,23 @@ function surchargeAmountFor(p){
   if(p && p.type === 'Cat') return state.surchargeCat;
   const isLarge = p && ['L','XL','XXL'].includes(p.boardingSize);
   return isLarge ? state.surchargeLXL : state.surchargeSM;
+}
+/* Who counts as the room's "main" occupant (31 Oct 2026). In Suite room and
+   Royal Suite the room price is the same for any dog, so the LARGEST dog
+   counts as the room and the smaller dog(s) pay the additional-pet
+   surcharge — e.g. S + L dog = RM 125 + RM 30 (S/M), never + RM 50 (L).
+   Previously it depended on whose name the booking was under, so the same
+   two dogs could be quoted two different prices. Dog Deluxe is left as it
+   was on purpose (an L dog plus a second dog don't fit in a Deluxe room).
+   Stable sort — pets of equal size keep their original order. `sizeOf`
+   returns a pet's boarding size (S/M/L/XL/XXL) for each list item. */
+const SIZE_RANK = { S:1, M:2, L:3, XL:4, XXL:5 };
+function isSuiteRoomType(type){ return type === 'Suite room' || type === 'Royal Suite'; }
+function orderOccupantsForRoom(roomType, list, sizeOf){
+  if(!isSuiteRoomType(roomType) || list.length < 2) return list;
+  return list.map((item,i)=>({ item, i, r: SIZE_RANK[sizeOf(item)] || 0 }))
+    .sort((a,b)=> (b.r - a.r) || (a.i - b.i))
+    .map(x=>x.item);
 }
 /* Same-week duplicate-booking check ("within 6 days" either direction) — used
    to gently flag possible accidental double-bookings before saving, not to
@@ -4336,7 +4367,7 @@ function computeStayCost(stay){
       // only the occupants actually present this specific night
       // findPetById: a sharing partner whose pet was deleted is no longer charged a surcharge (25 Oct 2026) —
       // previously the stay card still billed it while the WhatsApp quote didn't.
-      const presentToday = occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut);
+      const presentToday = orderOccupantsForRoom(room.type, occupants.filter(o => findPetById(o.petId) && dateStr >= o.checkIn && dateStr < o.checkOut), o=>findPetById(o.petId)?.boardingSize);
       if(presentToday.length===0) continue;
       maxConcurrent = Math.max(maxConcurrent, presentToday.length);
       const holiday = isHoliday(dateStr);
@@ -8954,7 +8985,7 @@ function openEnquiryModal(){
 
       // Sharing surcharge — every pet after the first in THIS room, per
       // night, by its own size.
-      const extraPets = pets.slice(1);
+      const extraPets = orderOccupantsForRoom(roomKind, pets, p=>p.size).slice(1); // Suites: largest dog counts as the room (31 Oct 2026)
       let surchargeTotal = 0;
       const surchargeLines = [];
       const surchargeQuoteLines = [];
@@ -9161,11 +9192,11 @@ function buildBoardingBlock(stay, sp){
     const dateStr = addDays(checkIn, n);
     if(paidThroughCapped && dateStr < paidThroughCapped) continue; // already paid — leave out of the quote
     const holiday = isHoliday(dateStr);
-    const presentIds = petIds.filter(id=>{
+    const presentIds = orderOccupantsForRoom(room && room.type, petIds.filter(id=>{
       if(!findPetById(id)) return false; // deleted pet — matches computeStayCost (25 Oct 2026)
       const w = petDatesInStay(stay, sp, id);
       return dateStr >= w.checkIn && dateStr < w.checkOut;
-    });
+    }), id=>findPetById(id)?.boardingSize);
     const anyLarge = presentIds.some(id=>{ const p=findPetById(id); return p && ['L','XL','XXL'].includes(p.boardingSize); });
     let rateObj;
     if(room && (room.type==='Dog Deluxe (Bottom)' || room.type==='Dog Deluxe (Upper)')){
@@ -9246,7 +9277,40 @@ function buildBoardingBlock(stay, sp){
     const hasHolidaySplit = holidayRows.length>0 && normalRows.length>0 && holidayRows[0].baseRate !== normalRows[0].baseRate;
     const quotedNights = nightRows.length;
 
-    if(!hasHolidaySplit){
+    // 31 Oct 2026 fix: the two layouts below assume every night (or every
+    // night within the holiday / normal group) costs the same. That breaks
+    // when a sharing pet arrives later or leaves earlier ("different dates
+    // for this pet") — the quote used to price the WHOLE stay like the first
+    // night and printed "RM 0 (Additional  in same room)", under-quoting the
+    // customer vs. the stay card. Now the nights are grouped by their actual
+    // price; when that gives more than the simple cases, each group gets its
+    // own block (who's in the room + dates), then a final sum line.
+    const priceSig = r => `${hasHolidaySplit ? (r.holiday?1:0) : ''}|${r.baseRate}|${r.surchargeAmt}|${r.primaryId}|${r.extrasTonight.map(p=>p.id).join(',')}`;
+    const priceSegs = [];
+    nightRows.forEach(r=>{ const k=priceSig(r); let s=priceSegs.find(x=>x.k===k); if(!s){ s={k, rows:[]}; priceSegs.push(s); } s.rows.push(r); });
+    const simpleLayout = priceSegs.length===1
+      || (priceSegs.length===2 && hasHolidaySplit && priceSegs[0].rows[0].holiday!==priceSegs[1].rows[0].holiday);
+
+    if(!simpleLayout){
+      priceSegs.sort((a,b)=> a.rows[0].dateStr < b.rows[0].dateStr ? -1 : 1);
+      const segTotals = [];
+      priceSegs.forEach(seg=>{
+        const rows = seg.rows, n = rows.length, r0 = rows[0];
+        const whoPets = [findPetById(r0.primaryId), ...r0.extrasTonight].filter(Boolean);
+        const who = whoPets.length===1 ? `${whoPets[0].name} only` : whoPets.map(p=>p.name).join(' & ');
+        const rateTag = hasHolidaySplit ? ` — ${r0.holiday?'Holiday':'Normal'} Rate` : '';
+        lines.push(`_${who}${rateTag} (${groupDateRangesForMessage(rows.map(r=>r.dateStr), checkOut)})_`);
+        let per = r0.baseRate;
+        if(r0.extrasTonight.length){ const sl = sharingLine(rows); per = sl.perNight; lines.push(sl.text); }
+        const segTotal = per * n;
+        segTotals.push(segTotal);
+        lines.push(`${n} night${n===1?'':'s'} x RM ${fmtRM(per)} = RM ${fmtRM(segTotal)}`);
+        lines.push('');
+      });
+      boardingTotal = segTotals.reduce((a,b)=>a+b, 0);
+      lines.push(`${segTotals.map(t=>`RM ${fmtRM(t)}`).join(' + ')} = RM ${fmtRM(boardingTotal)}`);
+      lastLineIsCombine = true;
+    } else if(!hasHolidaySplit){
       // Every remaining night uses the same rate (all normal, or all holiday).
       const rows = nightRows;
       let perNight = rows[0].baseRate;
@@ -11273,6 +11337,9 @@ function applyOfflineSnapshot(snap, keepSelection){
     state.staff = snap.staff || state.staff;
     state.waitlist = snap.waitlist || state.waitlist || [];
   } finally { _suppressOfflineAlert = prev; }
+  // Fingerprint of the data as shown — scheduleSync() compares against it
+  // so a plain redraw isn't mistaken for an edit (30 Oct 2026 fix).
+  try{ _offlineBaselineJSON = offlineSnapshotJSON(); }catch(err){ _offlineBaselineJSON = null; }
 }
 
 function fmtOfflineWhen(iso){
