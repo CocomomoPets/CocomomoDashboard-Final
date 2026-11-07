@@ -341,6 +341,10 @@
   .cal-cell{ width:92px; height:56px; padding:3px 6px; vertical-align:top; cursor:pointer; position:relative; }
   .cal-free:hover{ background:var(--teal-tint); }
   .cal-occupied{ color:#fff; }
+  /* Per-owner colour block inside a mixed cell (same-day turnover / cross-owner sharing) —
+     negative margins cancel the cell padding so each block spans the full cell width. */
+  .cal-cell-seg{ margin:0 -6px; padding:1px 6px; }
+  .cal-cell-seg-first{ margin-top:-3px; padding-top:3px; }
   .cal-occupied:hover{ filter:brightness(.95); }
   .cal-cell-line{ font-size:12.5px; font-weight:700; line-height:1.28; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:var(--cal-text-shadow, 0 1px 1px rgba(0,0,0,.3)); max-width:80px; }
   .cal-cell-breed{ font-size:11px; font-weight:600; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.9; text-shadow:var(--cal-text-shadow, 0 1px 1px rgba(0,0,0,.3)); max-width:80px; }
@@ -10347,22 +10351,48 @@ function calCellHtml(roomId, dateStr, occ, isToday, isHol, isClosed){
   }
   // distinct owner colours present in this cell
   const colours = [...new Set(occ.map(o=>calendarColorFor(o.cust.id)))];
-  const bg = colours.length===1 ? colours[0] : `linear-gradient(to bottom, ${colours[0]} 0%, ${colours[0]} 48%, ${colours[1]} 52%, ${colours[1]} 100%)`;
-  const avgLum = colours.reduce((s,c)=>s+relativeLuminance(c),0) / colours.length;
-  const textColor = avgLum > 0.45 ? '#1E2B25' : '#FFFFFF';
-  const textShadow = textColor === '#FFFFFF' ? '0 1px 1px rgba(0,0,0,.3)' : 'none';
+  const textFor = c => {
+    const tc = relativeLuminance(c) > 0.45 ? '#1E2B25' : '#FFFFFF';
+    return { color: tc, shadow: tc === '#FFFFFF' ? '0 1px 1px rgba(0,0,0,.3)' : 'none' };
+  };
   // Multiple pets in the same room only count as a "turnover" (handoff between
   // different bookings) if they come from different stays. Pets sharing a room
   // within the SAME stay are just sharing — show their names plainly, not O./I.
   const distinctStays = new Set(occ.map(o=>o.stay.id)).size;
-  let lines;
-  if(distinctStays > 1){
-    lines = occ.map(o=>`<div class="cal-cell-line">${turnoverLabel(o.kind)}${esc(o.pet.name)}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`).join('');
-  } else if(occ.length > 1){
-    lines = occ.map(o=>{
-      const idx = ownerPetIndex(o.cust, o.pet);
-      return `<div class="cal-cell-line">${idx?`${idx}.`:''}${esc(o.pet.name)}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
+  // Keep each booking's pets together so each colour forms one solid block.
+  const stayOrder = [...new Set(occ.map(o=>o.stay.id))];
+  const ordered = distinctStays > 1 ? [...occ].sort((a,b)=>stayOrder.indexOf(a.stay.id)-stayOrder.indexOf(b.stay.id)) : occ;
+  const lineFor = o => {
+    let label;
+    if(distinctStays > 1) label = turnoverLabel(o.kind);
+    else { const idx = ownerPetIndex(o.cust, o.pet); label = idx?`${idx}.`:''; }
+    return `<div class="cal-cell-line">${label}${esc(o.pet.name)}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
+  };
+  let lines, bg, textColor, textShadow;
+  if(colours.length > 1){
+    // Two+ owners in one cell (same-day turnover, or cross-owner sharing): colour each
+    // pet's own rows in its owner's colour, instead of a fixed half/half split. The cell
+    // background is the last block's colour so any empty space below stays that colour.
+    const segs = [];
+    ordered.forEach(o=>{
+      const c = calendarColorFor(o.cust.id);
+      if(segs.length && segs[segs.length-1].c===c) segs[segs.length-1].items.push(o);
+      else segs.push({ c, items:[o] });
+    });
+    lines = segs.map((s,i)=>{
+      const t = textFor(s.c);
+      return `<div class="cal-cell-seg${i===0?' cal-cell-seg-first':''}" style="background:${s.c};color:${t.color};--cal-text-shadow:${t.shadow};">${s.items.map(lineFor).join('')}</div>`;
     }).join('');
+    const last = textFor(segs[segs.length-1].c);
+    bg = segs[segs.length-1].c; textColor = last.color; textShadow = last.shadow;
+  } else {
+    bg = colours[0];
+    const t = textFor(colours[0]); textColor = t.color; textShadow = t.shadow;
+  }
+  if(colours.length > 1){
+    // lines already built above
+  } else if(occ.length > 1){
+    lines = ordered.map(lineFor).join('');
   } else {
     const o = occ[0];
     const idx = ownerPetIndex(o.cust, o.pet);
