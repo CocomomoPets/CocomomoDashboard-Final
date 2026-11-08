@@ -341,6 +341,10 @@
   .cal-cell{ width:92px; height:56px; padding:3px 6px; vertical-align:top; cursor:pointer; position:relative; }
   .cal-free:hover{ background:var(--teal-tint); }
   .cal-occupied{ color:#fff; }
+  /* Today grid (8 Nov 2026): risk flags spelled out + amount due on check-out cards */
+  .today-card-risk{ margin-top:5px; display:inline-block; font-size:12px; font-weight:700; color:#A23B2C; background:#FBE4E2; border:1px solid #EEB3AC; border-radius:6px; padding:2px 8px; }
+  .today-card-due{ margin-top:5px; font-size:12.5px; font-weight:700; color:#A23B2C; }
+  .today-card-paid{ margin-top:5px; font-size:12px; font-weight:600; color:#2E7D4F; }
   /* Per-owner colour block inside a mixed cell (same-day turnover / cross-owner sharing) —
      negative margins cancel the cell padding so each block spans the full cell width. */
   .cal-cell-seg{ margin:0 -6px; padding:1px 6px; }
@@ -392,6 +396,10 @@
   .slot-free:hover{ background:var(--teal-tint); }
   .slot-booked{ cursor:pointer; padding:6px 8px; color:#fff; }
   .slot-booked:hover{ filter:brightness(.95); }
+  /* Double-booked slot (8 Nov 2026): every appointment shown, outlined red */
+  .slot-clash{ background:#FBE4E2; outline:3px solid #C0392B; outline-offset:-3px; padding:4px 6px; }
+  .slot-clash-label{ font-size:10.5px; font-weight:800; color:#A23B2C; margin-bottom:2px; }
+  .slot-clash-item{ padding:2px 6px; border-radius:5px; margin-bottom:2px; font-size:11.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:156px; }
   .slot-apt-type{ font-weight:600; font-size:12.5px; line-height:1.25; opacity:.85; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:150px; }
   .slot-pet-name{ font-size:12.5px; font-weight:700; opacity:.95; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:150px; }
   .slot-breed-inline{ font-weight:500; opacity:.85; }
@@ -3722,6 +3730,18 @@ function renderTodayView(){
    nothing to confirm. */
 function checkinChecklistItems(cust, stay, memberIds){
   const items = [];
+  // Boarding agreement (8 Nov 2026): one line per owner whose agreement isn't
+  // signed yet — includes another customer's pet sharing the room, since each
+  // owner signs their own. Signed owners add nothing.
+  const owners = new Map();
+  memberIds.forEach(id=>{
+    const owner = findPetWithCustomer(id).cust || cust;
+    if(owner && !owners.has(owner.id)) owners.set(owner.id, owner);
+  });
+  owners.forEach(owner=>{
+    if(owner.agreement) return;
+    items.push({ key:`agreement-${owner.id}`, label:`<span style="color:#A23B2C;font-weight:700;">Boarding agreement NOT signed</span> by ${esc(owner.name)} — signed in person now, or the remote signing link sent (customer page → Boarding agreement)` });
+  });
   memberIds.forEach(id=>{
     const pet = findPetById(id);
     if(!pet) return;
@@ -3908,18 +3928,42 @@ function todayDateSectionHtml(sec, checkins, checkouts, grooms){
   </div>`;
 }
 
+/* Today grid (8 Nov 2026): spell out the risk flags on the card itself
+   ("⚠️ Escape risk") instead of a bare ⚠️ icon, so staff don't have to open
+   the pet's page to find out what the warning is. For a group card (pets
+   sharing a room) each flagged pet's name is shown in front of its flags. */
+function todayRiskLineHtml(pets, withNames){
+  const flagged = pets.filter(p=>p && (p.riskFlags||[]).length);
+  if(!flagged.length) return '';
+  const parts = flagged.map(p=>`${withNames?`<b>${esc(p.name)}:</b> `:''}${p.riskFlags.map(esc).join(', ')}`);
+  return `<div class="today-card-risk">⚠️ ${parts.join(' · ')}</div>`;
+}
+/* Today grid check-out cards (8 Nov 2026): show what's still owed up front,
+   so payment can be collected before the owner reaches the counter instead
+   of only finding out when Check out gets blocked. */
+function todayBalanceLineHtml(stay, cust){
+  if(stay.status!=='Active') return '';
+  try{
+    const owner = findStayOwnerCustomer(stay.id) || cust;
+    const b = computeStayBilling(owner, stay);
+    if(b.balance > 0.004){
+      return `<div class="today-card-due">💰 RM ${fmtRM2(b.balance)} due${b.paid>0.004?` (RM ${fmtRM2(b.paid)} paid)`:''}${b.isMerged?' · combined bill':''}</div>`;
+    }
+    return `<div class="today-card-paid">✅ Fully paid</div>`;
+  }catch(err){ console.warn('Balance line failed', err); return ''; }
+}
 function todayGroomCardHtml(cust, pet, g){
   const key = `${cust.id}|${pet.id}`;
   const gStatus = g.status || 'Not arrived';
-  const hasRiskFlags = ((pet.riskFlags)||[]).length>0;
   const confirmed = gStatus==='Done & informed' || gStatus==='Picked up';
   return `
   <div class="today-card ${confirmed?'today-card-confirmed':''}" data-today-groom-jump="${key}">
     <div class="avatar" style="${avatarStyle(colorFor(cust.id))}">${initials(cust.name)}</div>
     <div class="today-card-main">
-      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petLabel(pet)}${hasRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
+      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petLabel(pet)} <span class="badge ${GROOM_STATUS_BADGE[gStatus]||'badge-past'}">${GROOM_STATUS_ICON[gStatus]||''} ${esc(gStatus)}</span></div>
       <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
       <div class="today-card-sub">${g.time||'—'} · ${esc(g.bay)||'No bay'} · ${esc((g.apptTypes||[]).join(', '))||'—'}</div>
+      ${todayRiskLineHtml([pet], false)}
     </div>
     <select data-today-groom-status="${cust.id}|${pet.id}|${g.id}" style="padding:5px 7px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;">${GROOM_STATUSES.map(s=>`<option ${s===gStatus?'selected':''}>${esc(s)}</option>`).join('')}</select>
   </div>`;
@@ -3966,15 +4010,17 @@ function todayCardHtml(cust, pet, stay, sp, memberIds, mode, allowCheckout){
   const confirmed = (mode==='in' && allCheckedIn) || (mode==='out' && stay.status==='Past');
   const otherLabels = idsToLabels(ids.filter(id=>id!==pet.id), cust.id);
   const petNameDisplay = otherLabels.length ? `${petLabel(pet)} &amp; ${otherLabels.join(' &amp; ')}` : petLabel(pet);
-  const groupRiskFlags = ids.some(id=>((findPetById(id)||{}).riskFlags||[]).length>0);
+  const groupPets = ids.map(id=>findPetById(id)).filter(Boolean);
   const groupVaxWarn = ids.map(id=>findPetById(id)).filter(Boolean).find(p=>['expired','expiring'].includes(vaxExpiryInfo(p).status));
   const idsKey = ids.join(',');
   return `
   <div class="today-card ${confirmed?'today-card-confirmed':''}" data-today-jump="${key}">
     <div class="avatar" style="${avatarStyle(colorFor(cust.id))}">${initials(cust.name)}</div>
     <div class="today-card-main">
-      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${groupRiskFlags?' <span title="Risk flags — check pet profile" style="color:#A23B2C;">⚠️</span>':''}${mode==='in'&&groupVaxWarn?vaxExpiryCompactHtml(groupVaxWarn):''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
+      <div class="today-card-pet">${ANIMAL_ICON[pet.type]||'🐾'} ${petNameDisplay}${mode==='in'&&groupVaxWarn?vaxExpiryCompactHtml(groupVaxWarn):''} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${mode==='in'&&allCheckedIn?' <span class="badge badge-active">Checked in</span>':''}</div>
       <div class="today-card-sub">${esc(cust.name)} · ${esc(cust.phone)}</div>
+      ${todayRiskLineHtml(groupPets, groupPets.length>1)}
+      ${mode==='out' && !confirmed ? todayBalanceLineHtml(stay, cust) : ''}
       ${mode==='in' ? apptTimeLineHtml(stay, 'dropoff') : ''}
       ${mode==='out' ? apptTimeLineHtml(stay, 'pickup') : ''}
       ${mode==='out' ? `<div class="today-card-sub">${(cust.authorizedPickups&&cust.authorizedPickups.length) ? `✅ Authorized: ${cust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;">⚠️ No authorized pickup persons on file — verify with owner</span>`}</div>` : ''}
@@ -6577,6 +6623,19 @@ function openBulkGroomFieldsModal(cust, pet, ids){
   });
 }
 
+/* Bay options for the shift-conflict popup (8 Nov 2026 double-booking fix).
+   The old version pre-selected the wanted bay even though it was occupied
+   (greyed out but still the selected value), so pressing Apply moved the
+   appointment onto the taken slot. Now: the wanted bay only if it's free,
+   else the first free bay at that time, else a blank "no free bay" choice. */
+function freeBayOptionsHtml(date, time, preferredBay, excludeId){
+  const free = BAYS.filter(b=>!findGroomConflict(date, time, b, excludeId));
+  const pick = free.includes(preferredBay) ? preferredBay : (free[0] || '');
+  return `<option value="" ${pick===''?'selected':''}>${free.length?'— pick a bay —':'— no free bay at this time —'}</option>` + BAYS.map(b=>{
+    const occupied = !free.includes(b);
+    return `<option value="${b}" ${b===pick?'selected':''} ${occupied?'disabled':''}>${b}${occupied?' — occupied':''}</option>`;
+  }).join('');
+}
 function openShiftConflictsModal(cust, pet, conflicts){
   const rows = conflicts.map(c=>{
     const g = pet.groomingHistory.find(x=>x.id===c.groomId);
@@ -6589,7 +6648,7 @@ function openShiftConflictsModal(cust, pet, conflicts){
         <select data-shift-time>${TIME_SLOTS.map(t=>`<option ${t===wantTime?'selected':''}>${t}</option>`).join('')}</select>
       </div>
       <div class="field span2"><label>Bay</label>
-        <select data-shift-bay>${bayOptionsHtml(c.newDate, wantTime, wantBay, g.id)}</select>
+        <select data-shift-bay>${freeBayOptionsHtml(c.newDate, wantTime, wantBay, g.id)}</select>
       </div>
     </div>`;
   }).join('');
@@ -6610,18 +6669,42 @@ function openShiftConflictsModal(cust, pet, conflicts){
     const timeSel = row.querySelector('[data-shift-time]');
     const baySel = row.querySelector('[data-shift-bay]');
     const cur = baySel.value;
-    baySel.innerHTML = bayOptionsHtml(c.newDate, timeSel.value, cur, g.id);
+    baySel.innerHTML = freeBayOptionsHtml(c.newDate, timeSel.value, cur, g.id);
   }
   document.querySelectorAll('#shiftRows [data-shiftrow]').forEach(row=>{
     row.querySelector('[data-shift-time]').addEventListener('change', ()=>refreshBayOptions(row));
   });
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
-  document.getElementById('saveBtn').addEventListener('click', ()=>{
-    const rowsEls = document.querySelectorAll('#shiftRows [data-shiftrow]');
-    // Validate every row has a non-occupied bay selected before applying any of them.
+  document.getElementById('saveBtn').addEventListener('click', async ()=>{
+    const rowsEls = [...document.querySelectorAll('#shiftRows [data-shiftrow]')];
+    // Validate every row before applying any of them (8 Nov 2026: real
+    // occupancy check, not just "something is selected" — a greyed-out
+    // occupied bay used to count as a valid choice). Also stops two rows in
+    // this popup from picking the same free slot as each other, and re-checks
+    // live so another device's fresh booking is caught too.
+    const picked = new Set();
     for(const row of rowsEls){
-      const baySel = row.querySelector('[data-shift-bay]');
-      if(!baySel.value){ toast('Please pick an available bay for every appointment'); return; }
+      const c = conflicts.find(x=>x.groomId===row.dataset.shiftrow);
+      const time = row.querySelector('[data-shift-time]').value;
+      const bay = row.querySelector('[data-shift-bay]').value;
+      if(!bay){ toast('Please pick an available bay for every appointment'); return; }
+      if(findGroomConflict(c.newDate, time, bay, row.dataset.shiftrow)){ toast(`${bay} at ${time} on ${fmtDate(c.newDate)} is already booked — pick another`); return; }
+      const key = `${c.newDate}|${time}|${bay}`;
+      if(picked.has(key)){ toast(`Two appointments are set to ${bay} at ${time} on ${fmtDate(c.newDate)} — give one a different slot`); return; }
+      picked.add(key);
+    }
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
+    for(const row of rowsEls){
+      const c = conflicts.find(x=>x.groomId===row.dataset.shiftrow);
+      const time = row.querySelector('[data-shift-time]').value;
+      const bay = row.querySelector('[data-shift-bay]').value;
+      if(await findGroomConflictLive(c.newDate, time, bay, row.dataset.shiftrow)){
+        saveBtn.disabled = false; saveBtn.textContent = 'Apply';
+        toast(`${bay} at ${time} on ${fmtDate(c.newDate)} was just booked by another device — pick another`);
+        refreshBayOptions(row);
+        return;
+      }
     }
     let applied = 0;
     rowsEls.forEach(row=>{
@@ -10541,6 +10624,17 @@ function openCalendarCellModal(roomId, dateStr){
    rather than per-customer. Warning-only flag (#25) is surfaced here too,
    since a flagged customer waiting for a slot is exactly the kind of
    booking staff want a heads-up on before converting it. */
+/* Customer picker options for the booking forms (New booking, Book appointment,
+   Add to waitlist). With nothing typed in the search box the list starts on a
+   blank "Choose a customer" entry, so a booking can't accidentally land on
+   whoever happens to be first alphabetically (8 Nov 2026). Once staff type a
+   search, the first match is selected for them as before. */
+function custPickerOptionsHtml(filtered, q){
+  if(!filtered.length) return '<option value="">No matching customers</option>';
+  const opts = filtered.map(c=>`<option value="${c.id}">${esc(c.name)}${c.pets.length?` (${c.pets.map(p=>esc(p.name)).join(', ')})`:''}</option>`).join('');
+  return q ? opts : '<option value="">— Choose a customer —</option>' + opts;
+}
+const PET_PICKER_EMPTY = '<option value="">— Choose a customer first —</option>';
 function openWaitlistAddModal(){
   if(state.customers.length===0){ toast('Add a customer first'); return; }
   openModal(`
@@ -10567,14 +10661,14 @@ function openWaitlistAddModal(){
 
   function refreshPetOptions(){
     const cust = getCustomer(document.getElementById('wl_cust').value);
-    document.getElementById('wl_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : '<option value="">No pets</option>';
+    document.getElementById('wl_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : PET_PICKER_EMPTY;
   }
   function refreshCustOptions(filterText){
     const q = (filterText||'').trim().toLowerCase();
     const filtered = state.customers.filter(c => !q || c.name.toLowerCase().includes(q) || c.pets.some(p=>p.name.toLowerCase().includes(q))).slice().sort((a,b)=>a.name.localeCompare(b.name));
     const sel = document.getElementById('wl_cust');
     const prevVal = sel.value;
-    sel.innerHTML = filtered.length ? filtered.map(c=>`<option value="${c.id}">${esc(c.name)}${c.pets.length?` (${c.pets.map(p=>esc(p.name)).join(', ')})`:''}</option>`).join('') : '<option value="">No matching customers</option>';
+    sel.innerHTML = custPickerOptionsHtml(filtered, q);
     if(filtered.some(c=>c.id===prevVal)) sel.value = prevVal;
     refreshPetOptions();
   }
@@ -10593,7 +10687,7 @@ function openWaitlistAddModal(){
     const petId = document.getElementById('wl_pet').value;
     const checkIn = document.getElementById('wl_in').value;
     const checkOut = document.getElementById('wl_out').value;
-    if(!custId || !petId){ toast('Please pick a customer and pet'); return; }
+    if(!custId || !petId){ toast('Please choose a customer and pet first'); return; }
     if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid desired dates'); return; }
     state.waitlist = state.waitlist || [];
     state.waitlist.push({
@@ -10785,7 +10879,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   }
   function refreshPetOptions(query){
     const cust = getCustomer(document.getElementById('cb_cust').value);
-    document.getElementById('cb_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : '<option value="">No pets</option>';
+    document.getElementById('cb_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : PET_PICKER_EMPTY;
     if(cust && query){
       const matchedPet = cust.pets.find(p=>p.name.toLowerCase().includes(query));
       if(matchedPet) document.getElementById('cb_pet').value = matchedPet.id;
@@ -10800,9 +10894,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       .slice().sort((a,b)=> a.name.localeCompare(b.name));
     const sel = document.getElementById('cb_cust');
     const prevVal = sel.value;
-    sel.innerHTML = filtered.length
-      ? filtered.map(c=>`<option value="${c.id}">${esc(c.name)}${c.pets.length?` (${c.pets.map(p=>esc(p.name)).join(', ')})`:''}</option>`).join('')
-      : '<option value="">No matching customers</option>';
+    sel.innerHTML = custPickerOptionsHtml(filtered, q);
     if(filtered.some(c=>c.id===prevVal)) sel.value = prevVal;
     refreshPetOptions(q);
   }
@@ -10831,7 +10923,7 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
   document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const cust = getCustomer(document.getElementById('cb_cust').value);
     const pet = cust ? getPet(cust, document.getElementById('cb_pet').value) : null;
-    if(!cust || !pet){ toast('Please pick a customer with a pet'); return; }
+    if(!cust || !pet){ toast('Please choose a customer and pet first'); return; }
     const checkIn = document.getElementById('cb_in').value;
     const checkOut = document.getElementById('cb_out').value;
     if(!checkIn || !checkOut || checkOut < checkIn){ toast('Please provide valid check-in/check-out dates'); return; }
@@ -10924,12 +11016,45 @@ function groomLeaveBannerHtml(date, apptsForDay){
   return `<div style="background:var(--amber-tint);border:1px solid #F0D2AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#8A5A22;margin-bottom:12px;">🚫 On leave today: ${namesStr}</div>`;
 }
 
+/* Double-booking finder (8 Nov 2026): every date from today on where two or
+   more grooming appointments share the same time + bay, plus any appointment
+   whose time/bay doesn't fit the grid (so it would never be drawn). Shown as
+   a red banner on the Grooming availability tab with a tap-to-jump link per
+   date, so existing clashes can be found and fixed. */
+function findUpcomingGroomClashes(){
+  const today = todayStr();
+  const slots = new Map(); const offGrid = [];
+  state.customers.forEach(c=>c.pets.forEach(p=>(p.groomingHistory||[]).forEach(g=>{
+    if(!g.date || g.date < today) return;
+    if(!TIME_SLOTS.includes(g.time) || !BAYS.includes(g.bay)){ offGrid.push({ g, pet:p }); return; }
+    const k = `${g.date}|${g.time}|${g.bay}`;
+    if(!slots.has(k)) slots.set(k, []);
+    slots.get(k).push({ g, pet:p });
+  })));
+  const clashes = [...slots.entries()].filter(([k,v])=>v.length>1)
+    .map(([k,v])=>{ const [date,time,bay] = k.split('|'); return { date, time, bay, items:v }; })
+    .sort((a,b)=> (a.date+a.time+a.bay).localeCompare(b.date+b.time+b.bay));
+  offGrid.sort((a,b)=> (a.g.date+(a.g.time||'')).localeCompare(b.g.date+(b.g.time||'')));
+  return { clashes, offGrid };
+}
+function groomClashBannerHtml(){
+  const { clashes, offGrid } = findUpcomingGroomClashes();
+  if(!clashes.length && !offGrid.length) return '';
+  const line = (date, text) => `<div style="margin-top:4px;"><a href="#" data-clash-jump="${date}" style="color:#A23B2C;font-weight:700;">${fmtDateWithDay(date)}</a> — ${text}</div>`;
+  return `<div style="background:#FBE4E2;border:1px solid #EEB3AC;border-radius:8px;padding:10px 12px;font-size:12.5px;color:#A23B2C;margin-bottom:12px;">
+    ${clashes.length ? `<div style="font-weight:700;">⚠️ ${clashes.length} double-booked grooming slot${clashes.length===1?'':'s'} coming up — move one appointment in each:</div>
+      ${clashes.map(c=>line(c.date, `${esc(c.time)} ${esc(c.bay)}: ${c.items.map(i=>esc(i.pet.name)).join(' &amp; ')}`)).join('')}` : ''}
+    ${offGrid.length ? `<div style="font-weight:700;${clashes.length?'margin-top:8px;':''}">⚠️ ${offGrid.length} appointment${offGrid.length===1?'':'s'} with a time or bay that doesn't fit the grid (not shown on it):</div>
+      ${offGrid.map(o=>line(o.g.date, `${esc(o.pet.name)} · ${esc(o.g.time||'no time')} · ${esc(o.g.bay||'no bay')} — open from the pet's Grooming tab to fix`)).join('')}` : ''}
+  </div>`;
+}
 function renderGroomingAvailability(){
   const main = document.getElementById('mainArea');
   const date = state.groomingDate;
   const apptsForDay = allGroomAppointmentsOn(date);
   const totalSlots = TIME_SLOTS.length * BAYS.length;
   const booked = apptsForDay.length;
+  const usedSlots = new Set(apptsForDay.filter(a=>TIME_SLOTS.includes(a.time)&&BAYS.includes(a.bay)).map(a=>a.time+'|'+a.bay)).size;
   const closed = closedDateFor(date);
 
   main.innerHTML = `
@@ -10947,7 +11072,7 @@ function renderGroomingAvailability(){
       <button class="btn btn-amber" id="bookApptBtn" ${closed?'disabled title="Shop is closed on this date"':''}>+ Book appointment</button>
       <button class="btn btn-primary" id="groomAddCustomerBtn" type="button">+ Add customer</button>
       <div class="legend-row">
-        <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>${totalSlots-booked} available</span>
+        <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>${totalSlots-usedSlots} available</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--teal);"></span>${booked} booked</span>
         ${BAYS.map(b=>`<span class="legend-chip">${b}: ${apptsForDay.filter(a=>a.bay===b).length}</span>`).join('')}
       </div>
@@ -10963,6 +11088,7 @@ function renderGroomingAvailability(){
     <div style="margin-bottom:10px;font-family:var(--font-display);font-size:24px;font-weight:600;">${fmtDateLong(date)}</div>
     ${closed ? `<div style="background:var(--danger-tint,#FBE4E2);border:1px solid #EEB3AC;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#A23B2C;margin-bottom:12px;">🚫 Shop closed${closed.name?` — ${esc(closed.name)}`:''}. No grooming appointments are taken today.</div>` : ''}
     ${groomLeaveBannerHtml(date, apptsForDay)}
+    ${groomClashBannerHtml()}
     <div class="grid-wrap">
       <table class="avail-grid">
         <thead>
@@ -11005,6 +11131,9 @@ function renderGroomingAvailability(){
   document.querySelectorAll('.slot-booked').forEach(el=>{
     el.addEventListener('click', ()=> openApptDetailModal(el.dataset.groomid));
   });
+  document.querySelectorAll('[data-clash-jump]').forEach(el=>{
+    el.addEventListener('click', (e)=>{ e.preventDefault(); state.groomingDate = el.dataset.clashJump; renderGroomingAvailability(); });
+  });
   scheduleSync();
 }
 
@@ -11020,9 +11149,25 @@ function gridRowHtml(time, date, apptsForDay){
   return `<tr>
     <td class="time-cell">${time}</td>
     ${BAYS.map(bay=>{
-      const appt = apptsForDay.find(a=>a.time===time && a.bay===bay);
+      // ALL appointments in this slot, not just the first (8 Nov 2026) — a
+      // double-booked slot used to show only one booking and silently hide
+      // the other. Two or more now show stacked, outlined red, each tappable.
+      const inSlot = apptsForDay.filter(a=>a.time===time && a.bay===bay);
+      const appt = inSlot[0];
       if(!appt){
         return `<td class="slot-cell slot-free" data-time="${time}" data-bay="${bay}"></td>`;
+      }
+      if(inSlot.length > 1){
+        return `<td class="slot-cell slot-clash" title="Double-booked — ${inSlot.length} appointments in this slot">
+          <div class="slot-clash-label">⚠️ Double-booked (${inSlot.length})</div>
+          ${inSlot.map(a=>{
+            const c = getCustomer(a.customerId);
+            const pt = c ? getPet(c, a.petId) : null;
+            const col = a.groomColor || (c ? colorFor(c.id) : 'var(--teal)');
+            const tc = textColorFor(col);
+            return `<div class="slot-booked slot-clash-item" style="background:${col};color:${tc};" data-groomid="${a.id}"><b>${esc(pt?.name||'—')}</b> · ${esc((a.apptTypes||[]).join(', ')||'—')}</div>`;
+          }).join('')}
+        </td>`;
       }
       const cust = getCustomer(appt.customerId);
       const pet = cust ? getPet(cust, appt.petId) : null;
@@ -11144,7 +11289,7 @@ function openFullBookingModal(prefTime, prefBay){
   }
   function refreshPetOptions(query){
     const cust = getCustomer(document.getElementById('b_cust').value);
-    document.getElementById('b_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : '<option value="">No pets</option>';
+    document.getElementById('b_pet').innerHTML = cust ? (cust.pets.map(p=>`<option value="${p.id}">${ANIMAL_ICON[p.type]} ${petLabel(p)}</option>`).join('') || '<option value="">No pets</option>') : PET_PICKER_EMPTY;
     if(cust && query){
       const matchedPet = cust.pets.find(p=>p.name.toLowerCase().includes(query));
       if(matchedPet) document.getElementById('b_pet').value = matchedPet.id;
@@ -11165,9 +11310,7 @@ function openFullBookingModal(prefTime, prefBay){
       .slice().sort((a,b)=> a.name.localeCompare(b.name));
     const sel = document.getElementById('b_cust');
     const prevVal = sel.value;
-    sel.innerHTML = filtered.length
-      ? filtered.map(c=>`<option value="${c.id}">${esc(c.name)}${c.pets.length?` (${c.pets.map(p=>esc(p.name)).join(', ')})`:''}</option>`).join('')
-      : '<option value="">No matching customers</option>';
+    sel.innerHTML = custPickerOptionsHtml(filtered, q);
     if(filtered.some(c=>c.id===prevVal)) sel.value = prevVal;
     refreshPetOptions(q);
   }
@@ -11194,7 +11337,7 @@ function openFullBookingModal(prefTime, prefBay){
   document.getElementById('saveBtn').addEventListener('click', async ()=>{
     const cust = getCustomer(document.getElementById('b_cust').value);
     const pet = cust ? getPet(cust, document.getElementById('b_pet').value) : null;
-    if(!cust || !pet){ toast('Please pick a customer with a pet'); return; }
+    if(!cust || !pet){ toast('Please choose a customer and pet first'); return; }
     const date = document.getElementById('b_date').value;
     const time = document.getElementById('b_time').value;
     const bay = document.getElementById('b_bay').value;
