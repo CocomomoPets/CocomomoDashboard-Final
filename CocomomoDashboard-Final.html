@@ -9258,6 +9258,18 @@ function groupDateRangesForMessage(dateStrs, checkOut){
    the boarding-only subtotal — shared by the single-stay "WhatsApp message"
    button and the customer-level "combine multiple stays" feature below.
    Returns null if the dates are broken (caller decides how to report that). */
+/* WhatsApp message time format (9 Nov 2026): "11:00" -> "11am",
+   "11:30" -> "11.30am", "13:00" -> "1pm", "12:00" -> "12pm". Shown in
+   italics after the date, without brackets: "_11.30am_". */
+function waTime(t){
+  const m = /^(\d{1,2}):(\d{2})/.exec(t||'');
+  if(!m) return t||'';
+  let h = +m[1]; const min = m[2];
+  const ap = h >= 12 ? 'pm' : 'am';
+  h = h % 12 || 12;
+  return `${h}${min==='00'?'':'.'+min}${ap}`;
+}
+function waTimeSuffix(t){ return t ? ` _${waTime(t)}_` : ''; }
 function buildBoardingBlock(stay, sp){
   const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
   const pets = petIds.map(id=>findPetById(id)).filter(Boolean);
@@ -9286,7 +9298,7 @@ function buildBoardingBlock(stay, sp){
     const daycareBase = stay.daycareRate != null ? +stay.daycareRate : defaultDaycareTotal(stay);
     const dClosed = closedDateFor(checkIn);
     const dTime = (stay.dropoff && stay.dropoff.time) || (stay.pickup && stay.pickup.time);
-    lines.push(`Daycare - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(dClosed && dTime) ? ` _(${dTime})_` : ''}`);
+    lines.push(`Daycare - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${waTimeSuffix(dTime)}`);
     lines.push('');
     boardingTotal = daycareBase;
     lines.push(`Daycare rate = RM ${fmtRM(boardingTotal)}`);
@@ -9343,12 +9355,12 @@ function buildBoardingBlock(stay, sp){
   // earlier and this isn't a fresh arrival (so no drop-off time note here).
   if(paidThroughCapped && paidThroughCapped > checkIn){
     lines.push(`From - ${fmtDateOrdinalShort(paidThroughCapped)} (${weekdayShort(paidThroughCapped)})`);
-    lines.push(`Until/Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+    lines.push(`Until/Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${waTimeSuffix(pickupTime)}`);
   } else {
     const ciClosed = closedDateFor(checkIn);
     const dropoffTime = stay.dropoff && stay.dropoff.time;
-    lines.push(`Check In - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${(ciClosed && dropoffTime) ? ` _(${dropoffTime})_` : ''}`);
-    lines.push(`Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${(coClosed && pickupTime) ? ` _(${pickupTime})_` : ''}`);
+    lines.push(`Check In - ${fmtDateOrdinalShort(checkIn)} (${weekdayShort(checkIn)})${waTimeSuffix(dropoffTime)}`);
+    lines.push(`Check Out - ${fmtDateOrdinalShort(checkOut)} (${weekdayShort(checkOut)})${waTimeSuffix(pickupTime)}`);
   }
   lines.push('');
 
