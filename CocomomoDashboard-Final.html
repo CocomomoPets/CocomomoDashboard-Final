@@ -1858,8 +1858,26 @@ function openCancelReasonModal(title, onConfirm){
    itself, amount and all, is kept: it just drops back to "general" (or stays
    linked to any other stay it was also split across) so it still counts
    toward the customer's balance and can be applied to a future stay. */
+/* Payment ✕ (9 Nov 2026): asks before deleting (a single mis-tap used to
+   remove a deposit permanently, with no trace), and records the deletion in
+   the Change log so it can be found and re-entered if it was a mistake. */
+function confirmAndLogPaymentDelete(owner, pmt){
+  if(!pmt) return false;
+  const label = `${pmt.type||'Payment'} RM ${fmtRM2(+pmt.amount||0)} (${fmtDate(pmt.date)})`;
+  if(!confirm(`Delete this payment?\n\n${label} — ${owner?.name||''}\n\nThis can't be undone.`)) return false;
+  logChange('Payment', { custId: owner?.id, paymentId: pmt.id }, `${owner?.name||''} — payment`, 'deleted', 'Payment deleted', label + (pmt.receiptNo?` · Receipt #${pmt.receiptNo}`:''), '(deleted)');
+  return true;
+}
 function unlinkPaymentsFromStay(cust, stayId){
-  if(!cust) return;
+  // 9 Nov 2026: checks EVERY customer's payments, not only `cust` — a pet
+  // sharing the room can belong to another customer, and a deposit they paid
+  // towards this stay must fall back to THEIR General payments too.
+  state.customers.forEach(c=>(c.payments||[]).forEach(p=>{
+    if(p.stayIds && p.stayIds.includes(stayId)){
+      p.stayIds = p.stayIds.filter(id=>id!==stayId);
+    }
+  }));
+  if(!cust || state.customers.includes(cust)) return;
   (cust.payments||[]).forEach(p=>{
     if(p.stayIds && p.stayIds.includes(stayId)){
       p.stayIds = p.stayIds.filter(id=>id!==stayId);
@@ -1985,7 +2003,7 @@ function openChangeLogModal(){
             <div class="today-card-sub">${changeLogValueDisplay(e.oldValue)} → ${changeLogValueDisplay(e.newValue)}</div>
             <div class="today-card-sub">${fmtDateWithDay(e.ts.slice(0,10))} at ${new Date(e.ts).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</div>
           </div>
-          ${!e.undone ? `<button class="btn btn-sm" data-undo-change="${e.id}">Undo</button>` : ''}
+          ${!e.undone && e.field!=='deleted' ? `<button class="btn btn-sm" data-undo-change="${e.id}">Undo</button>` : ''}
         </div>
       `).join('')}
     </div>
@@ -3361,6 +3379,7 @@ function renderCustomersMain(){
   document.querySelectorAll('[data-del-payment]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
+      if(!confirmAndLogPaymentDelete(cust, cust.payments.find(p=>p.id===btn.dataset.delPayment))) return;
       cust.payments = cust.payments.filter(p=>p.id!==btn.dataset.delPayment);
       renderCustomersMain(); scheduleSync(); toast('Payment removed');
     });
@@ -5030,7 +5049,12 @@ function wireSubContentEvents(cust, pet){
         unlinkPaymentsFromStay(ownerCust, stayId);
         logCancellation('Boarding', reason, note, ownerCust, pet, summary);
         scheduleSync();
-        renderPetSubContent(cust, pet); toast('Stay deleted');
+        // 9 Nov 2026: redraw the WHOLE customer page, not just the pet's tab —
+        // the deposit moves to "General payments" (top of the page), and the
+        // old partial redraw left that section showing "No general payments".
+        renderCustomersMain();
+        const unlinked = (ownerCust.payments||[]).filter(p=>!(p.stayIds||[]).length).length;
+        toast(unlinked ? 'Stay deleted — any payment on it is now under General payments' : 'Stay deleted');
       });
     });
   });
@@ -5053,8 +5077,9 @@ function wireSubContentEvents(cust, pet){
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
       const owner = findPaymentOwner(btn.dataset.delPayment) || cust;
+      if(!confirmAndLogPaymentDelete(owner, owner.payments.find(p=>p.id===btn.dataset.delPayment))) return;
       owner.payments = owner.payments.filter(p=>p.id!==btn.dataset.delPayment);
-      renderPetSubContent(cust, pet); scheduleSync(); toast('Payment removed');
+      renderCustomersMain(); scheduleSync(); toast('Payment removed');
     });
   });
   root.querySelectorAll('[data-edit-payment]').forEach(row=>{
@@ -8344,7 +8369,9 @@ function findArchivableRecords(cutoff){
     (groom.status==='Done & informed' || groom.status==='Picked up') && groom.date < cutoff);
   const payments = flattenAllPayments(state.customers).filter(({pmt}) => {
     const ids = pmt.stayIds || [];
-    if(ids.length === 0) return pmt.date < cutoff;
+    // 9 Nov 2026: a Deposit linked to no stay is credit the customer still
+    // has (e.g. its stay was cancelled) — keep it visible, never archive it.
+    if(ids.length === 0) return pmt.type !== 'Deposit' && pmt.date < cutoff;
     return ids.every(id => archivableStayIds.has(id));
   });
   return { stays, grooms, payments };
