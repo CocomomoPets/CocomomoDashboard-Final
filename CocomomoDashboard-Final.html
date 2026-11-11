@@ -1953,7 +1953,7 @@ function undoChange(entryId){
   if(entry.entityType==='Stay' && (entry.field==='checkIn' || entry.field==='checkOut')){
     const trial = { ...obj, [entry.field]: entry.oldValue };
     if(!trial.checkIn || !trial.checkOut || trial.checkOut < trial.checkIn){ toast("Can't undo — the stay would end before it starts"); return; }
-    const clash = (obj.pets||[]).find(sp=>{ const w = spRoomWindow(trial, sp); return !isRoomAvailable(sp.room, w.checkIn, w.checkOut, obj.id); });
+    const clash = stayPetSegRows(trial).find(sp=>{ const w = spRoomWindow(trial, sp); return !isRoomAvailable(sp.room, w.checkIn, w.checkOut, obj.id); });
     if(clash){ toast(`Can't undo — ${clash.room} is now booked by someone else for those dates`); return; }
     if(!confirm('Undo this date change? Free grooming appointments are not moved automatically — check them afterwards.')) return;
   }
@@ -2124,15 +2124,17 @@ function computeMonthlyReport(monthStr){
         // different dates are only counted/charged for the nights they're
         // actually there.
         const byRoom = {};
-        stay.pets.forEach(sp=>{
-          if(!byRoom[sp.room]) byRoom[sp.room] = [];
+        stayPetSegRows(stay).forEach(sp=>{
+          const rk = sp._seg ? `${sp.room}\u0001${sp._seg.spIdx}.${sp._seg.index}` : sp.room; // mid-stay room moves: one group per room actually used
+          if(!byRoom[rk]) byRoom[rk] = [];
           const ids = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
           ids.forEach(id=>{
-            if(byRoom[sp.room].some(o=>o.petId===id)) return;
-            byRoom[sp.room].push({ petId: id, ...petDatesInStay(stay, sp, id) });
+            if(byRoom[rk].some(o=>o.petId===id)) return;
+            byRoom[rk].push({ petId: id, ...petDatesInStay(stay, sp, id) });
           });
         });
-        Object.entries(byRoom).forEach(([roomId, occupants])=>{
+        Object.entries(byRoom).forEach(([roomKey, occupants])=>{
+          const roomId = roomKey.split('\u0001')[0];
           const room = roomTypeFor(roomId);
           if(!room || occupants.length===0) return;
           const roomCheckIn = occupants.map(o=>o.checkIn).sort()[0];
@@ -2232,7 +2234,7 @@ function computeUpcomingOccupancy(days){
       cust.pets.forEach(pet=>{
         (pet.stays||[]).forEach(stay=>{
           if(stay.status!=='Active') return;
-          stay.pets.forEach(sp=>{
+          stayPetSegRows(stay).forEach(sp=>{
             if(!sp.room) return;
             const w = spRoomWindow(stay, sp);
             if(dateStr>=w.checkIn && dateStr<w.checkOut) roomsBooked.add(sp.room);
@@ -2891,6 +2893,7 @@ function normalizeStayPet(sp){
     feeding: sp?.feeding || '',
     belongings: Array.isArray(sp?.belongings) ? sp.belongings.map(normalizeBelonging) : [],
     dates: sanitizeStayPetDates(sp?.dates),
+    moves: normalizeRoomMoves(sp?.moves),
   };
 }
 /* Effective [checkIn, checkOut) for one specific pet within a stay-pet row —
@@ -2910,6 +2913,86 @@ function spRoomWindow(stay, sp){
   const checkIn = wins.map(w=>w.checkIn).sort()[0];
   const checkOut = wins.map(w=>w.checkOut).sort().slice(-1)[0];
   return { checkIn, checkOut };
+}
+/* ── Mid-stay room moves (11 Nov 2026) ──────────────────────────────────
+   A pet (or a room-sharing group — the whole stay-pet row moves together)
+   can change room part-way through a stay WITHOUT checking out. The row
+   keeps `room` as the room it STARTS in, plus `moves: [{date, room}]` —
+   from the night of `date` onward it sleeps in `room`. One stay, one bill,
+   one check-in/out; only the calendar, room-clash checks and per-night
+   pricing follow the room actually used each night (a move to a different
+   room type charges that night, and every night after, at the new room's
+   rate). Stored inside the stay's existing `pets` JSON — no SQL needed. */
+function normalizeRoomMoves(moves){
+  if(!Array.isArray(moves)) return [];
+  const byDate = {};
+  moves.forEach(m=>{ if(m && m.date && m.room) byDate[m.date] = { date: m.date, room: m.room }; });
+  return Object.values(byDate).sort((a,b)=> a.date < b.date ? -1 : 1);
+}
+/* The row's room timeline: [{room, checkIn, checkOut}] in date order, each
+   [checkIn, checkOut) like a mini-stay. A row with no moves gives exactly one. */
+function spRoomSegments(stay, sp){
+  const w = spRoomWindow(stay, sp);
+  const moves = normalizeRoomMoves(sp && sp.moves);
+  if(!moves.length || !w.checkIn || !w.checkOut || w.checkOut <= w.checkIn) return [{ room: sp.room, checkIn: w.checkIn, checkOut: w.checkOut }];
+  let room = sp.room, start = w.checkIn;
+  const segs = [];
+  moves.forEach(m=>{
+    if(m.date <= w.checkIn){ room = m.room; return; }
+    if(m.date >= w.checkOut || m.room === room) return;
+    segs.push({ room, checkIn: start, checkOut: m.date });
+    room = m.room; start = m.date;
+  });
+  segs.push({ room, checkIn: start, checkOut: w.checkOut });
+  return segs;
+}
+function spFirstRoom(stay, sp){ return spRoomSegments(stay, sp)[0].room; }
+function spLastRoom(stay, sp){ const g = spRoomSegments(stay, sp); return g[g.length-1].room; }
+/* Room slept in on the night of dateStr. */
+function spRoomOn(stay, sp, dateStr){
+  const g = spRoomSegments(stay, sp);
+  const hit = g.find(x=> dateStr >= x.checkIn && dateStr < x.checkOut);
+  return hit ? hit.room : (dateStr < g[0].checkIn ? g[0].room : g[g.length-1].room);
+}
+/* "DB-01 → SU-01 from 13 Nov 2026 (Fri)" — plain room id when there are no moves. */
+function spRoomHistoryLabel(stay, sp){
+  const g = spRoomSegments(stay, sp);
+  return g.map((x,i)=> i===0 ? (x.room||'Unassigned') : `${x.room} from ${fmtDateWithDay(x.checkIn)}`).join(' → ');
+}
+/* Tidy a row's moves against its (possibly just-edited) dates: moves that
+   now fall outside the stay are dropped, so `room` is always the first room. */
+function pruneRoomMoves(stay, sp){
+  if(!sp || !sp.moves || !sp.moves.length) return;
+  const g = spRoomSegments(stay, sp);
+  sp.room = g[0].room;
+  sp.moves = g.slice(1).map(x=>({ date: x.checkIn, room: x.room }));
+}
+/* stay.pets with every moved row split into one "virtual" row per room it
+   uses — same shape as a real row (room / petId / sharingWith / dates), with
+   each pet's dates clipped to the nights spent in THAT room, so everything
+   that already understands "a row in a room for a window" (clash checks,
+   pricing, calendar, occupancy) just works per room. Rows without moves are
+   returned as-is. Virtual rows carry `_seg` (the real row + neighbours). */
+function stayPetSegRows(stay){
+  const out = [];
+  ((stay && stay.pets) || []).forEach((sp, spIdx)=>{
+    const segs = spRoomSegments(stay, sp);
+    if(segs.length===1 && segs[0].room===sp.room){ out.push(sp); return; }
+    const ids = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
+    segs.forEach((seg, i)=>{
+      const dates = {}, present = [];
+      ids.forEach(id=>{
+        const pw = petDatesInStay(stay, sp, id);
+        const ci = pw.checkIn > seg.checkIn ? pw.checkIn : seg.checkIn;
+        const co = pw.checkOut < seg.checkOut ? pw.checkOut : seg.checkOut;
+        if(ci < co){ dates[id] = { checkIn: ci, checkOut: co }; present.push(id); }
+      });
+      if(ids.length && !present.length) return;
+      out.push({ ...sp, room: seg.room, petId: ids.length ? present[0] : sp.petId, sharingWith: present.slice(1), dates, moves: [],
+        _seg: { sp, spIdx, index: i, count: segs.length, prevRoom: i>0 ? segs[i-1].room : null, nextRoom: i<segs.length-1 ? segs[i+1].room : null } });
+    });
+  });
+  return out;
 }
 function normalizeClosedAppt(a){
   if(!a) return null;
@@ -3887,7 +3970,7 @@ function printTodaySchedule(){
       const sp = item.sp;
       return `<tr>
         <td><b>${esc(item.pet.name)}</b> (${esc(item.cust.name)})</td>
-        <td>${esc(sp.room)||''}</td>
+        <td>${esc(spFirstRoom(item.stay, sp))||''}</td>
         <td>${esc(item.cust.phone)}</td>
         <td>${esc(sp.feeding)||'—'}</td>
       </tr>`;
@@ -3896,7 +3979,7 @@ function printTodaySchedule(){
       const pickups = (item.cust.authorizedPickups||[]).map(a=>`${a.name} (${a.phone})`).join(', ');
       return `<tr>
         <td><b>${esc(item.pet.name)}</b> (${esc(item.cust.name)})</td>
-        <td>${esc(item.sp.room)||''}</td>
+        <td>${esc(spLastRoom(item.stay, item.sp))||''}</td>
         <td>${esc(item.cust.phone)}</td>
         <td>${esc(pickups)||'None on file — verify with owner'}</td>
       </tr>`;
@@ -3919,6 +4002,28 @@ function printTodaySchedule(){
   area.innerHTML = html;
   window.print();
 }
+/* Mid-stay room moves due on `date` (Active stays only) — shown as a banner
+   on the Today grid so a move planned in advance isn't forgotten on the day. */
+function roomMovesOn(date){
+  const out = [];
+  state.customers.forEach(c=>c.pets.forEach(p=>(p.stays||[]).forEach(stay=>{
+    if(stay.status!=='Active') return;
+    (stay.pets||[]).forEach(sp=>{
+      const g = spRoomSegments(stay, sp);
+      for(let i=1;i<g.length;i++){
+        if(g[i].checkIn !== date) continue;
+        const names = [sp.petId, ...(sp.sharingWith||[])].map(id=>findPetById(id)?.name).filter(Boolean).join(' & ');
+        out.push({ names, from: g[i-1].room, to: g[i].room });
+      }
+    });
+  })));
+  return out;
+}
+function roomMovesBannerHtml(date){
+  const moves = roomMovesOn(date);
+  if(!moves.length) return '';
+  return `<div style="background:#E4EEFB;border:1px solid #B5CDEE;border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;color:#1B4C8C;margin-bottom:12px;">🔁 Room move${moves.length===1?'':'s'}: ${moves.map(m=>`${esc(m.names)} ${esc(m.from)} → ${esc(m.to)}`).join(' · ')}</div>`;
+}
 function todayDateSectionHtml(sec, checkins, checkouts, grooms){
   return `
   <div class="today-date-section ${sec.primary?'primary':'muted'}">
@@ -3927,6 +4032,7 @@ function todayDateSectionHtml(sec, checkins, checkouts, grooms){
       <span class="today-date-sub">${fmtDateLong(sec.date)}</span>
     </div>
     ${groomLeaveBannerHtml(sec.date, grooms)}
+    ${roomMovesBannerHtml(sec.date)}
     <div class="today-grid">
       <div>
         <div class="today-col-head"><h2>✂️ Grooming</h2><span class="today-count">${grooms.length}</span></div>
@@ -4044,7 +4150,7 @@ function todayCardHtml(cust, pet, stay, sp, memberIds, mode, allowCheckout){
       ${mode==='out' ? apptTimeLineHtml(stay, 'pickup') : ''}
       ${mode==='out' ? `<div class="today-card-sub">${(cust.authorizedPickups&&cust.authorizedPickups.length) ? `✅ Authorized: ${cust.authorizedPickups.map(a=>`${esc(a.name)} (${esc(a.phone)})`).join(', ')}` : `<span style="color:#A23B2C;">⚠️ No authorized pickup persons on file — verify with owner</span>`}</div>` : ''}
     </div>
-    <div class="today-card-room">${esc(sp.room)||'No room'}</div>
+    <div class="today-card-room">${esc(mode==='out' ? spLastRoom(stay, sp) : spFirstRoom(stay, sp))||'No room'}</div>
     ${canCheckin ? `<button class="btn btn-sm" data-today-checkin="${cust.id}|${stay.id}|${idsKey}">Check in</button>` : ''}
     ${canUndoCheckin ? `<button class="btn btn-sm btn-ghost" data-today-undo-checkin="${cust.id}|${stay.id}|${idsKey}" title="Wrong tap? Undo the check-in">Undo check-in</button>` : ''}
     ${canCheckout ? `<button class="btn btn-sm" data-today-checkout="${cust.id}|${stay.id}">Check out</button>` : ''}
@@ -4119,7 +4225,7 @@ function stayCardHtml(cust, pet, stay){
       <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>
       <div>
         <div class="card-head-title">${fmtDateWithDay(outerWindow.checkIn || stay.checkIn)} → ${fmtDateWithDay(outerWindow.checkOut || stay.checkOut)} <span class="badge ${stay.status==='Active'?'badge-active':'badge-past'}">${stay.status}</span>${isDaycareStay(stay)?' <span class="badge badge-active" style="background:#E0873C;">🐾 Daycare</span>':''}${stay.status==='Active'&&myCheckedIn?' <span class="badge badge-active">Checked in</span>':''}${isForeign?` <span class="badge badge-past">Sharing · booked under ${esc(ownerCust.name)}</span>`:''}${editingBadgeHtml(stay.id)}</div>
-        <div class="card-head-sub">${isDaycareStay(stay)?'Daycare (same-day)':`${nights} night${nights===1?'':'s'}`} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(mySlot.room):'—'}</div>
+        <div class="card-head-sub">${isDaycareStay(stay)?'Daycare (same-day)':`${nights} night${nights===1?'':'s'}`} · ${stay.pets.length} pet${stay.pets.length===1?'':'s'} in stay · Room ${mySlot?esc(spRoomSegments(stay, mySlot).map(x=>x.room||'—').join(' → ')):'—'}</div>
       </div>
       <div class="card-head-actions">
         ${stay.status==='Active' && !myCheckedIn ? `<button class="btn btn-sm" data-act="checkin-stay" data-stay="${stay.id}" data-pet="${pet.id}">Check in</button>` : ''}
@@ -4146,8 +4252,9 @@ function stayCardHtml(cust, pet, stay){
         <div class="stay-pet-block">
           <h4>${ANIMAL_ICON[spPet?.type]||'🐾'} ${petLabel(spPet)} ${spPet?.id===pet.id?'<span class="badge badge-active">this pet</span>':''}${riskFlagBadgesHtml(spPet)}</h4>
           ${vetInfoLineHtml(spPet)}
-          <div class="kv-row"><span>Room</span><span>${esc(sp.room)||'Unassigned'}</span></div>
+          <div class="kv-row"><span>Room</span><span>${esc(spRoomHistoryLabel(stay, sp))}</span></div>
           ${sp.room ? `<button type="button" class="btn btn-sm" data-whatsapp-msg="${stay.id}|${spIdx}" style="margin:4px 0 8px;">WhatsApp message</button>` : ''}
+          ${editable && sp.room && !isDaycareStay(stay) ? `<button type="button" class="btn btn-sm" data-move-room="${stay.id}|${spIdx}" style="margin:4px 0 8px;" title="Pet changes room part-way through the stay — no check-out needed">Move room</button>` : ''}
           ${hasOwnDates ? `<div class="kv-row"><span>Dates</span><span>${fmtDateWithDay(myWindow.checkIn)} → ${fmtDateWithDay(myWindow.checkOut)}</span></div>` : ''}
           <div class="kv-row"><span>Sharing with</span><span>${sp.sharingWith.length ? sharingPetLabelsWithDates(ownerCust, stay, sp).join(', ') : 'Not sharing'}</span></div>
           <div class="kv-row" style="align-items:stretch;">
@@ -4408,8 +4515,11 @@ function computeStayCost(stay){
   // actually there.
   const byRoom = {};
   const seenPerRoom = {};
-  stay.pets.forEach(sp => {
-    const room = sp.room;
+  // stayPetSegRows: a row that moved room mid-stay is priced per room it
+  // actually used each night (key = room + which part of the stay, so a pet
+  // that moves away and later back to the same room is still counted right).
+  stayPetSegRows(stay).forEach(sp => {
+    const room = sp._seg ? `${sp.room}\u0001${sp._seg.spIdx}.${sp._seg.index}` : sp.room;
     if(!byRoom[room]){ byRoom[room] = []; seenPerRoom[room] = new Set(); }
     if(!seenPerRoom[room].has(sp.petId)){
       seenPerRoom[room].add(sp.petId);
@@ -4424,7 +4534,8 @@ function computeStayCost(stay){
   });
   let total = 0, holidayUsed=false, extraCount=0, surchargeTotal=0;
   const surchargeByPet = {}; // petId -> { nights, amount } — how many nights THAT pet actually paid the sharing surcharge for, not the whole stay's night count
-  Object.entries(byRoom).forEach(([roomId, occupants])=>{
+  Object.entries(byRoom).forEach(([roomKey, occupants])=>{
+    const roomId = roomKey.split('\u0001')[0];
     const room = roomTypeFor(roomId);
     if(!room){ return; }
     const roomCheckIn = occupants.map(o=>o.checkIn).sort()[0];
@@ -4666,7 +4777,7 @@ function isRoomAvailable(roomId, checkIn, checkOut, excludeStayId){
     for(const p of c.pets){
       for(const s of p.stays){
         if(s.id === excludeStayId) continue;
-        for(const sp of s.pets){
+        for(const sp of stayPetSegRows(s)){
           if(sp.room !== roomId) continue;
           const w = spRoomWindow(s, sp);
           if(checkIn < w.checkOut && w.checkIn < checkOut) return false;
@@ -4709,7 +4820,7 @@ async function isRoomAvailableLive(roomId, checkIn, checkOut, excludeStayId){
       confirmationSent: s.confirmation_sent || [],
       billingGroupId: s.billing_group_id || null, daycareRate: s.daycare_rate,
     });
-    for(const sp of (stay.pets||[])){
+    for(const sp of stayPetSegRows(stay)){
       if(sp.room !== roomId) continue;
       const w = spRoomWindow(stay, sp);
       if(checkIn < w.checkOut && w.checkIn < checkOut) return false;
@@ -5007,6 +5118,13 @@ function wireSubContentEvents(cust, pet){
       e.stopPropagation();
       const [stayId, spIdx] = el.dataset.whatsappMsg.split('|');
       openBoardingWhatsAppModal(stayId, +spIdx);
+    });
+  });
+  root.querySelectorAll('[data-move-room]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [stayId, spIdx] = el.dataset.moveRoom.split('|');
+      openMoveRoomModal(stayId, +spIdx, { onSaved: ()=>renderPetSubContent(cust, pet) });
     });
   });
   root.querySelectorAll('[data-act="edit-stay"]').forEach(el=>{
@@ -6209,11 +6327,138 @@ function openClosedApptEditModal(stay, kind, onSaved){
   });
 }
 
+/* "Move room" (11 Nov 2026) — a pet (or the pets sharing its room) changes
+   room part-way through a stay without checking out. Adds/removes an entry
+   in the stay-pet row's `moves` list (see spRoomSegments). The new room is
+   checked for the nights it's needed: against other stays on this device,
+   other rows of the same stay, and the live table. */
+function openMoveRoomModal(stayId, spIdx, opts){
+  opts = opts || {};
+  if(_offlineMode){ offlineEditBlocked(); return; }
+  const stay = findStayById(stayId);
+  const sp = stay && stay.pets[spIdx];
+  if(!sp) return;
+  const onSaved = opts.onSaved || (()=>render());
+  const w = spRoomWindow(stay, sp);
+  if(isDaycareStay(stay) || nightsBetween(w.checkIn, w.checkOut) < 2){
+    toast('This stay is too short for a mid-stay move — use Edit to change the room');
+    return;
+  }
+  const names = [sp.petId, ...(sp.sharingWith||[])].map(id=>findPetById(id)?.name).filter(Boolean).join(' & ') || 'This pet';
+  const firstPet = findPetById(sp.petId);
+  const rooms = ROOM_INVENTORY.filter(r => !firstPet || r.animal === firstPet.type);
+  const minDate = addDays(w.checkIn, 1), maxDate = addDays(w.checkOut, -1);
+  let defDate = opts.defaultDate || todayStr();
+  if(defDate < minDate) defDate = minDate;
+  if(defDate > maxDate) defDate = maxDate;
+
+  // The room part that would cover `date` if the row's moves were `moves`.
+  const segAt = (moves, date)=> spRoomSegments(stay, { ...sp, moves }).find(g=> date >= g.checkIn && date < g.checkOut);
+  const clashInThisStay = (g)=> stay.pets.some((o,j)=> j!==spIdx && spRoomSegments(stay, o).some(y=> y.room===g.room && g.checkIn < y.checkOut && y.checkIn < g.checkOut));
+  const movesWith = (date, room)=> [...(sp.moves||[]).filter(m=>m.date!==date), { date, room }];
+  const typeName = id => { const rt = roomTypeFor(id); return rt ? rt.type : ''; };
+
+  function roomOptionsHtml(date){
+    const cur = spRoomOn(stay, sp, date);
+    return `<option value="">— select new room —</option>` + rooms.map(r=>{
+      if(r.id === cur) return `<option value="${r.id}" disabled>${r.id} · ${r.type} — current room</option>`;
+      const g = segAt(movesWith(date, r.id), date);
+      const busy = !g || !isRoomAvailable(g.room, g.checkIn, g.checkOut, stay.id) || clashInThisStay(g);
+      return `<option value="${r.id}" ${busy?'disabled':''}>${r.id} · ${r.type}${busy?' — occupied':''}</option>`;
+    }).join('');
+  }
+  function noteHtml(){
+    const date = document.getElementById('mr_date')?.value || defDate;
+    const roomId = document.getElementById('mr_room')?.value || '';
+    if(!roomId) return `Pick the room ${esc(names)} moves into. No check-out or new check-in is needed — it stays one booking and one bill.`;
+    const g = segAt(movesWith(date, roomId), date);
+    const n = g ? nightsBetween(date, g.checkOut) : 0;
+    const fromType = typeName(spRoomOn(stay, sp, date)), toType = typeName(roomId);
+    const rateLine = fromType !== toType
+      ? `Different room type (${esc(fromType)} → ${esc(toType)}): the night of ${fmtDateWithDay(date)} and every night after is charged at the ${esc(toType)} rate.`
+      : `Same room type, so the price doesn't change.`;
+    return `${esc(names)} sleeps in <b>${esc(roomId)}</b> from the night of ${fmtDateWithDay(date)} (${n} night${n===1?'':'s'}). ${rateLine}`;
+  }
+  const segs = spRoomSegments(stay, sp);
+  openModal(`
+    <div class="modal-head"><h3>Move room — ${esc(names)}</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      <div style="font-size:12.5px;font-weight:700;color:var(--ink-soft);margin-bottom:6px;">Rooms for this stay</div>
+      ${segs.map((g,i)=>`
+        <div class="charge-row" style="align-items:center;">
+          <span class="charge-desc"><b>${esc(g.room||'Unassigned')}</b> · ${fmtDateWithDay(g.checkIn)} → ${fmtDateWithDay(g.checkOut)} · ${nightsBetween(g.checkIn, g.checkOut)} night${nightsBetween(g.checkIn, g.checkOut)===1?'':'s'}</span>
+          ${i>0 ? `<button type="button" class="btn btn-sm btn-ghost" data-mr-remove="${g.checkIn}" title="Cancel this move — the pet stays in the room before it">✕ Undo move</button>` : ''}
+        </div>`).join('')}
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line-soft);">
+        <div class="repeat-row">
+          <div class="field">
+            <label>Moves on (first night in the new room)</label>
+            ${dateOverlayHtml('mr_date', defDate)}
+          </div>
+          <div class="field">
+            <label>New room</label>
+            <select id="mr_room">${roomOptionsHtml(defDate)}</select>
+          </div>
+        </div>
+        <div id="mr_note" style="font-size:12.5px;color:var(--ink-soft);margin-top:10px;">${noteHtml()}</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelBtn">Close</button>
+      <button class="btn btn-primary" id="mrSaveBtn">Move room</button>
+    </div>
+  `);
+  const dateEl = document.getElementById('mr_date'), roomEl = document.getElementById('mr_room'), noteEl = document.getElementById('mr_note');
+  dateEl.min = minDate; dateEl.max = maxDate;
+  wireDateOverlay('mr_date');
+  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  const dateOk = d => d && d >= minDate && d <= maxDate;
+  dateEl.addEventListener('change', ()=>{
+    if(dateOk(dateEl.value)) roomEl.innerHTML = roomOptionsHtml(dateEl.value);
+    noteEl.innerHTML = noteHtml();
+  });
+  roomEl.addEventListener('change', ()=>{ noteEl.innerHTML = noteHtml(); });
+
+  // Check the one room-part affected by the change, then save.
+  async function applyMoves(newMoves, focusDate, btn, doneMsg){
+    const g = segAt(newMoves, focusDate);
+    if(!g){ toast('That date is outside this stay'); return; }
+    if(!isRoomAvailable(g.room, g.checkIn, g.checkOut, stay.id) || clashInThisStay(g)){
+      toast(`${g.room} is already booked between ${fmtDate(g.checkIn)} and ${fmtDate(g.checkOut)} — please choose a different room`);
+      return;
+    }
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Checking availability…';
+    const liveOk = await isRoomAvailableLive(g.room, g.checkIn, g.checkOut, stay.id);
+    btn.disabled = false; btn.textContent = label;
+    if(!liveOk){ toast(`${g.room} was just booked by another device — please choose a different room`); return; }
+    sp.moves = normalizeRoomMoves(newMoves);
+    pruneRoomMoves(stay, sp);
+    closeModal(); scheduleSync(); onSaved();
+    toast(doneMsg);
+  }
+  document.getElementById('mrSaveBtn').addEventListener('click', ()=>{
+    const date = dateEl.value, roomId = roomEl.value;
+    if(!dateOk(date)){ toast(`Pick a date after check-in and before check-out (${fmtDate(minDate)} – ${fmtDate(maxDate)}). To change the room for the whole stay, use Edit.`); return; }
+    if(!roomId){ toast('Please pick the new room'); return; }
+    if(roomId === spRoomOn(stay, sp, date)){ toast(`${names} is already in ${roomId} on that date`); return; }
+    applyMoves(movesWith(date, roomId), date, document.getElementById('mrSaveBtn'), `${names} moves to ${roomId} from ${fmtDate(date)}`);
+  });
+  document.querySelectorAll('[data-mr-remove]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const date = btn.dataset.mrRemove;
+      if(!confirm(`Cancel the room move on ${fmtDate(date)}? ${names} will stay in the room before it for those nights.`)) return;
+      applyMoves((sp.moves||[]).filter(m=>m.date!==date), date, btn, 'Room move cancelled');
+    });
+  });
+}
+
 function openStayModal(cust, primaryPet, existing, afterSave){
   const onSaved = afterSave || (()=>renderPetSubContent(cust, primaryPet));
   const s = existing ? normalizeStay(existing) : { id:'', checkIn: todayStr(), checkOut: todayStr(), status:'Active', notes:'',
     pets:[{ petId: primaryPet.id, room:'', sharingWith:[], feeding:'', belongings:[], dates:{} }] };
-  let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings], dates:{...(sp.dates||{})}}));
+  let workingPets = s.pets.map(sp=>({...sp, belongings:[...sp.belongings], dates:{...(sp.dates||{})}, moves:(sp.moves||[]).map(m=>({...m}))}));
+  workingPets.forEach(w=>pruneRoomMoves(s, w));
   const rows = workingPets.map((sp,idx)=> stayPetRowHtml(cust, sp, idx)).join('');
   openModal(`
     <div class="modal-head"><h3>${existing?'Edit stay':'New stay'}</h3><button class="modal-close">✕</button></div>    <div class="modal-body">
@@ -6402,7 +6647,10 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     // this row's own occupied window — the union of this pet's + its sharing
     // partners' dates (their per-pet overrides if set, else the stay's own
     // dates above) — used for room-availability checks, not the bare stay window.
-    const rowWindow = spRoomWindow({checkIn, checkOut}, sp);
+    // With a mid-stay room move, the room picked here is only the FIRST room,
+    // so it only has to be free until the move date (see spRoomSegments).
+    const rowSegs = spRoomSegments({checkIn, checkOut}, sp);
+    const rowWindow = { checkIn: rowSegs[0].checkIn, checkOut: rowSegs[0].checkOut };
     return `
     <div style="border:1px solid var(--line-soft);border-radius:8px;padding:12px;margin-bottom:10px;background:var(--panel-2);">
       <div class="repeat-row">
@@ -6420,6 +6668,7 @@ function openStayModal(cust, primaryPet, existing, afterSave){
             }).join('')}
           </select>
           ${sp.room && !isRoomAvailable(sp.room, rowWindow.checkIn, rowWindow.checkOut, existing?.id) ? `<div style="color:var(--danger);font-size:11.5px;font-weight:600;margin-top:4px;">⚠ ${esc(sp.room)} is booked by another stay for these dates — please pick a different room.</div>` : ''}
+          ${rowSegs.length>1 ? `<div style="font-size:11.5px;color:var(--ink-soft);margin-top:4px;">Room above is until ${fmtDateWithDay(rowSegs[1].checkIn)}. Then: ${rowSegs.slice(1).map(g=>`${esc(g.room)} from ${fmtDateWithDay(g.checkIn)}`).join(', ')} — change this with “Move room” on the stay card.</div>` : ''}
         </div>
         ${workingPets.length>1 ? `<button type="button" class="mini-remove" data-stayrow-remove="${idx}">✕</button>` : ''}
       </div>
@@ -6483,10 +6732,23 @@ function openStayModal(cust, primaryPet, existing, afterSave){
       }
     }
     // Deep audit (25 Oct 2026): the same room picked twice in one booking was never caught.
-    const roomsUsed = workingPets.map(w=>w.room);
-    const dupRoom = roomsUsed.find((r,i)=>roomsUsed.indexOf(r)!==i);
+    // Mid-stay room moves (11 Nov 2026): tidy moves against the dates being
+    // saved, then check every room each row uses, for the nights it uses it.
+    const stayLike = { checkIn, checkOut };
+    workingPets.forEach(w=>pruneRoomMoves(stayLike, w));
+    const segsOf = w => spRoomSegments(stayLike, w);
+    let dupRoom = null;
+    workingPets.forEach((a,i)=>workingPets.forEach((b,j)=>{
+      if(j<=i || dupRoom) return;
+      const sa = segsOf(a), sb2 = segsOf(b);
+      sa.forEach(x=>sb2.forEach(y=>{
+        if(x.room!==y.room) return;
+        if((sa.length===1 && sb2.length===1) || (x.checkIn < y.checkOut && y.checkIn < x.checkOut)) dupRoom = x.room;
+      }));
+    }));
     if(dupRoom){ toast(`${dupRoom} is picked for two pets in this booking — put them in one row as "sharing", or choose another room`); return; }
-    const conflictRoom = workingPets.find(w => { const rw = spRoomWindow({checkIn, checkOut}, w); return !isRoomAvailable(w.room, rw.checkIn, rw.checkOut, existing?.id); });
+    let conflictRoom = null;
+    workingPets.forEach(w=>segsOf(w).forEach(g=>{ if(!conflictRoom && !isRoomAvailable(g.room, g.checkIn, g.checkOut, existing?.id)) conflictRoom = g; }));
     if(conflictRoom){ toast(`${conflictRoom.room} is already booked for these dates — please choose a different room`); return; }
     const saveBtn = document.getElementById('saveBtn');
     saveBtn.disabled = true; saveBtn.textContent = 'Checking availability…';
@@ -6496,9 +6758,11 @@ function openStayModal(cust, primaryPet, existing, afterSave){
     // and this device hasn't reloaded yet.
     let liveConflictRoom = null;
     for(const w of workingPets){
-      const rw = spRoomWindow({checkIn, checkOut}, w);
-      const available = await isRoomAvailableLive(w.room, rw.checkIn, rw.checkOut, existing?.id);
-      if(!available){ liveConflictRoom = w; break; }
+      for(const g of segsOf(w)){
+        const available = await isRoomAvailableLive(g.room, g.checkIn, g.checkOut, existing?.id);
+        if(!available){ liveConflictRoom = g; break; }
+      }
+      if(liveConflictRoom) break;
     }
     saveBtn.disabled = false; saveBtn.textContent = 'Save';
     if(liveConflictRoom){
@@ -9274,8 +9538,13 @@ function buildBoardingBlock(stay, sp){
   const petIds = Array.from(new Set([sp.petId, ...(sp.sharingWith||[])]));
   const pets = petIds.map(id=>findPetById(id)).filter(Boolean);
   if(pets.length===0) return null;
-  const room = roomTypeFor(sp.room);
-  const roomLabel = genericRoomLabel(room ? room.type : '');
+  // Mid-stay room moves (11 Nov 2026): each night is priced by the room the
+  // pet actually sleeps in that night. `room` stays the first room; when the
+  // room TYPE changes the label reads e.g. "Deluxe room → Suite room".
+  const roomSegs = spRoomSegments(stay, sp);
+  const room = roomTypeFor(roomSegs[0].room);
+  const segLabels = roomSegs.map(g=>{ const rt = roomTypeFor(g.room); return genericRoomLabel(rt ? rt.type : ''); });
+  const roomLabel = segLabels.filter((l,i)=> i===0 || l!==segLabels[i-1]).join(' → ');
   const win = spRoomWindow(stay, sp);
   const checkIn = win.checkIn, checkOut = win.checkOut;
   const nights = nightsBetween(checkIn, checkOut);
@@ -9318,6 +9587,8 @@ function buildBoardingBlock(stay, sp){
     const dateStr = addDays(checkIn, n);
     if(paidThroughCapped && dateStr < paidThroughCapped) continue; // already paid — leave out of the quote
     const holiday = isHoliday(dateStr);
+    const room = roomTypeFor(spRoomOn(stay, sp, dateStr)); // tonight's room (shadows the first room above)
+    const nightRoomLabel = genericRoomLabel(room ? room.type : '');
     const presentIds = orderOccupantsForRoom(room && room.type, petIds.filter(id=>{
       if(!findPetById(id)) return false; // deleted pet — matches computeStayCost (25 Oct 2026)
       const w = petDatesInStay(stay, sp, id);
@@ -9342,7 +9613,7 @@ function buildBoardingBlock(stay, sp){
       : standardRate;
     const extrasTonight = presentIds.slice(1).map(id=>findPetById(id)).filter(Boolean);
     const surchargeAmt = extrasTonight.reduce((sum,p)=> sum + surchargeAmountFor(p), 0);
-    nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight, primaryId: presentIds[0] });
+    nightRows.push({ dateStr, holiday, baseRate, surchargeAmt, extrasTonight, primaryId: presentIds[0], roomLabel: nightRoomLabel });
   }
   merge.nightRows = nightRows;
   merge.paidFrom = paidThroughCapped;
@@ -9378,7 +9649,7 @@ function buildBoardingBlock(stay, sp){
     // Deluxe room rate depends on dog size, so the size is shown there;
     // Suite / Royal Suite cost the same for any single dog — no size.
     const primaryLabel = (primaryPet && primaryPet.type === 'Cat') ? 'cat'
-      : (roomLabel==='Deluxe room' && primaryPet) ? `${sizeGroupLabel(primaryPet.boardingSize)} size dog` : 'dog';
+      : (sample.roomLabel==='Deluxe room' && primaryPet) ? `${sizeGroupLabel(primaryPet.boardingSize)} size dog` : 'dog';
     const sizeCounts = {};
     sample.extrasTonight.forEach(p=>{
       const lbl = p.type === 'Cat' ? 'cat' : `${sizeGroupLabel(p.boardingSize)} size dog`;
@@ -9411,11 +9682,15 @@ function buildBoardingBlock(stay, sp){
     // customer vs. the stay card. Now the nights are grouped by their actual
     // price; when that gives more than the simple cases, each group gets its
     // own block (who's in the room + dates), then a final sum line.
-    const priceSig = r => `${hasHolidaySplit ? (r.holiday?1:0) : ''}|${r.baseRate}|${r.surchargeAmt}|${r.primaryId}|${r.extrasTonight.map(p=>p.id).join(',')}`;
+    const roomTypeChanged = new Set(nightRows.map(r=>r.roomLabel)).size > 1; // moved to a different room type mid-stay
+    merge.roomTypeChanged = roomTypeChanged;
+    const priceSig = r => `${hasHolidaySplit ? (r.holiday?1:0) : ''}|${r.baseRate}|${r.surchargeAmt}|${r.primaryId}|${r.extrasTonight.map(p=>p.id).join(',')}|${r.roomLabel}`;
     const priceSegs = [];
     nightRows.forEach(r=>{ const k=priceSig(r); let s=priceSegs.find(x=>x.k===k); if(!s){ s={k, rows:[]}; priceSegs.push(s); } s.rows.push(r); });
-    const simpleLayout = priceSegs.length===1
-      || (priceSegs.length===2 && hasHolidaySplit && priceSegs[0].rows[0].holiday!==priceSegs[1].rows[0].holiday);
+    const simpleLayout = !roomTypeChanged && (priceSegs.length===1
+      || (priceSegs.length===2 && hasHolidaySplit && priceSegs[0].rows[0].holiday!==priceSegs[1].rows[0].holiday));
+    // Who's-in-the-room only needs spelling out per block when it actually varies.
+    const whoVaries = new Set(nightRows.map(r=>`${r.primaryId}|${r.extrasTonight.map(p=>p.id).join(',')}`)).size > 1;
 
     if(!simpleLayout){
       priceSegs.sort((a,b)=> a.rows[0].dateStr < b.rows[0].dateStr ? -1 : 1);
@@ -9425,7 +9700,8 @@ function buildBoardingBlock(stay, sp){
         const whoPets = [findPetById(r0.primaryId), ...r0.extrasTonight].filter(Boolean);
         const who = whoPets.length===1 ? `${whoPets[0].name} only` : whoPets.map(p=>p.name).join(' & ');
         const rateTag = hasHolidaySplit ? ` — ${r0.holiday?'Holiday':'Normal'} Rate` : '';
-        lines.push(`_${who}${rateTag} (${groupDateRangesForMessage(rows.map(r=>r.dateStr), checkOut)})_`);
+        const blockTitle = !roomTypeChanged ? who : (whoVaries ? `${r0.roomLabel} — ${who}` : r0.roomLabel);
+        lines.push(`_${blockTitle}${rateTag} (${groupDateRangesForMessage(rows.map(r=>r.dateStr), checkOut)})_`);
         let per = r0.baseRate;
         if(r0.extrasTonight.length){ const sl = sharingLine(rows); per = sl.perNight; lines.push(sl.text); }
         const segTotal = per * n;
@@ -9740,7 +10016,7 @@ function buildCombinedBoardingWhatsAppMessage(entries, ownerCust){
 function buildSameDatesMultiRoomMessage(blocks, ownerCust){
   if(blocks.length < 2) return null;
   const bs = blocks.map(x=>x.block);
-  if(!bs.every(b=>b.merge && !b.merge.daycare && b.merge.nightRows.length>0)) return null;
+  if(!bs.every(b=>b.merge && !b.merge.daycare && b.merge.nightRows.length>0 && !b.merge.roomTypeChanged)) return null;
   const first = bs[0];
   if(!bs.every(b=>b.checkIn===first.checkIn && b.checkOut===first.checkOut && b.merge.paidFrom===first.merge.paidFrom)) return null;
   const nightCount = first.merge.nightRows.length;
@@ -10316,24 +10592,33 @@ function cellOccupants(roomId, dateStr){
   state.customers.forEach(cust=>{
     cust.pets.forEach(pet=>{
       pet.stays.forEach(stay=>{
-        stay.pets.forEach(sp=>{
+        stayPetSegRows(stay).forEach(sp=>{
           if(sp.room !== roomId) return;
+          // realSp: the stored row (sp itself unless this is one room-part of a
+          // row that moved room mid-stay — see stayPetSegRows).
+          const realSp = sp._seg ? sp._seg.sp : sp;
           const memberIds = [sp.petId, ...(sp.sharingWith||[])].filter(Boolean);
           memberIds.forEach(id=>{
             if(seenPetIds.has(id)) return;
             const w = petDatesInStay(stay, sp, id);
             if(dateStr < w.checkIn || dateStr > w.checkOut) return;
-            let kind = 'staying';
+            const real = petDatesInStay(stay, realSp, id);
+            let kind = 'staying', moveTo = null, moveFrom = null;
             if(dateStr === w.checkIn && dateStr === w.checkOut) kind = 'both';
-            else if(dateStr === w.checkIn) kind = 'checkin';
-            else if(dateStr === w.checkOut) kind = 'checkout';
+            else if(dateStr === w.checkIn){
+              // first day in this room: a real check-in, or a move in from another room
+              if(w.checkIn === real.checkIn) kind = 'checkin'; else { kind = 'movein'; moveFrom = sp._seg ? sp._seg.prevRoom : null; }
+            }
+            else if(dateStr === w.checkOut){
+              if(w.checkOut === real.checkOut) kind = 'checkout'; else { kind = 'moveout'; moveTo = sp._seg ? sp._seg.nextRoom : null; }
+            }
             // id may be the row's own petId (look up via findPetAcrossStay so a
             // shared stay resolves to the real owner) or a sharing partner's id
             // (look up globally, since they can belong to a different customer).
-            const resolved = id===sp.petId ? { pet: findPetAcrossStay(cust, id) || pet, cust } : findPetWithCustomer(id);
+            const resolved = id===realSp.petId ? { pet: findPetAcrossStay(cust, id) || pet, cust } : findPetWithCustomer(id);
             if(!resolved.pet) return;
             seenPetIds.add(id);
-            out.push({ cust: resolved.cust || cust, pet: resolved.pet, stay, kind });
+            out.push({ cust: resolved.cust || cust, pet: resolved.pet, stay, kind, moveTo, moveFrom });
           });
         });
       });
@@ -10353,7 +10638,7 @@ function findUpcomingRoomClashes(){
   const today = todayStr();
   const rows = [];
   state.customers.forEach(c=>c.pets.forEach(p=>(p.stays||[]).forEach(st=>{
-    (st.pets||[]).forEach(sp=>{
+    stayPetSegRows(st).forEach(sp=>{
       if(!sp.room) return;
       const w = spRoomWindow(st, sp);
       if(!w.checkIn || !w.checkOut || w.checkOut <= today) return;
@@ -10443,6 +10728,7 @@ function renderBoardingCalendar(){
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--line-soft);border:1px solid var(--line);"></span>Free</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--teal);"></span>Booked — colour = owner</span>
         <span class="legend-chip">Split colour = same-day turnover (O. = out, I. = in)</span>
+        <span class="legend-chip">⇢ / ⇠ = moves room that day (same stay, no check-out)</span>
         <span class="legend-chip">Numbered = same owner's other pets, different room</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:var(--amber-tint);border:1px solid #F0D2AC;"></span>Holiday rate period</span>
         <span class="legend-chip"><span class="legend-swatch" style="background:#FBE4E2;border:2px solid #A23B2C;"></span>🔒 Shop closed</span>
@@ -10530,12 +10816,20 @@ function ownerPetIndex(cust, pet){
 }
 /* Label for a same-room, same-day turnover entry: Out / In (not a numbered list). */
 function turnoverLabel(kind){
-  if(kind==='checkout') return 'O.';
-  if(kind==='checkin') return 'I.';
+  if(kind==='checkout' || kind==='moveout') return 'O.';
+  if(kind==='checkin' || kind==='movein') return 'I.';
   if(kind==='both') return 'O/I.';
   return '';
 }
 
+/* Mid-stay room move markers on the calendar: on the move day the old room
+   shows "⇢ NEWROOM" (pet leaves this room, room is free that night) and the
+   new room shows "⇠ OLDROOM". Not a check-out/check-in. */
+function calMoveSuffix(o){
+  if(o.kind==='moveout') return ` ⇢${esc(o.moveTo||'')}`;
+  if(o.kind==='movein') return ` ⇠${esc(o.moveFrom||'')}`;
+  return '';
+}
 function calCellHtml(roomId, dateStr, occ, isToday, isHol, isClosed){
   const holCls = isHol ? 'cal-holiday-col' : '';
   const closedCls = isClosed ? 'cal-closed-col' : '';
@@ -10560,7 +10854,7 @@ function calCellHtml(roomId, dateStr, occ, isToday, isHol, isClosed){
     let label;
     if(distinctStays > 1) label = turnoverLabel(o.kind);
     else { const idx = ownerPetIndex(o.cust, o.pet); label = idx?`${idx}.`:''; }
-    return `<div class="cal-cell-line">${label}${esc(o.pet.name)}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
+    return `<div class="cal-cell-line">${label}${esc(o.pet.name)}${calMoveSuffix(o)}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
   };
   let lines, bg, textColor, textShadow;
   if(colours.length > 1){
@@ -10590,7 +10884,7 @@ function calCellHtml(roomId, dateStr, occ, isToday, isHol, isClosed){
   } else {
     const o = occ[0];
     const idx = ownerPetIndex(o.cust, o.pet);
-    const arrow = o.kind==='checkin' ? ' →' : o.kind==='checkout' ? ' ←' : o.kind==='both' ? ' ↔' : '';
+    const arrow = o.kind==='checkin' ? ' →' : o.kind==='checkout' ? ' ←' : o.kind==='both' ? ' ↔' : calMoveSuffix(o);
     lines = `<div class="cal-cell-line">${idx?`${idx}.`:''}${esc(o.pet.name)}${arrow}</div>${o.pet.breed?`<div class="cal-cell-breed">${esc(o.pet.breed)}</div>`:''}`;
   }
   const holBadge = isHol ? '<span class="cal-holiday-badge" title="Holiday rate"></span>' : '';
@@ -10626,6 +10920,8 @@ function openCalendarCellModal(roomId, dateStr){
               ${o.kind==='checkin'?'<span class="badge badge-active">Checking in</span>':''}
               ${o.kind==='checkout'?'<span class="badge badge-past">Checking out</span>':''}
               ${o.kind==='both'?'<span class="badge badge-active">In &amp; out today</span>':''}
+              ${o.kind==='moveout'?`<span class="badge badge-past">Moving to ${esc(o.moveTo||'another room')} today</span>`:''}
+              ${o.kind==='movein'?`<span class="badge badge-active">Moved here from ${esc(o.moveFrom||'another room')} today</span>`:''}
               ${sharing?'<span class="badge badge-active">Sharing room</span>':''}
             </div>
             <div class="today-card-sub">${esc(o.cust.name)} · ${esc(o.cust.phone)} · ${fmtDate(o.stay.checkIn)} → ${fmtDate(o.stay.checkOut)}</div>
@@ -10633,6 +10929,7 @@ function openCalendarCellModal(roomId, dateStr){
             ${showPickup ? apptTimeLineHtml(o.stay, 'pickup', `data-cal-edit-closed-appt="${o.stay.id}|pickup|${o.cust.id}|${o.pet.id}"`) : ''}
             <div data-cal-view-pet="${o.cust.id}|${o.pet.id}" style="cursor:pointer;margin-top:4px;font-size:12px;font-weight:600;text-decoration:underline;color:var(--ink-soft);">View pet's page →</div>
           </div>
+          ${o.stay.status==='Active' && !isDaycareStay(o.stay) ? `<button class="btn btn-sm" data-cal-move-room="${o.stay.id}|${o.pet.id}" title="Pet changes room part-way through the stay — no check-out needed">Move room</button>` : ''}
           <button class="btn btn-sm btn-danger" data-cal-delete-stay="${o.stay.id}" title="Delete this stay">Delete</button>
         </div>`;
         }).join('')}
@@ -10657,7 +10954,7 @@ function openCalendarCellModal(roomId, dateStr){
   document.getElementById('cancelBtn').addEventListener('click', closeModal);
   document.querySelectorAll('[data-cal-edit-stay]').forEach(el=>{
     el.addEventListener('click', (e)=>{
-      if(e.target.closest('[data-cal-edit-closed-appt]') || e.target.closest('[data-cal-view-pet]') || e.target.closest('[data-cal-delete-stay]')) return;
+      if(e.target.closest('[data-cal-edit-closed-appt]') || e.target.closest('[data-cal-view-pet]') || e.target.closest('[data-cal-delete-stay]') || e.target.closest('[data-cal-move-room]')) return;
       const stayId = el.dataset.calEditStay;
       const st = findStayById(stayId);
       if(!st) return;
@@ -10669,6 +10966,18 @@ function openCalendarCellModal(roomId, dateStr){
       // reopen this same cell's day-detail modal instead of navigating to
       // the pet's page (which the "View pet's page" link below does instead).
       openStayModal(ownerCust, ownerPet, st, ()=>{ renderBoardingCalendar(); openCalendarCellModal(roomId, dateStr); });
+    });
+  });
+  document.querySelectorAll('[data-cal-move-room]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const [stayId, petId] = btn.dataset.calMoveRoom.split('|');
+      const st = findStayById(stayId);
+      if(!st) return;
+      const spIdx = st.pets.findIndex(x=> x.petId===petId || (x.sharingWith||[]).includes(petId));
+      if(spIdx < 0) return;
+      closeModal();
+      openMoveRoomModal(stayId, spIdx, { defaultDate: dateStr, onSaved: ()=>{ renderBoardingCalendar(); openCalendarCellModal(roomId, dateStr); } });
     });
   });
   document.querySelectorAll('[data-cal-view-pet]').forEach(el=>{
