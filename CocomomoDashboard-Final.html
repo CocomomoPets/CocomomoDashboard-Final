@@ -832,18 +832,17 @@ function hydrateStateFromRemote(remote, opts){
     c.pets.forEach(p=>{
       (p.stays||[]).forEach(stay=>{
         if(stay.status !== 'Active') return;
-        const dates = computeFreeGroomingDates(stay.checkIn, stay.checkOut);
-        if(dates.length === 0) return;
+        const plan = planFreeGroomings(stay.checkIn, stay.checkOut);
+        if(plan.length === 0) return;
         stay.pets.forEach(sp=>{
           (sp.sharingWith||[]).forEach(sharedId=>{
             const { pet: sharedPet, cust: sharedCust } = findPetWithCustomer(sharedId);
             if(!sharedPet || sharedPet.type !== 'Dog') return;
             const owner = sharedCust || c;
-            dates.forEach((date, idx)=>{
-              const alreadyHas = (sharedPet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
-              if(alreadyHas) return;
-              const isCheckoutDay = idx === dates.length - 1;
-              const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
+            plan.forEach(entry=>{
+              const date = entry.date;
+              if(!date || fbgHasOn(sharedPet, date) || fbgHasOn(sharedPet, entry.rawDate)) return;
+              const slot = findFbgSlot(date, entry.prefTime, entry.latestTime, null);
               if(!slot) return;
               sharedPet.groomingHistory.push({
                 id: uid('groom'), date, time: slot.time, bay: slot.bay,
@@ -1026,6 +1025,7 @@ async function loadFromCloudInner(){
   _cloudLoaded = true;
   render();
   checkSignedAgreements();
+  moveClosedDayFbgs();
   // Fire-and-forget — never awaited, so a slow or failing auto-backup can
   // never delay the dashboard becoming usable. See maybeRunAutoBackup()
   // for why this exists and how it's kept safe.
@@ -6824,19 +6824,24 @@ function openStayModal(cust, primaryPet, existing, afterSave){
         freeResult = await assignFreeGroomings(cust, petWindows);
       }
       closeModal(); onSaved(); scheduleSync();
+      const fbgSkipped = freeResult.skippedList || [];
+      const fbgMoved = freeResult.movedList || [];
       if(freeResult.assignedCount > 0){
         toast(`Stay ${existing?'updated':'created'} — ${freeResult.assignedCount} free grooming${freeResult.assignedCount===1?'':'s'} auto-booked`);
-        if(!createdStay) openFreeGroomingSummaryModal(freeResult.assignedList);
       } else if(freeResult.movedCount > 0){
         toast(`Stay updated — ${freeResult.movedCount} free grooming${freeResult.movedCount===1?'':'s'} rescheduled to match`);
       } else {
         toast(existing ? 'Stay updated' : 'Stay created');
       }
-      // Pain point #13 — prompt an instant booking confirmation right at
-      // creation time, instead of only the day-before reminder. Shown last
-      // (after the free-grooming toast/summary above) so that info isn't
-      // lost, but always shown for a brand-new stay.
-      if(createdStay) openBookingConfirmationModal(cust, createdStay);
+      // Pain point #13 — instant booking confirmation for a brand-new stay.
+      // FBG popup (16 Nov 2026) now shows for NEW bookings too, first, so
+      // staff can review/edit/decline the free groomings before the
+      // confirmation message is copied; the confirmation opens when the
+      // FBG popup is closed.
+      const showConfirm = ()=>{ if(createdStay) openBookingConfirmationModal(cust, createdStay); };
+      if(freeResult.assignedCount > 0 || fbgMoved.length || fbgSkipped.length){
+        openFreeGroomingSummaryModal(freeResult.assignedList, { moved: fbgMoved, skipped: fbgSkipped, onClose: showConfirm });
+      } else showConfirm();
     };
     const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
     if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
@@ -7491,24 +7496,137 @@ function computeFreeGroomingDates(checkIn, checkOut){
   }
   return dates;
 }
-/* Preferred bay/time on a given date, falling back gracefully if taken:
-   preferred bay at the preferred time -> preferred bay at any time -> any
-   open bay/time at all. Keeps the free grooming off a real booking's slot.
-   `excludeId` lets a slot search ignore one specific grooming record (used
-   when moving an existing FBG appointment to a new date/time). */
-function findFreeGroomSlot(date, prefTime, prefBay, excludeId){
-  const time0 = prefTime || TIME_SLOTS[0];
-  const bay0 = prefBay || BAYS[0];
-  if(!findGroomConflict(date, time0, bay0, excludeId)) return { time: time0, bay: bay0 };
-  for(const time of TIME_SLOTS){
-    if(!findGroomConflict(date, time, bay0, excludeId)) return { time, bay: bay0 };
-  }
-  for(const time of TIME_SLOTS){
-    for(const bay of BAYS){
-      if(!findGroomConflict(date, time, bay, excludeId)) return { time, bay };
+/* FBG slot rules (16 Nov 2026):
+   - Mid-stay FBG: 4pm, Bay 1 -> Bay 2 -> Bay 3 (never Bay 4).
+   - Check-out-day FBG: 10am, Bay 1 -> Bay 2 -> Bay 3 (never Bay 4), and
+     only up to 2pm — if 10am–2pm is full it is left for staff to assign.
+   - If every bay is taken at that time, try other times on the HOUR only
+     (no half-hours), nearest hour first, later hour wins a tie:
+       4pm  -> 5pm, 3pm, 6pm, 2pm, 1pm, 12pm, 11am, 10am
+       10am -> 11am, 12pm, 1pm ... 6pm
+     Only if EVERY hourly slot is full does it try half-hours, nearest first
+     (4:30pm, 3:30pm, 5:30pm... / 10:30am, 11:30am...).
+   - Closed day (e.g. Tuesday): the FBG moves to the day before, at the
+     END of the day (4pm, 5pm, 3pm...). If the day before is closed too it
+     keeps stepping back; a mid-stay one that can't go back (would land
+     before check-in) steps forward instead. See planFreeGroomings(). */
+const FBG_BAYS = ['Bay 1','Bay 2','Bay 3']; // Bay 4 is never auto-assigned for FBG (16 Nov 2026) — staff can still move one there by hand
+const FBG_MIDSTAY_TIME = '16:00';
+const FBG_CHECKOUT_TIME = '10:00';
+const FBG_CHECKOUT_LATEST = '14:00'; // latest start time for a check-out-day FBG
+function fbgHourOrder(prefTime){
+  const toMin = t=>{ const [h,m]=t.split(':').map(Number); return h*60+m; };
+  const p = toMin(prefTime);
+  const nearest = (a,b)=>{
+    const da = Math.abs(toMin(a)-p), db = Math.abs(toMin(b)-p);
+    return da!==db ? da-db : toMin(b)-toMin(a);
+  };
+  // Every on-the-hour slot first; half-hour slots only as a last resort
+  // once every hourly slot (Bays 1–3) is full (16 Nov 2026).
+  const hours = TIME_SLOTS.filter(t=>t.endsWith(':00')).sort(nearest);
+  const halves = TIME_SLOTS.filter(t=>!t.endsWith(':00')).sort(nearest);
+  return [...hours, ...halves];
+}
+/* Every candidate {time, bay} in rule order that is free on THIS device's
+   copy of the schedule. `excludeId` ignores one grooming record (used when
+   moving an existing FBG so it doesn't block itself). */
+function fbgSlotCandidates(date, prefTime, latestTime, excludeId){
+  const out = [];
+  for(const time of fbgHourOrder(prefTime).filter(t=>!latestTime || t <= latestTime)){
+    for(const bay of FBG_BAYS){
+      if(!findGroomConflict(date, time, bay, excludeId)) out.push({ time, bay });
     }
   }
-  return null;
+  return out;
+}
+function findFbgSlot(date, prefTime, latestTime, excludeId){
+  return fbgSlotCandidates(date, prefTime, latestTime, excludeId)[0] || null;
+}
+/* Same as findFbgSlot, plus a live server check. If another device has just
+   taken the chosen slot, it moves on to the next candidate instead of giving
+   up (max 3 live checks, so a booking never turns into a long chain of
+   network calls). Returns { slot } or { slot:null, reason:'full'|'live' }. */
+async function findFbgSlotLive(date, prefTime, latestTime, excludeId){
+  const cands = fbgSlotCandidates(date, prefTime, latestTime, excludeId);
+  if(!cands.length) return { slot:null, reason: latestTime ? 'checkoutMorningFull' : 'full' };
+  for(const c of cands.slice(0,3)){
+    if(!(await findGroomConflictLive(date, c.time, c.bay, excludeId))) return { slot:c };
+  }
+  return { slot:null, reason:'live' };
+}
+/* Turns the raw earned dates into the actual booking plan, applying the
+   closed-day rule. Each entry: { rawDate, date, prefTime, isCheckout,
+   shifted } — `date` is null if no open day could be found in the stay. */
+function planFreeGroomings(checkIn, checkOut){
+  const raw = computeFreeGroomingDates(checkIn, checkOut);
+  return raw.map((rawDate, idx)=>{
+    const isCheckout = idx === raw.length-1;
+    let date = rawDate, prefTime = isCheckout ? FBG_CHECKOUT_TIME : FBG_MIDSTAY_TIME, shifted = false;
+    if(isClosedDate(rawDate)){
+      shifted = true;
+      prefTime = FBG_MIDSTAY_TIME; // end of the day before
+      let d = addDays(rawDate, -1);
+      while(d >= checkIn && isClosedDate(d)) d = addDays(d, -1);
+      if(d >= checkIn){ date = d; }
+      else if(!isCheckout){
+        d = addDays(rawDate, 1);
+        while(d < checkOut && isClosedDate(d)) d = addDays(d, 1);
+        date = (d <= checkOut && !isClosedDate(d)) ? d : null;
+      } else date = null;
+    }
+    // Check-out-day FBG only uses 10am–2pm (most owners pick up before 2pm).
+    // If all of those are full it is NOT pushed later — staff are told to
+    // assign it by hand. Doesn't apply once moved to the day before.
+    const latestTime = (isCheckout && !shifted) ? FBG_CHECKOUT_LATEST : null;
+    return { rawDate, date, prefTime, latestTime, isCheckout, shifted };
+  });
+}
+/* Leave info for the FBG summary popup. */
+function fbgLeaveInfo(date){
+  const onLeave = staffOnLeaveFor(date);
+  const total = (state.staff||[]).length;
+  return { names: onLeave.map(o=>o.staff.name), all: total>0 && onLeave.length>=total };
+}
+/* One-time fix-up (16 Nov 2026, standing "migrate existing bookings too"
+   rule): any already-booked, still "Not arrived", today-or-later FBG that
+   sits on a closed day is moved using the new closed-day rule (day before,
+   end of day). Runs after every cloud load but only changes anything when it
+   finds such an FBG, so it's idempotent. Existing FBGs on open days are left
+   exactly where they are (not reshuffled from Bay 3 to Bay 1). */
+function moveClosedDayFbgs(){
+  const today = todayStr();
+  const moved = [];
+  state.customers.forEach(c=>c.pets.forEach(p=>{
+    (p.groomingHistory||[]).forEach(g=>{
+      if(!(g.apptTypes||[]).includes('FBG') || g.notes!=='(Boarding)' || g.status!=='Not arrived' || g.date < today || !isClosedDate(g.date)) return;
+      // Find this pet's boarding window that covers the FBG date.
+      let win = null;
+      state.customers.forEach(c2=>c2.pets.forEach(p2=>(p2.stays||[]).forEach(st=>{
+        if(win || st.status!=='Active') return;
+        (st.pets||[]).forEach(sp=>{
+          if(win || ![sp.petId, ...(sp.sharingWith||[])].includes(p.id)) return;
+          const w = petDatesInStay(st, sp, p.id);
+          if(w && g.date >= w.checkIn && g.date <= w.checkOut) win = w;
+        });
+      })));
+      if(!win) return;
+      const entry = planFreeGroomings(win.checkIn, win.checkOut).find(e=>e.rawDate===g.date);
+      if(!entry || !entry.date || entry.date < today || fbgHasOn(p, entry.date)) return;
+      const slot = findFbgSlot(entry.date, entry.prefTime, entry.latestTime, g.id);
+      if(!slot) return;
+      const from = g.date;
+      g.date = entry.date; g.time = slot.time; g.bay = slot.bay;
+      moved.push(`${p.name}: ${fmtDate(from)} → ${fmtDate(g.date)} ${fmtTimeAMPM(g.time)} ${g.bay}`);
+    });
+  }));
+  if(moved.length){
+    scheduleSync();
+    render();
+    toast(`${moved.length} free grooming${moved.length===1?'':'s'} moved off a closed day — ${moved.join('; ')}`);
+  }
+}
+function fbgHasOn(pet, date){
+  return (pet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
 }
 /* Auto-creates the earned free groomings for any DOG among `petIds` on a newly
    booked stay — including any pets sharing the room, not just the one the
@@ -7517,9 +7635,8 @@ function findFreeGroomSlot(date, prefTime, prefBay, excludeId){
    attributed to its own owner rather than assumed to be `cust`.
    The appointment is a normal, fully editable grooming record — staff can
    add on Full Grooming etc. if the owner wants to upgrade it.
-   Mid-stay free groomings default to 4pm at Bay 3; the one that lands on the
-   check-out day defaults to 10am at Bay 3 (falling back to another slot only
-   if that one's already taken). Returns the count assigned plus the list of
+   Time/bay/closed-day rules: see the FBG slot rules comment above
+   (fbgHourOrder / planFreeGroomings). Returns the count assigned plus the list of
    records created, so the caller can show them for a quick review/edit. */
 /* `petWindows` is an array of {petId, checkIn, checkOut} — each pet's OWN
    actual dates (its per-pet override if the stay-pet row set one, else the
@@ -7532,42 +7649,32 @@ function findFreeGroomSlot(date, prefTime, prefBay, excludeId){
 async function assignFreeGroomings(cust, petWindows){
   let assignedCount = 0;
   const assignedList = [];
+  const skippedList = [];
   const seen = new Set();
   for(const {petId, checkIn, checkOut} of petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId))){
     const { pet, cust: petCust } = findPetWithCustomer(petId);
     if(!pet || pet.type !== 'Dog') continue;
     const owner = petCust || cust;
-    const dates = computeFreeGroomingDates(checkIn, checkOut);
-    for(let idx=0; idx<dates.length; idx++){
-      const date = dates[idx];
-      const alreadyHas = (pet.groomingHistory||[]).some(g=>(g.apptTypes||[]).includes('FBG') && g.date===date && g.notes==='(Boarding)');
-      if(alreadyHas) continue;
-      const isCheckoutDay = idx === dates.length - 1;
-      const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3');
-      if(!slot) continue;
-      // One live check on the FINAL resolved slot only, not on every
-      // candidate findFreeGroomSlot tries internally — pain point #5
-      // follow-up (29 Aug 2026). This is a much lower-risk path than a
-      // person actively picking a slot (it's a side effect of booking a
-      // stay, not a race to grab a specific time), so a single check here
-      // is enough to close the real gap (creating a live duplicate)
-      // without turning every stay save into a slow chain of per-candidate
-      // network round-trips. If it turns out taken, this date is simply
-      // skipped rather than double-booked — staff can add it manually.
-      if(await findGroomConflictLive(date, slot.time, slot.bay, null)) continue;
+    for(const entry of planFreeGroomings(checkIn, checkOut)){
+      // Already has one on the planned day (or on the raw closed day, from
+      // before the closed-day rule existed) — don't duplicate.
+      if((entry.date && fbgHasOn(pet, entry.date)) || fbgHasOn(pet, entry.rawDate)) continue;
+      if(!entry.date){ skippedList.push({ cust: owner, pet, date: entry.rawDate, reason:'closed' }); continue; }
+      const { slot, reason } = await findFbgSlotLive(entry.date, entry.prefTime, entry.latestTime, null);
+      if(!slot){ skippedList.push({ cust: owner, pet, date: entry.date, reason }); continue; }
       const record = {
-        id: uid('groom'), date, time: slot.time, bay: slot.bay,
+        id: uid('groom'), date: entry.date, time: slot.time, bay: slot.bay,
         apptTypes: ['FBG'], sizeCode: pet.groomingSize || '', cutCode:'', details:'',
         addons: [], photos: [], status:'Not arrived',
         notes: '(Boarding)',
         customerId: owner.id, petId: pet.id,
       };
       pet.groomingHistory.push(record);
-      assignedList.push({ cust: owner, pet, record });
+      assignedList.push({ cust: owner, pet, record, shiftedFrom: entry.shifted ? entry.rawDate : null });
       assignedCount++;
     }
   }
-  return { assignedCount, assignedList };
+  return { assignedCount, assignedList, skippedList };
 }
 /* Used when SAVING AN EDIT to an existing stay (not on first creation) —
    reconciles this pet's FBG appointments against its newly entitled dates
@@ -7588,13 +7695,13 @@ async function assignFreeGroomings(cust, petWindows){
    are reconciled. */
 async function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId){
   let assignedCount = 0, movedCount = 0;
-  const assignedList = [];
+  const assignedList = [], movedList = [], skippedList = [];
   const seen = new Set();
   for(const {petId, checkIn, checkOut} of petWindows.filter(w=>w && w.petId && !seen.has(w.petId) && seen.add(w.petId))){
     const { pet, cust: petCust } = findPetWithCustomer(petId);
     if(!pet || pet.type !== 'Dog') continue;
     const owner = petCust || cust;
-    const newDates = computeFreeGroomingDates(checkIn, checkOut);
+    const plan = planFreeGroomings(checkIn, checkOut);
     const oldWindow = (oldWindowsByPetId && oldWindowsByPetId[petId]) || { checkIn, checkOut };
     const scopeStart = oldWindow.checkIn < checkIn ? oldWindow.checkIn : checkIn;
     const scopeEnd = oldWindow.checkOut > checkOut ? oldWindow.checkOut : checkOut;
@@ -7607,32 +7714,36 @@ async function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId)
     const today = todayStr();
     const lockedDates = new Set(linked.filter(g => g.status==='Done & Informed' || g.status==='Picked up' || g.date < today).map(g=>g.date));
     const movablePool = linked.filter(g => g.status!=='Done & Informed' && g.status!=='Picked up' && g.date >= today);
-    const neededDates = newDates.filter(d => !lockedDates.has(d) && d >= today);
-    for(let idx=0; idx<neededDates.length; idx++){
-      const date = neededDates[idx];
-      const exactIdx = movablePool.findIndex(g=>g.date===date);
-      if(exactIdx>-1){ movablePool.splice(exactIdx,1); continue; } // already right where it should be
-      const isCheckoutDay = idx === neededDates.length - 1;
+    // A done/past FBG on either the planned day or the raw (closed) day
+    // counts as already fulfilling that slot.
+    const needed = plan.filter(e => !lockedDates.has(e.rawDate) && !(e.date && lockedDates.has(e.date)) && (e.date || e.rawDate) >= today);
+    // First pass: anything already sitting on its planned day stays put.
+    const toPlace = [];
+    for(const e of needed){
+      const exactIdx = e.date ? movablePool.findIndex(g=>g.date===e.date) : -1;
+      if(exactIdx>-1) movablePool.splice(exactIdx,1);
+      else toPlace.push(e);
+    }
+    for(const e of toPlace){
+      if(!e.date){ skippedList.push({ cust: owner, pet, date: e.rawDate, reason:'closed' }); continue; }
       if(movablePool.length){
         const g = movablePool.shift();
-        const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', g.id);
-        // Same one-live-check-on-the-final-slot approach as
-        // assignFreeGroomings above — see its comment for reasoning.
-        if(slot && !(await findGroomConflictLive(date, slot.time, slot.bay, g.id))){ g.date = date; g.time = slot.time; g.bay = slot.bay; movedCount++; }
+        const { slot, reason } = await findFbgSlotLive(e.date, e.prefTime, e.latestTime, g.id);
+        if(slot){ g.date = e.date; g.time = slot.time; g.bay = slot.bay; movedCount++; movedList.push({ cust: owner, pet, record: g, shiftedFrom: e.shifted ? e.rawDate : null }); }
+        else skippedList.push({ cust: owner, pet, date: e.date, reason, stuck: g });
         continue;
       }
-      const slot = findFreeGroomSlot(date, isCheckoutDay ? '10:00' : '16:00', 'Bay 3', null);
-      if(!slot) continue;
-      if(await findGroomConflictLive(date, slot.time, slot.bay, null)) continue;
+      const { slot, reason } = await findFbgSlotLive(e.date, e.prefTime, e.latestTime, null);
+      if(!slot){ skippedList.push({ cust: owner, pet, date: e.date, reason }); continue; }
       const record = {
-        id: uid('groom'), date, time: slot.time, bay: slot.bay,
+        id: uid('groom'), date: e.date, time: slot.time, bay: slot.bay,
         apptTypes: ['FBG'], sizeCode: pet.groomingSize || '', cutCode:'', details:'',
         addons: [], photos: [], status:'Not arrived',
         notes: '(Boarding)',
         customerId: owner.id, petId: pet.id,
       };
       pet.groomingHistory.push(record);
-      assignedList.push({ cust: owner, pet, record });
+      assignedList.push({ cust: owner, pet, record, shiftedFrom: e.shifted ? e.rawDate : null });
       assignedCount++;
     }
     // Any leftover movablePool entries (more not-done FBGs than the stay now
@@ -7640,33 +7751,67 @@ async function reconcileFreeGroomings(cust, stay, petWindows, oldWindowsByPetId)
     // — staff can remove them via the usual grooming-history delete if truly
     // no longer wanted.
   }
-  return { assignedCount, movedCount, assignedList };
+  return { assignedCount, movedCount, assignedList, movedList, skippedList };
 }
-/* Shown right after a stay is created if any free groomings were earned —
-   lets staff jump straight into editing any of them, one at a time, and land
-   back on this same summary after each save (rather than losing the list). */
-function openFreeGroomingSummaryModal(assignedList){
-  openModal(`
-    <div class="modal-head"><h3>Free grooming auto-booked</h3><button class="modal-close">✕</button></div>
-    <div class="modal-body">
-      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">This stay earned ${assignedList.length} free Basic Grooming (FBG) appointment${assignedList.length===1?'':'s'}. Tap any appointment below to edit its date, time, bay, status, colour, or anything else — or remove it if it shouldn't be booked. You'll come back to this list afterward.</div>
-      ${assignedList.length===0 ? `<div style="font-size:12.5px;color:var(--ink-soft);">No free grooming appointments left to review.</div>` : ''}
-      ${assignedList.map((a,i)=>`
-        <div class="today-card" data-fbg-edit="${i}" style="cursor:pointer;">
+/* Shown right after a stay is created (or edited) when free groomings were
+   booked, moved, or couldn't be booked — lets staff jump straight into
+   editing any of them, one at a time, and land back on this same summary
+   after each save (rather than losing the list).
+   `opts.moved`   — existing FBGs rescheduled by an edit (editable, no "Don't book").
+   `opts.skipped` — FBGs that couldn't be booked ({pet, date, reason}).
+   `opts.onClose` — runs once when the popup is closed (Done / ✕ / backdrop /
+                    last item removed), e.g. to open the booking confirmation next. */
+function openFreeGroomingSummaryModal(assignedList, opts){
+  opts = opts || {};
+  const moved = opts.moved || [];
+  const skipped = opts.skipped || [];
+  const reasonText = r => r==='checkoutMorningFull' ? 'check-out day morning slots (10am–2pm, Bays 1–3) are all full — please assign this FBG manually'
+    : r==='closed' ? 'shop is closed and no open day was found in this stay'
+    : r==='live' ? 'the slot was just taken on another device'
+    : 'Bays 1–3 are full at every time slot that day';
+  const cardHtml = (a, i, kind)=>{
+    const lv = fbgLeaveInfo(a.record.date);
+    const leaveLine = lv.all
+      ? `<div style="font-size:11.5px;color:#B42318;font-weight:600;margin-top:3px;">⚠️ All staff on leave this day (${esc(lv.names.join(', '))}) — please move it</div>`
+      : lv.names.length ? `<div style="font-size:11.5px;color:#B54708;margin-top:3px;">On leave: ${esc(lv.names.join(', '))}</div>` : '';
+    const shiftLine = a.shiftedFrom ? `<div style="font-size:11.5px;color:var(--ink-soft);margin-top:3px;">Moved from ${fmtDateWithDay(a.shiftedFrom)} (closed day)</div>` : '';
+    return `
+        <div class="today-card" data-fbg-edit="${kind}|${i}" style="cursor:pointer;">
           <div class="avatar" style="${avatarStyle(a.record.groomColor || colorFor(a.cust.id))}">${initials(a.cust.name)}</div>
           <div class="today-card-main">
-            <div class="today-card-pet">${ANIMAL_ICON[a.pet.type]||'🐾'} ${petLabel(a.pet)} <span class="badge badge-active">FBG</span></div>
-            <div class="today-card-sub">${fmtDateWithDay(a.record.date)} · ${a.record.time} · ${a.record.bay} · ${GROOM_STATUS_ICON[a.record.status]||''} ${esc(a.record.status||'Not arrived')}</div>
+            <div class="today-card-pet">${ANIMAL_ICON[a.pet.type]||'🐾'} ${petLabel(a.pet)} <span class="badge badge-active">FBG</span>${kind==='m'?' <span class="badge">Rescheduled</span>':''}</div>
+            <div class="today-card-sub">${fmtDateWithDay(a.record.date)} · ${fmtTimeAMPM(a.record.time)} · ${a.record.bay} · ${GROOM_STATUS_ICON[a.record.status]||''} ${esc(a.record.status||'Not arrived')}</div>
+            ${shiftLine}${leaveLine}
           </div>
-          <button class="btn btn-sm btn-danger" data-fbg-remove="${i}" title="Don't book this one">Don't book</button>
-        </div>
-      `).join('')}
+          ${kind==='a' ? `<button class="btn btn-sm btn-danger" data-fbg-remove="${i}" title="Don't book this one">Don't book</button>` : ''}
+        </div>`;
+  };
+  const total = assignedList.length + moved.length;
+  openModal(`
+    <div class="modal-head"><h3>Free grooming (FBG)</h3><button class="modal-close">✕</button></div>
+    <div class="modal-body">
+      ${total ? `<div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:12px;">${assignedList.length ? `${assignedList.length} free Basic Grooming appointment${assignedList.length===1?'':'s'} auto-booked` : ''}${assignedList.length && moved.length ? ', ' : ''}${moved.length ? `${moved.length} rescheduled to match the new dates` : ''}. Tap any appointment to edit it${assignedList.length ? ', or tap "Don\'t book" if it shouldn\'t be booked' : ''}. You'll come back to this list afterward.</div>` : ''}
+      ${total===0 && !skipped.length ? `<div style="font-size:12.5px;color:var(--ink-soft);">No free grooming appointments left to review.</div>` : ''}
+      ${assignedList.map((a,i)=>cardHtml(a,i,'a')).join('')}
+      ${moved.map((a,i)=>cardHtml(a,i,'m')).join('')}
+      ${skipped.length ? `
+        <div style="margin-top:12px;padding:10px 12px;border-radius:10px;background:#FEF3F2;border:1px solid #FECDCA;">
+          <div style="font-size:12.5px;font-weight:700;color:#B42318;margin-bottom:4px;">⚠️ ${skipped.length} free grooming${skipped.length===1?'':'s'} could NOT be booked — please book by hand</div>
+          ${skipped.map(x=>`<div style="font-size:12px;color:#7A271A;margin-top:3px;">• ${esc(x.pet.name)} — ${fmtDateWithDay(x.date)}: ${reasonText(x.reason)}${x.stuck?` (still at ${fmtDateWithDay(x.stuck.date)} ${fmtTimeAMPM(x.stuck.time)})`:''}</div>`).join('')}
+        </div>` : ''}
     </div>
     <div class="modal-foot">
       <button class="btn btn-primary" id="cancelBtn">Done</button>
     </div>
   `);
-  document.getElementById('cancelBtn').addEventListener('click', closeModal);
+  // Closing (any way) hands over to opts.onClose exactly once. Editing an
+  // appointment re-opens this popup, so that doesn't count as closing.
+  let handedOff = false;
+  const finish = ()=>{ if(handedOff) return; handedOff = true; closeModal(); if(opts.onClose) opts.onClose(); };
+  document.getElementById('cancelBtn').addEventListener('click', finish);
+  document.querySelectorAll('#modalRoot .modal-close').forEach(b=>b.addEventListener('click', finish));
+  const bd = document.getElementById('mBackdrop');
+  if(bd) bd.addEventListener('click', e=>{ if(e.target.id==='mBackdrop') finish(); });
   document.querySelectorAll('[data-fbg-remove]').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.stopPropagation();
@@ -7678,17 +7823,21 @@ function openFreeGroomingSummaryModal(assignedList){
       a.pet.groomingHistory = (a.pet.groomingHistory||[]).filter(g=>g.id!==a.record.id);
       assignedList.splice(+btn.dataset.fbgRemove, 1);
       scheduleSync();
-      if(assignedList.length===0){ closeModal(); if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); toast('Free grooming appointment removed'); }
-      else { openFreeGroomingSummaryModal(assignedList); toast('Free grooming appointment removed'); }
+      if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render();
+      toast('Free grooming appointment removed');
+      if(assignedList.length===0 && moved.length===0 && skipped.length===0) finish();
+      else { handedOff = true; openFreeGroomingSummaryModal(assignedList, opts); }
     });
   });
   document.querySelectorAll('[data-fbg-edit]').forEach(el=>{
     el.addEventListener('click', (e)=>{
       if(e.target.closest('[data-fbg-remove]')) return;
-      const a = assignedList[+el.dataset.fbgEdit];
+      const [kind, idx] = el.dataset.fbgEdit.split('|');
+      const a = (kind==='m' ? moved : assignedList)[+idx];
+      handedOff = true; // popup comes back after the edit
       openGroomModal(a.cust, a.pet, a.record, {
-        onDone: ()=>{ if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); openFreeGroomingSummaryModal(assignedList); },
-        onCancel: ()=> openFreeGroomingSummaryModal(assignedList),
+        onDone: ()=>{ if(state.activeTab==='customers') renderPetSubContent(a.cust, a.pet); else render(); openFreeGroomingSummaryModal(assignedList, opts); },
+        onCancel: ()=> openFreeGroomingSummaryModal(assignedList, opts),
       });
     });
   });
@@ -11411,8 +11560,12 @@ function openCalendarNewBookingModal(prefRoomId, prefDate){
       } else {
         toast('Booking created');
       }
-      // Pain point #13 — instant booking confirmation at creation time.
-      openBookingConfirmationModal(cust, newStay);
+      // Pain point #13 — instant booking confirmation at creation time,
+      // opened after the FBG review popup (if any) is closed.
+      const showConfirm = ()=> openBookingConfirmationModal(cust, newStay);
+      if(freeResult.assignedCount > 0 || (freeResult.skippedList||[]).length){
+        openFreeGroomingSummaryModal(freeResult.assignedList, { skipped: freeResult.skippedList, onClose: showConfirm });
+      } else showConfirm();
     };
     const holidayHits = holidayOverlapsForStay(checkIn, checkOut);
     if(holidayHits.length){ openHolidayRateNoticeModal(holidayHits, doSave); } else { doSave(); }
