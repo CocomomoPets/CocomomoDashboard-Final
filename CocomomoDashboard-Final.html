@@ -4,6 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=0.5, minimum-scale=0.3, maximum-scale=3.0, user-scalable=yes">
 <title>Cocomomo okr</title>
+<script>
+/* Phone detection (19 Nov 2026): marks <html> with "is-phone" so the
+   Boarding calendar can switch to a compact layout. Uses the physical
+   screen size (not affected by the 50% initial zoom) + a touch screen, so
+   tablets and desktops keep the normal layout. */
+(function(){
+  try{
+    var shortSide = Math.min(screen.width, screen.height);
+    var touch = (window.matchMedia && matchMedia('(pointer:coarse)').matches) || ('ontouchstart' in window);
+    if(touch && shortSide <= 600) document.documentElement.classList.add('is-phone');
+  }catch(e){}
+})();
+</script>
 <style>
   :root{
     --bg: #F6F4EF;
@@ -123,6 +136,55 @@
   .lock-card input:focus{ outline:none; border-color:var(--teal); background:#fff; }
   .lock-card .btn{ width:100%; justify-content:center; padding:11px; }
   .lock-error{ color:var(--danger); font-size:12px; font-weight:600; margin:-4px 0 12px; }
+
+  /* ---------- Phone layout (19 Nov 2026) ----------
+     Only applies when <html> has "is-phone" (set by the detection script in
+     <head>: touch screen, short side <= 600px). Desktop/tablet unchanged. */
+  .top-tools{ display:contents; }
+  .more-btn{ display:none; }
+  .is-phone .topbar{ flex-wrap:wrap; gap:10px 10px; padding:12px 14px; position:relative; }
+  .is-phone .brand{ order:1; flex:1; min-width:0; }
+  .is-phone #shopName{ min-width:0; width:100%; font-size:18px; }
+  .is-phone #syncStatus{ order:2; }
+  .is-phone .more-btn{ display:inline-flex; order:3; }
+  .is-phone .topbar-spacer{ display:none; }
+  .is-phone .tabs{ order:4; flex-basis:100%; margin-left:0; display:grid; grid-template-columns:repeat(4,1fr); gap:4px; }
+  .is-phone .tab-btn{ padding:9px 4px; font-size:13px; line-height:1.2; }
+  .is-phone .top-tools{
+    display:none; position:absolute; right:14px; top:58px; z-index:60;
+    flex-direction:column; align-items:stretch; gap:6px; padding:10px;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 32px rgba(0,0,0,.18);
+  }
+  .is-phone .top-tools.open{ display:flex; }
+  .is-phone .top-tools .btn{ justify-content:flex-start; padding:11px 14px; font-size:14px; }
+  /* Computers/tablets with a too-narrow screen (19 Nov 2026): when the tool
+     buttons don't fit on the topbar, <html> gets "topbar-compact" (see
+     fitTopbar() in the script) and they move into the same More ▾ menu. */
+  .topbar-compact .topbar{ position:relative; flex-wrap:wrap; row-gap:10px; }
+  .topbar-compact .brand{ min-width:0; flex:0 1 auto; }
+  .topbar-compact #shopName{ width:170px; min-width:0; }
+  .topbar-compact .more-btn{ display:inline-flex; }
+  .topbar-compact #syncStatus{ white-space:nowrap; flex-shrink:0; }
+  .topbar-compact .top-tools{
+    display:none; position:absolute; right:22px; top:calc(100% - 6px); z-index:60;
+    flex-direction:column; align-items:stretch; gap:6px; padding:10px; min-width:240px;
+    background:var(--panel); border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 32px rgba(0,0,0,.18);
+  }
+  .topbar-compact .top-tools.open{ display:flex; }
+  .topbar-compact .top-tools .btn{ justify-content:flex-start; padding:10px 14px; }
+  /* Customers tab: list OR customer page, full width, with a Back button */
+  .is-phone .body.phone-list .sidebar{ width:100%; border-right:none; }
+  .is-phone .body.phone-list .main{ display:none; }
+  .is-phone .body.phone-detail .sidebar{ display:none; }
+  .phone-back{ display:none; }
+  .is-phone .phone-back{ display:inline-flex; margin-bottom:12px; }
+  .is-phone .main{ padding:14px 14px 60px; }
+  .is-phone .subtabs{ overflow-x:auto; }
+  .is-phone .subtab-btn{ margin-right:16px; white-space:nowrap; flex-shrink:0; }
+  .is-phone .info-grid{ grid-template-columns:1fr 1fr; }
+  .is-phone .modal-backdrop{ padding:10px; }
+  .is-phone .modal{ max-height:94vh; }
+  .is-phone .modal-foot{ flex-wrap:wrap; }
 
   /* ---------- Body layout ---------- */
   .body{ flex:1; display:flex; min-height:0; min-width:0; overflow-x:hidden; }
@@ -353,6 +415,19 @@
   .cal-cell-line{ font-size:12.5px; font-weight:700; line-height:1.28; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; text-shadow:var(--cal-text-shadow, 0 1px 1px rgba(0,0,0,.3)); max-width:80px; }
   .cal-cell-breed{ font-size:11px; font-weight:600; line-height:1.2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:.9; text-shadow:var(--cal-text-shadow, 0 1px 1px rgba(0,0,0,.3)); max-width:80px; }
   .cal-today-col{ box-shadow:inset 0 0 0 2px var(--amber); }
+  /* Compact Boarding calendar on phones (19 Nov 2026) — narrower day
+     columns and smaller text so roughly half a month fits on screen
+     (still scrolls sideways for the rest). */
+  .is-phone table.cal-grid thead th{ min-width:58px; padding:6px 2px; font-size:15px; }
+  .is-phone table.cal-grid thead th.cal-room-head{ padding:6px 6px; min-width:auto; }
+  .is-phone table.cal-grid thead .cal-wd{ font-size:11px; }
+  .is-phone .cal-type-row td{ font-size:14px; padding:5px 6px; }
+  .is-phone .cal-room-cell{ font-size:14px; padding:0 6px; }
+  .is-phone .cal-cell{ width:58px; height:46px; padding:2px 3px; }
+  .is-phone .cal-cell-seg{ margin:0 -3px; padding:1px 3px; }
+  .is-phone .cal-cell-seg-first{ margin-top:-2px; padding-top:2px; }
+  .is-phone .cal-cell-line{ font-size:11px; max-width:52px; }
+  .is-phone .cal-cell-breed{ font-size:9.5px; max-width:52px; }
   th.cal-holiday-col{ background:var(--amber-tint) !important; color:#8A5A22; }
   td.cal-free.cal-holiday-col{ background:var(--amber-tint); }
   td.cal-free.cal-holiday-col:hover{ background:#F5DFB8; }
@@ -556,12 +631,15 @@
     <div id="syncStatus" class="sync-status sync-off">
       <span class="sync-dot"></span><span class="sync-label">Cloud sync not set up</span>
     </div>
+    <button class="btn more-btn" id="moreBtn" type="button">More ▾</button>
+    <div class="top-tools" id="topTools">
     <button class="btn" id="enquiryBtn" title="Quick nights &amp; price estimate for an unconfirmed enquiry — nothing here is saved">Enquiry calculator</button>
     <button class="btn" id="policiesBtn">Boarding policies</button>
     <button class="btn" id="ratesBtn" title="Room rates, surcharges, holidays &amp; closed dates — plus Staff &amp; leave">Rates &amp; Staff</button>
     <button class="btn" id="scheduleBtn" title="Reminders for tomorrow's appointments/checkouts, and the monthly revenue/occupancy report">Reminders &amp; Reports</button>
     <button class="btn" id="historyBtn" title="Recent edits (with undo), the log of cancelled appointments/stays, and the incident/injury log">Change log &amp; Cancellations</button>
     <button class="btn" id="archiveBtn" title="Move old finished records out of the main tables — plus daily automatic Backups">Archive &amp; Backup</button>
+    </div>
   </div>
 
   <div class="body">
@@ -3211,7 +3289,20 @@ function renderTabs(){
     b.classList.toggle('active', b.dataset.tab === state.activeTab);
   });
   document.getElementById('sidebarWrap').classList.toggle('hidden', state.activeTab !== 'customers');
+  // Phone: Customers tab shows EITHER the list or the customer page.
+  const body = document.querySelector('.app > .body');
+  if(body){
+    const showList = state.activeTab==='customers' && (!state.selectedCustomerId || (_phoneListOpen && _phoneListFor===state.selectedCustomerId));
+    body.classList.toggle('phone-list', showList);
+    body.classList.toggle('phone-detail', state.activeTab==='customers' && !showList);
+  }
 }
+/* Phone list/detail switch for the Customers tab. The list shows after
+   "← All customers" or tapping the Customers tab; any jump to a different
+   customer (from Today, calendar, search, etc.) opens their page. */
+let _phoneListOpen = false, _phoneListFor = null;
+function phoneShowCustomerList(){ _phoneListOpen = true; _phoneListFor = state.selectedCustomerId; renderTabs(); }
+function isPhone(){ return document.documentElement.classList.contains('is-phone'); }
 
 /* =========================================================
    RENDER: SIDEBAR
@@ -3252,6 +3343,7 @@ function renderSidebarOrHide(){
       const cust = getCustomer(state.selectedCustomerId);
       state.selectedPetId = cust.pets[0] ? cust.pets[0].id : null;
       document.getElementById('custSearch').value = '';
+      _phoneListOpen = false;
       render();
     });
   });
@@ -3306,6 +3398,16 @@ function petLabel(p){
    RENDER: CUSTOMERS MAIN
    ========================================================= */
 function renderCustomersMain(){
+  _renderCustomersMainInner();
+  if(isPhone() && getCustomer(state.selectedCustomerId)){
+    const main = document.getElementById('mainArea');
+    const back = document.createElement('button');
+    back.className = 'btn phone-back'; back.type = 'button'; back.textContent = '← All customers';
+    back.addEventListener('click', ()=>{ phoneShowCustomerList(); document.getElementById('sidebarWrap').scrollTop = 0; });
+    main.prepend(back);
+  }
+}
+function _renderCustomersMainInner(){
   const main = document.getElementById('mainArea');
   const cust = getCustomer(state.selectedCustomerId);
   if(!cust){
@@ -10925,12 +11027,13 @@ function renderBoardingCalendar(){
   // The whole month renders as one wide, horizontally-scrollable table —
   // every re-render (e.g. switching tabs and back) reset that scroll
   // position back to day 1, so on the back half of the month you had to
-  // manually drag it over every time. Now: if we're looking at the current
-  // month and today's past the 16th, jump the scroll straight to today's
-  // column so the end of the month is visible without dragging.
-  if(ym === today.slice(0,7) && Number(today.slice(8,10)) > 16){
-    const todayCol = main.querySelector('.cal-today-col');
-    if(todayCol) todayCol.scrollIntoView({ inline:'center', block:'nearest' });
+  // manually drag it over every time. Now (16 Nov 2026): if we're looking
+  // at the current month and today is the 14th or later, scroll all the way
+  // to the right so the calendar shows through to the last day of the month
+  // (30th/31st) without dragging. Before the 14th it starts at day 1.
+  if(ym === today.slice(0,7) && Number(today.slice(8,10)) >= 14){
+    const wrap = main.querySelector('.cal-wrap');
+    if(wrap) wrap.scrollLeft = wrap.scrollWidth;
   }
   document.getElementById('calNewBookingBtn').addEventListener('click', ()=>openCalendarNewBookingModal(null, null));
   document.getElementById('calWaitlistAddBtn').addEventListener('click', ()=>openWaitlistAddModal());
@@ -11948,8 +12051,37 @@ function openFullBookingModal(prefTime, prefBay){
    GLOBAL WIRING
    ========================================================= */
 document.querySelectorAll('.tab-btn').forEach(b=>{
-  b.addEventListener('click', ()=>{ state.activeTab = b.dataset.tab; render(); });
+  b.addEventListener('click', ()=>{
+    if(b.dataset.tab==='customers' && isPhone()){ _phoneListOpen = true; _phoneListFor = state.selectedCustomerId; }
+    state.activeTab = b.dataset.tab; render();
+  });
 });
+/* Phone "More ▾" menu holding the topbar tool buttons. Tapping any tool
+   (or anywhere outside the menu) closes it. */
+(function(){
+  const more = document.getElementById('moreBtn'), tools = document.getElementById('topTools');
+  if(!more || !tools) return;
+  more.addEventListener('click', e=>{ e.stopPropagation(); tools.classList.toggle('open'); });
+  // On computers/tablets: switch to the More menu only when the tool
+  // buttons would overflow the topbar; re-checked whenever the window resizes.
+  const root = document.documentElement, bar = document.querySelector('.topbar');
+  function fitTopbar(){
+    if(root.classList.contains('is-phone')) return; // phones always use More
+    tools.classList.remove('open');
+    root.classList.remove('topbar-compact');
+    const last = document.getElementById('archiveBtn');
+    const tooWide = bar.scrollWidth > bar.clientWidth + 1 || (last && last.getBoundingClientRect().right > bar.getBoundingClientRect().right - 10)
+      || document.getElementById('syncStatus').offsetHeight > 40;
+    root.classList.toggle('topbar-compact', tooWide);
+  }
+  let _fitT; window.addEventListener('resize', ()=>{ clearTimeout(_fitT); _fitT = setTimeout(fitTopbar, 120); });
+  fitTopbar();
+  // The sync label changes length ("Synced", "Saving…", "Save failed — tap to retry")
+  new MutationObserver(()=>{ clearTimeout(_fitT); _fitT = setTimeout(fitTopbar, 120); })
+    .observe(document.getElementById('syncStatus'), { childList:true, subtree:true, characterData:true });
+  tools.addEventListener('click', ()=> tools.classList.remove('open'));
+  document.addEventListener('click', e=>{ if(!tools.contains(e.target) && e.target!==more) tools.classList.remove('open'); });
+})();
 document.getElementById('custSearch').addEventListener('input', renderSidebarOrHide);
 document.getElementById('shopName').addEventListener('change', (e)=>{ state.shopName = e.target.value || 'Cocomomo okr'; toast('Shop name updated'); scheduleSync(); });
 document.getElementById('shopName').addEventListener('keydown', (e)=>{ if(e.key==='Enter') e.target.blur(); });
